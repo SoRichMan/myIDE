@@ -45,6 +45,7 @@ E:\TestDeepSeek\
 │   │   └── tests\bench_highlight.rs  #[ignore] 高亮性能基准（全量/增量）
 │   ├── ext-theme-vscode\    第八轮：内置扩展 = Dark+ / Light+ / Dark(Visual Studio - C/C++)
 │   ├── ide-ui\              eframe/egui 前端, bin = liteide
+│   │   ├── assets\          内置资源：codicon.ttf（图标字体，第九轮）+ appicon.png（应用图标位图，第十一轮）
 │   │   ├── main.rs          阶段5：设置落地/命令面板/多标签/UI 打磨/虚拟滚动 + 扩展宿主装配
 │   │   ├── editor.rs        虚拟滚动编辑器 + EditorAction + 动态字号/主题/语言高亮器注入
 │   │   ├── settings.rs      阶段5：AppSettings 加载/校验/JSON 热重载
@@ -76,7 +77,7 @@ E:\TestDeepSeek\
 └── target\release\liteide.exe  9.68 MB
 ```
 
-## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十轮搜索视图按 VS Code **实测几何**对齐，含标题栏精简与「清除」清输入）
+## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十一轮自绘标题栏：Logo + 菜单 + 窗口按钮合到最上一行，对齐 VS Code）
 
 ### 已交付
 
@@ -838,6 +839,58 @@ egui 的 `Context::set_fonts` 要到**帧末**才生效。原来第一帧「调�
   （`edit-code` / `book`、`exclude`）未做；结果行文件图标仍是「按扩展名着色 + codicon 文件形状」，
   没有复刻 Seti 主题；缩进参考线未画；汇总行与「⋯」的行高比 VS Code 各高 2px 左右（egui 的
   `interact_size.y` 决定，视觉差 < 3px）。
+
+---
+
+## UI 复核改进第十一轮：自绘标题栏（Logo + 菜单 + 窗口按钮合到最上一行）（2026-10-19）
+
+用户给了两张截图（我们的 vs VS Code）：我们上面是**两行**——[系统标题栏（`e` 图标 + "LiteIDE"）] + [菜单行]；
+要求像 VS Code 一样全部合到最上面一行。
+
+### 做法：系统标题栏换成自绘（这是唯一能合并的路径）
+
+- `main()` 里 `with_decorations(false)` 去掉系统标题栏，改由 `draw_title_bar()` 自绘：
+  **35px 单行** = 35px 应用图标区（图标居中）+ File/Edit/View/Go/Run/Help +
+  右侧 3×46px 窗口按钮（最小化 / 最大化-还原 / 关闭，codicon 字形）；
+- 窗口交互全部自己接管：标题栏空白处按下 = `StartDrag` 拖动窗口；双击标题栏 = 最大化/还原；
+  `draw_window_resize_edges()` 负责 5px 边缘带（四角优先）的 8 向 `BeginResize` + 鼠标指针
+  （最大化时不留缩放带，与 VS Code 一致）；
+- 度量/配色按 VS Code 实测值：`.part.titlebar` 35px、`.window-appicon` 35px、
+  `.window-controls-container` 3×46px、`.menubar-menu-title { padding: 0 8px; border-radius: 5px }`；
+  窗口按钮悬停 `#ffffff1a`，关闭按钮悬停 `#e81123e6` + 白图标；窗口失焦用 `titleBar.inactiveBackground`；
+- 弹出菜单：`menu.background` / `menu.border` / `menu.selectionBackground`（Dark+ 是蓝 `#0078d4`）——
+  ⚠️ egui 的弹出菜单用的是 `ctx` 的样式而不是父 `Ui` 的，所以菜单项样式必须写在各菜单闭包内部
+  （`menu_items_style`），否则不生效；
+- `theme.rs` 新增 6 个标题栏/菜单色（Dark+ / Light+ / C/C++ Dark 三套）+ `PaletteHex` 新字段 +
+  守护测试 `titlebar_colors_match_vscode`。
+
+### 应用图标（用户追问：「为什么换成了一个连接符，不应该是字母 e 吗？」）
+
+- 起因：自绘标题栏初期我随手用了 codicon 的 `</>`（`code`，U+EAC4）当占位图标 —— 用户看到的「连接符」；
+- codicon 里**没有拉丁字母**（用 cmap 解析过：字形范围只有 U+EA60–U+F102），唯一的品牌字形是
+  `codicon-vscode`（VS Code 自己的 logo），不适合当我们图标；
+- 改为用**应用原本的图标**：eframe/egui 的默认窗口图标（深色圆角方块 + 白色小写 “e”，512×512）→
+  裁掉四周各 40px 透明留白 → 高质量重采样成 **40×40 PNG** 内嵌（`crates/ide-ui/assets/appicon.png`，
+  1.4 KB，出处与许可见同目录 `appicon.LICENSE.txt`）；
+- 为什么内嵌位图而不是直接画字形/直接用 eframe 默认值：egui 的纹理**没有 mipmap**，512px 直接缩到
+  显示尺寸会因采样不足走样；40×40 缩到 20px 正好是一次干净的 2:1 平均。解码失败只记一条 `tracing::warn!`
+  并退化成「不画图标」——不在 UI 线程 panic（遵守「非测试代码不用 unwrap/expect」红线）；
+- 显示尺寸：VS Code 是 16px，但我们的图标是整块实心方块，用户反馈 16px 看着偏小 → 调到 **20px**。
+
+### 验收
+
+| 指标 | 结果 |
+|---|---|
+| cargo test --workspace | ✅ 全绿（ide-ui 95 passed，本轮新增 `title_bar_keeps_logo_menus_and_window_buttons_on_one_top_row`） |
+| cargo clippy --workspace --all-targets -- -D warnings | ✅ 0 warning |
+| 真机（debug exe + 合成鼠标输入） | ✅ 拖动标题栏移动窗口、右下角拖拽缩放、双击标题栏最大化、点最小化按钮（`IsIconic=True`） |
+| 截图 | ✅ 单行标题栏：深色圆角方块 + 白色小写 e（20px）+ 6 个菜单 + 最小化/最大化/关闭 |
+
+### 本轮已知边界
+
+- 窗口没有系统阴影/圆角（`WS_POPUP` 无边框窗口所致；VS Code/Electron 有）——用户在意再议；
+- 未加 Selection / Terminal 菜单（功能未实现，先不加）；菜单弹层仍是 egui 原生（宽度、阴影与 VS Code 略有差异）；
+- 标题栏图标是 40×40 位图（非矢量），>200% 缩放的屏幕上会有轻微放大模糊（100%~200% 区间是清晰的）。
 
 ---
 

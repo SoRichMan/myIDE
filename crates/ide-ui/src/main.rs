@@ -11,7 +11,7 @@ mod tree;
 use eframe::egui;
 use eframe::egui::RichText;
 use editor::EditorAction;
-use ide_core::theme::{palette, ThemeKind};
+use ide_core::theme::{palette, PaletteHex, ThemeKind};
 use ide_ext::ExtensionHost;
 use ide_dap::manager::{BreakpointSpec, DapManager, DapStatus, Event as DapEvent, StackFrame, VarNode};
 use ide_git::{Event as GitEvent, GitManager, GitStatus};
@@ -343,6 +343,8 @@ struct LiteIdeApp {
     explorer_last_click: Option<(usize, f64)>,
     /// 上一次点击的标签页 (序号, 时间)，用于双击锁定。
     tab_last_click: Option<(usize, f64)>,
+    /// 标题栏左上角的应用图标纹理（首帧懒加载，之后每帧复用）。
+    app_icon: Option<egui::TextureHandle>,
 }
 
 impl LiteIdeApp {
@@ -498,6 +500,7 @@ impl LiteIdeApp {
             explorer_expanded: HashSet::new(),
             explorer_last_click: None,
             tab_last_click: None,
+            app_icon: None,
         }
     }
 
@@ -3626,104 +3629,218 @@ impl LiteIdeApp {
         ui.separator();
     }
 
-    fn draw_menu_bar(&mut self, ctx: &egui::Context) {
-        let bg = palette(self.applied_theme).bg_sidebar;
-        egui::TopBottomPanel::top("menu_bar")
-            .exact_height(26.0)
+    /// 顶部标题栏：应用图标 + 菜单 + 窗口按钮合并成一行（对齐 VS Code 的自绘标题栏）。
+    ///
+    /// 窗口用 `with_decorations(false)` 去掉了系统标题栏，所以整条标题栏的空白处按下就能
+    /// 拖动窗口（`StartDrag` 交给系统原生移动循环：边缘吸附、最大化时拖拽还原都在），
+    /// 双击切换最大化；四边的缩放见 [`LiteIdeApp::draw_window_resize_edges`]。
+    fn draw_title_bar(&mut self, ctx: &egui::Context) {
+        let p = palette(self.applied_theme);
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let fg = hex(p.fg_titlebar);
+        let bg = if focused {
+            p.bg_titlebar
+        } else {
+            p.bg_titlebar_inactive
+        };
+
+        let mut cmd: Option<egui::ViewportCommand> = None;
+        egui::TopBottomPanel::top("title_bar")
+            .exact_height(TITLEBAR_H)
             .frame(egui::Frame::none().fill(hex(bg)))
             .show(ctx, |ui| {
-                egui::menu::bar(ui, |ui| {
-                    ui.menu_button("File", |ui| {
-                        if ui.button("New File").clicked() {
-                            self.on_new_file();
-                            ui.close_menu();
+                // 整条标题栏先登记成拖动区；后登记的菜单/窗口按钮在 egui 的命中测试里
+                // 优先级更高（同一个点取「最后登记」的控件），所以只有空白处才会拖窗口。
+                let bar = egui::Rect::from_min_size(
+                    ui.min_rect().min,
+                    egui::vec2(ui.available_width(), TITLEBAR_H),
+                );
+                let drag = ui.interact(
+                    bar,
+                    ui.id().with("titlebar_drag"),
+                    egui::Sense::click_and_drag(),
+                );
+
+                // 菜单标题样式：VS Code `.menubar-menu-title { padding: 0 8px;
+                // border-radius: 5px }`，悬停底色是 `menubar.selectionBackground`。
+                {
+                    let st = ui.style_mut();
+                    st.spacing.button_padding = egui::vec2(MENUBAR_ITEM_PAD_X, 4.0);
+                    st.spacing.item_spacing.x = 0.0;
+                    st.text_styles
+                        .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+                    st.visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                    st.visuals.widgets.inactive.rounding =
+                        egui::Rounding::same(MENUBAR_ITEM_RADIUS);
+                    st.visuals.widgets.inactive.fg_stroke.color = fg;
+                    st.visuals.widgets.hovered.weak_bg_fill = menubar_selection();
+                    st.visuals.widgets.hovered.bg_fill = menubar_selection();
+                    st.visuals.widgets.hovered.rounding = egui::Rounding::same(MENUBAR_ITEM_RADIUS);
+                    st.visuals.widgets.hovered.fg_stroke.color = fg;
+                }
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), TITLEBAR_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        // 应用图标：35px 宽的区域里居中放 16px 图标（`.window-appicon`）。
+                        // 纯绘制、不登记点击/拖拽，所以点图标处也能拖动窗口。
+                        let (logo, _) = ui.allocate_exact_size(
+                            egui::vec2(APPICON_W, TITLEBAR_H),
+                            egui::Sense::hover(),
+                        );
+                        if self.app_icon.is_none() {
+                            self.app_icon = app_icon_texture(ctx);
                         }
-                        if ui.button("Open…").clicked() {
-                            self.open_file_picker();
-                            ui.close_menu();
+                        if let Some(icon) = self.app_icon.as_ref() {
+                            draw_app_icon(ui.painter(), logo.center(), icon);
                         }
-                        if ui.button("Save").clicked() {
-                            self.on_save();
-                            ui.close_menu();
-                        }
-                        if ui.button("Save As…").clicked() {
-                            self.open_save_as();
-                            ui.close_menu();
-                        }
-                        if ui.button("Save All").clicked() {
-                            self.on_save_all();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Quit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                    ui.menu_button("Edit", |ui| {
-                        if ui.button("Undo").clicked() {
-                            if let Some(ed) = self.editor.as_mut() {
-                                ed.undo();
+
+                        ui.menu_button("File", |ui| {
+                            menu_items_style(ui, p);
+                            if ui.button("New File").clicked() {
+                                self.on_new_file();
+                                ui.close_menu();
                             }
-                            ui.close_menu();
-                        }
-                        if ui.button("Redo").clicked() {
-                            if let Some(ed) = self.editor.as_mut() {
-                                ed.redo();
+                            if ui.button("Open…").clicked() {
+                                self.open_file_picker();
+                                ui.close_menu();
                             }
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Find…").clicked() {
-                            self.open_find(false);
-                            ui.close_menu();
-                        }
-                        if ui.button("Replace…").clicked() {
-                            self.open_find(true);
-                            ui.close_menu();
-                        }
-                    });
-                    ui.menu_button("View", |ui| {
-                        let mut sb = self.settings.show_sidebar;
-                        if ui.checkbox(&mut sb, "Side Bar").changed() {
-                            self.settings.show_sidebar = sb;
-                            self.save_settings();
-                        }
-                        let mut dbg = self.debug_open;
-                        if ui.checkbox(&mut dbg, "Debug Panel").changed() {
-                            self.debug_open = dbg;
-                        }
-                        ui.separator();
-                        if ui.button("Command Palette…").clicked() {
-                            self.palette_open = true;
-                            ui.close_menu();
-                        }
-                    });
-                    ui.menu_button("Go", |ui| {
-                        if ui.button("Go to Line…").clicked() {
-                            self.goto_line_open = true;
-                            self.goto_line_input.clear();
-                            ui.close_menu();
-                        }
-                    });
-                    ui.menu_button("Run", |ui| {
-                        if ui.button("Start Debugging").clicked() {
-                            self.on_debug_start();
-                            self.debug_open = true;
-                            ui.close_menu();
-                        }
-                        if ui.button("Stop Debugging").clicked() {
-                            self.on_debug_stop();
-                            ui.close_menu();
-                        }
-                    });
-                    ui.menu_button("Help", |ui| {
-                        if ui.button("About LiteIDE").clicked() {
-                            self.about_open = true;
-                            ui.close_menu();
-                        }
-                    });
-                });
+                            if ui.button("Save").clicked() {
+                                self.on_save();
+                                ui.close_menu();
+                            }
+                            if ui.button("Save As…").clicked() {
+                                self.open_save_as();
+                                ui.close_menu();
+                            }
+                            if ui.button("Save All").clicked() {
+                                self.on_save_all();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Quit").clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                        ui.menu_button("Edit", |ui| {
+                            menu_items_style(ui, p);
+                            if ui.button("Undo").clicked() {
+                                if let Some(ed) = self.editor.as_mut() {
+                                    ed.undo();
+                                }
+                                ui.close_menu();
+                            }
+                            if ui.button("Redo").clicked() {
+                                if let Some(ed) = self.editor.as_mut() {
+                                    ed.redo();
+                                }
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Find…").clicked() {
+                                self.open_find(false);
+                                ui.close_menu();
+                            }
+                            if ui.button("Replace…").clicked() {
+                                self.open_find(true);
+                                ui.close_menu();
+                            }
+                        });
+                        ui.menu_button("View", |ui| {
+                            menu_items_style(ui, p);
+                            let mut sb = self.settings.show_sidebar;
+                            if ui.checkbox(&mut sb, "Side Bar").changed() {
+                                self.settings.show_sidebar = sb;
+                                self.save_settings();
+                            }
+                            let mut dbg = self.debug_open;
+                            if ui.checkbox(&mut dbg, "Debug Panel").changed() {
+                                self.debug_open = dbg;
+                            }
+                            ui.separator();
+                            if ui.button("Command Palette…").clicked() {
+                                self.palette_open = true;
+                                ui.close_menu();
+                            }
+                        });
+                        ui.menu_button("Go", |ui| {
+                            menu_items_style(ui, p);
+                            if ui.button("Go to Line…").clicked() {
+                                self.goto_line_open = true;
+                                self.goto_line_input.clear();
+                                ui.close_menu();
+                            }
+                        });
+                        ui.menu_button("Run", |ui| {
+                            menu_items_style(ui, p);
+                            if ui.button("Start Debugging").clicked() {
+                                self.on_debug_start();
+                                self.debug_open = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("Stop Debugging").clicked() {
+                                self.on_debug_stop();
+                                ui.close_menu();
+                            }
+                        });
+                        ui.menu_button("Help", |ui| {
+                            menu_items_style(ui, p);
+                            if ui.button("About LiteIDE").clicked() {
+                                self.about_open = true;
+                                ui.close_menu();
+                            }
+                        });
+
+                        // 右侧窗口按钮：右对齐布局，先加的先贴右边，
+                        // 所以顺序是「关闭在最右」→ 与 VS Code 一致（最小化/最大化/关闭）。
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if window_control(ui, Codicon::ChromeClose, true, "关闭", fg) {
+                                cmd = Some(egui::ViewportCommand::Close);
+                            }
+                            let (icon, tip) = if maximized {
+                                (Codicon::ChromeRestore, "还原")
+                            } else {
+                                (Codicon::ChromeMaximize, "最大化")
+                            };
+                            if window_control(ui, icon, false, tip, fg) {
+                                cmd = Some(egui::ViewportCommand::Maximized(!maximized));
+                            }
+                            if window_control(ui, Codicon::ChromeMinimize, false, "最小化", fg) {
+                                cmd = Some(egui::ViewportCommand::Minimized(true));
+                            }
+                        });
+                    },
+                );
+
+                // 标题栏空白处：双击 = 最大化/还原，按下拖动 = 移动窗口。
+                if drag.double_clicked() {
+                    cmd = Some(egui::ViewportCommand::Maximized(!maximized));
+                } else if drag.drag_started_by(egui::PointerButton::Primary)
+                    && !press_on_resize_edge(ctx)
+                {
+                    cmd = Some(egui::ViewportCommand::StartDrag);
+                }
             });
+        if let Some(cmd) = cmd {
+            ctx.send_viewport_cmd(cmd);
+        }
+    }
+
+    /// 自绘标题栏后系统不再提供边框缩放：光标进入窗口四边/四角 5px 时换成缩放箭头，
+    /// 按下时交给 winit 的原生缩放循环（VS Code 的 `.resizer` 同理）。
+    fn draw_window_resize_edges(&mut self, ctx: &egui::Context) {
+        let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        let Some((dir, cursor)) = resize_zone_at(ctx, pos) else {
+            return;
+        };
+        ctx.set_cursor_icon(cursor);
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
     }
 
     fn draw_tab_strip(&mut self, ctx: &egui::Context) {
@@ -4375,7 +4492,7 @@ impl eframe::App for LiteIdeApp {
         let text_focus_before = ctx.wants_keyboard_input();
 
         self.draw_status_bar(ctx);
-        self.draw_menu_bar(ctx);
+        self.draw_title_bar(ctx);
         self.draw_activity_bar(ctx);
         self.draw_sidebar(ctx);
         if self.debug_open {
@@ -4510,6 +4627,8 @@ impl eframe::App for LiteIdeApp {
         self.draw_keys(ctx);
         self.draw_close_confirm(ctx);
         self.draw_flash(ctx);
+        // 自绘标题栏后，窗口四边的缩放带由我们自己接管（放最后：光标样式由它说了算）。
+        self.draw_window_resize_edges(ctx);
 
         // egui 默认「按需重绘」：后台线程（rg / LSP / DAP）刚送到的结果如果不主动重绘，
         // 界面就一直停在旧帧，直到用户再动一下鼠标 —— 表现就是「搜索没反应」。
@@ -4582,6 +4701,11 @@ enum Codicon {
     // 树/行内的展开箭头
     ChevronRight, // eab6
     ChevronDown,  // eab4
+    // 标题栏：窗口按钮（最小化/最大化/还原/关闭）
+    ChromeMinimize, // eaba
+    ChromeMaximize, // eab9
+    ChromeRestore,  // eabb
+    ChromeClose,    // eab8
 }
 
 impl Codicon {
@@ -4611,6 +4735,10 @@ impl Codicon {
         Codicon::ReplaceAll,
         Codicon::ChevronRight,
         Codicon::ChevronDown,
+        Codicon::ChromeMinimize,
+        Codicon::ChromeMaximize,
+        Codicon::ChromeRestore,
+        Codicon::ChromeClose,
     ];
 
     /// 字体里的码位（U+Exxx）。
@@ -4639,6 +4767,10 @@ impl Codicon {
             Codicon::ReplaceAll => 0xeb3c,
             Codicon::ChevronRight => 0xeab6,
             Codicon::ChevronDown => 0xeab4,
+            Codicon::ChromeMinimize => 0xeaba,
+            Codicon::ChromeMaximize => 0xeab9,
+            Codicon::ChromeRestore => 0xeabb,
+            Codicon::ChromeClose => 0xeab8,
         };
         char::from_u32(cp).unwrap_or(' ')
     }
@@ -4674,6 +4806,135 @@ fn draw_twistie(painter: &egui::Painter, center: egui::Pos2, expanded: bool, col
         Codicon::ChevronRight
     };
     draw_codicon(painter, center, 14.0, icon, color);
+}
+
+// ---- 自绘标题栏（VS Code 的窗口标题栏样式） ----
+
+/// 标题栏左上的应用图标：VS Code 在 35px 宽的区域里居中放一个图标（见 `APPICON_SIZE`）。
+fn draw_app_icon(painter: &egui::Painter, center: egui::Pos2, icon: &egui::TextureHandle) {
+    painter.image(
+        icon.id(),
+        egui::Rect::from_center_size(center, egui::Vec2::splat(APPICON_SIZE)),
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+/// 把内嵌的应用图标 PNG 解成纹理（首帧建一次，之后缓存在 `LiteIdeApp::app_icon` 里复用）。
+///
+/// 图标是随二进制内嵌的仓库资源，解不开属于构建事故；这里只记日志、退化成「标题栏不画图标」，
+/// 不在 UI 线程里 panic。
+fn app_icon_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let icon = match eframe::icon_data::from_png_bytes(APPICON_PNG) {
+        Ok(icon) => icon,
+        Err(err) => {
+            tracing::warn!("[ui] 内置应用图标解码失败，标题栏不显示图标：{err}");
+            return None;
+        }
+    };
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    Some(ctx.load_texture("app_icon", image, egui::TextureOptions::LINEAR))
+}
+
+/// 标题栏右侧的窗口按钮（VS Code `.window-icon`：46px 宽、16px 图标、悬停出底色）。
+///
+/// 悬停底色取自 VS Code：普通按钮 `#ffffff1a`，关闭按钮 `#e81123e6` + 白色图标。
+fn window_control(
+    ui: &mut egui::Ui,
+    icon: Codicon,
+    close: bool,
+    tip: &str,
+    fg: egui::Color32,
+) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(WINDOW_BTN_W, TITLEBAR_H), egui::Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter();
+    if hovered {
+        let bg = if close {
+            egui::Color32::from_rgba_unmultiplied(0xe8, 0x11, 0x23, 0xe6)
+        } else {
+            egui::Color32::from_white_alpha(0x1a)
+        };
+        painter.rect_filled(rect, 0.0, bg);
+    }
+    let color = if close && hovered {
+        egui::Color32::WHITE
+    } else {
+        fg
+    };
+    draw_codicon(painter, rect.center(), 16.0, icon, color);
+    resp.on_hover_text(tip).clicked()
+}
+
+/// 下拉菜单项的样式：VS Code `menu.foreground` + `menu.selectionBackground`（Dark+ 蓝）。
+///
+/// 注意：egui 的弹出菜单用的是 `ctx` 的样式（不是父 Ui 的），所以这段只能写在各菜单闭包
+/// 内部——在那里 `ui` 已经是弹出菜单自己的 Ui。
+fn menu_items_style(ui: &mut egui::Ui, p: PaletteHex) {
+    let st = ui.style_mut();
+    st.spacing.button_padding = egui::vec2(8.0, 4.0);
+    st.text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+    st.visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    st.visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
+    st.visuals.widgets.inactive.fg_stroke.color = hex(p.fg_titlebar);
+    st.visuals.widgets.hovered.weak_bg_fill = hex(p.bg_menu_selection);
+    st.visuals.widgets.hovered.bg_fill = hex(p.bg_menu_selection);
+    st.visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
+    st.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+}
+
+/// 窗口边缘的缩放带命中（四角优先于四边）。
+fn resize_zone(
+    r: egui::Rect,
+    pos: egui::Pos2,
+) -> Option<(egui::ResizeDirection, egui::CursorIcon)> {
+    use egui::ResizeDirection as Dir;
+
+    if !r.contains(pos) {
+        return None;
+    }
+    let (n, s) = (
+        pos.y <= r.top() + RESIZE_BORDER,
+        pos.y >= r.bottom() - RESIZE_BORDER,
+    );
+    let (w, e) = (
+        pos.x <= r.left() + RESIZE_BORDER,
+        pos.x >= r.right() - RESIZE_BORDER,
+    );
+    let (dir, cursor) = match (n, s, w, e) {
+        (true, _, true, _) => (Dir::NorthWest, egui::CursorIcon::ResizeNwSe),
+        (true, _, _, true) => (Dir::NorthEast, egui::CursorIcon::ResizeNeSw),
+        (_, true, true, _) => (Dir::SouthWest, egui::CursorIcon::ResizeNeSw),
+        (_, true, _, true) => (Dir::SouthEast, egui::CursorIcon::ResizeNwSe),
+        (true, _, _, _) => (Dir::North, egui::CursorIcon::ResizeVertical),
+        (_, true, _, _) => (Dir::South, egui::CursorIcon::ResizeVertical),
+        (_, _, true, _) => (Dir::West, egui::CursorIcon::ResizeHorizontal),
+        (_, _, _, true) => (Dir::East, egui::CursorIcon::ResizeHorizontal),
+        _ => return None,
+    };
+    Some((dir, cursor))
+}
+
+/// 同 [`resize_zone`]，但最大化时四边没有缩放带（VS Code 最大化后同样不可拖边框）。
+fn resize_zone_at(
+    ctx: &egui::Context,
+    pos: egui::Pos2,
+) -> Option<(egui::ResizeDirection, egui::CursorIcon)> {
+    if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+        return None;
+    }
+    resize_zone(ctx.screen_rect(), pos)
+}
+
+/// 这次按下是否落在窗口边缘的缩放带上（是的话就不能同时开始拖动窗口）。
+fn press_on_resize_edge(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.pointer.press_origin())
+        .is_some_and(|pos| resize_zone_at(ctx, pos).is_some())
 }
 
 /// 调试面板的分节标题（VS Code 风格：折叠箭头 + 名称 + 数量）。
@@ -5150,6 +5411,36 @@ const SEARCH_GUTTER_W: f32 = 18.0;
 /// 输入框内选项开关（`.monaco-custom-toggle`）边长。
 const SEARCH_TOGGLE: f32 = 20.0;
 
+// ---- 标题栏（逐项对齐 VS Code `.part.titlebar` / `.menubar` / `.window-controls-container`） ----
+/// 标题栏高度（VS Code 里由 `TitlebarPart` 直接写成 35px 内联样式）。
+const TITLEBAR_H: f32 = 35.0;
+/// 应用图标区宽度（VS Code `.window-appicon { width: 35px }`，图标 16px 居中）。
+const APPICON_W: f32 = 35.0;
+/// 标题栏里应用图标的显示边长。
+///
+/// VS Code 这里是 16px（`.window-appicon { background-size: 16px }`），但我们的图标是整块实心
+/// 深色方块，同样 16px 看着偏小；按用户反馈调到 20px。
+const APPICON_SIZE: f32 = 20.0;
+/// 应用图标位图：40×40（正好是显示尺寸的 2 倍）。
+///
+/// 就是 eframe/egui 的默认窗口图标——深色圆角方块里一个白色小写 “e”；位图比显示尺寸大
+/// 一倍，缩到 20px 时正好是一次干净的 2:1 平均（egui 的纹理没有 mipmap，尺寸取太大反而会走样）。
+/// 出处与许可见 `assets/appicon.LICENSE.txt`。
+const APPICON_PNG: &[u8] = include_bytes!("../assets/appicon.png");
+/// 窗口按钮宽度（VS Code Windows 上 3×46px = 138px）。
+const WINDOW_BTN_W: f32 = 46.0;
+/// 菜单标题左右内边距（VS Code `.menubar-menu-title { padding: 0 8px }`）。
+const MENUBAR_ITEM_PAD_X: f32 = 8.0;
+/// 菜单标题圆角（VS Code `.menubar-menu-title { border-radius: 5px }`）。
+const MENUBAR_ITEM_RADIUS: f32 = 5.0;
+/// 窗口四边/四角的缩放带宽度（VS Code `.resizer { height: 4px }`，四角留 5px）。
+const RESIZE_BORDER: f32 = 5.0;
+
+/// 菜单标题悬停底色：VS Code `menubar.selectionBackground`（深色默认 #5a5d5e50）。
+fn menubar_selection() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(0x5a, 0x5d, 0x5e, 0x50)
+}
+
 /// VS Code 的 `.monaco-inputbox`：主题输入框底色 + 1px 描边 + 4px 圆角。
 ///
 /// 高 26px、圆角 4px、文字距左沿 6px，全部由「内边距 + 内容高度」撑出。
@@ -5470,7 +5761,12 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("LiteIDE")
-            .with_inner_size([1280.0, 800.0]),
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([640.0, 400.0])
+            // 去掉系统标题栏，改由 `draw_title_bar` 自绘（图标 + 菜单 + 窗口按钮同一行，
+            // 与 VS Code 的 `window.titleBarStyle: custom` 效果一致）；窗口的拖动/缩放
+            // 随之也由我们自己接管（见 `draw_window_resize_edges`）。
+            .with_decorations(false),
         ..Default::default()
     };
     eframe::run_native(
@@ -5955,6 +6251,97 @@ mod tests {
             }
             _ => None,
         })
+    }
+
+    /// 从一帧里找出应用图标（`Shape::image` 展开成的那张贴图四边形）的矩形。
+    fn app_icon_rect(out: &egui::FullOutput, texture: egui::TextureId) -> Option<egui::Rect> {
+        out.shapes.iter().find_map(|cs| match &cs.shape {
+            egui::Shape::Mesh(m) if m.texture_id == texture => {
+                let pts: Vec<egui::Pos2> = m.vertices.iter().map(|v| v.pos).collect();
+                Some(egui::Rect::from_points(&pts))
+            }
+            _ => None,
+        })
+    }
+
+    /// 标题栏：应用图标、菜单、窗口按钮全部合到**最上面同一行**（对齐 VS Code 的自绘标题栏）。
+    #[test]
+    fn title_bar_keeps_logo_menus_and_window_buttons_on_one_top_row() {
+        const W: f32 = 1200.0;
+        let ctx = drawing_ctx();
+        let mut app = LiteIdeApp::new();
+        // 第一帧让 `set_fonts` 生效（egui 的字体表在帧末才替换）。
+        let _ = ctx.run(probe_raw_input(), |_ctx| {});
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_title_bar(ctx));
+
+        // 1) 整条标题栏就是 35px 高的一条色带，从窗口最顶边开始（系统标题栏已被它取代）。
+        let bar = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Rect(r) if r.fill == hex("#3c3c3c") => Some(r.rect),
+                _ => None,
+            })
+            .expect("应画出标题栏底色");
+        assert_eq!(bar.height(), TITLEBAR_H);
+        assert_eq!(bar.top(), 0.0);
+        assert_eq!(bar.width(), W);
+
+        // 2) 左侧：35px 宽的应用图标区，16px 图标居中。
+        let icon_id = app.app_icon.as_ref().expect("应已加载应用图标").id();
+        let logo = app_icon_rect(&out, icon_id).expect("应画出应用图标");
+        assert_eq!(logo.center().x, APPICON_W / 2.0);
+        assert_eq!(logo.center().y, TITLEBAR_H / 2.0);
+        assert_eq!(logo.width(), APPICON_SIZE);
+        assert_eq!(logo.height(), APPICON_SIZE);
+
+        // 3) 菜单紧跟在图标区右边、和图标同一行——这正是「都在最上」。
+        let file = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text() == "File" => Some(t.pos),
+                _ => None,
+            })
+            .expect("应画出 File 菜单");
+        assert_eq!(file.x, APPICON_W + MENUBAR_ITEM_PAD_X);
+        assert!(
+            file.y > bar.top() && file.y + 7.0 < bar.bottom(),
+            "菜单不在标题栏这一行里"
+        );
+
+        // 4) 右侧：三个 46px 宽的窗口按钮，贴窗口右沿，顺序同 VS Code（最小化/最大化/关闭）。
+        let buttons = [
+            Codicon::ChromeClose,
+            Codicon::ChromeMaximize,
+            Codicon::ChromeMinimize,
+        ];
+        for (i, icon) in buttons.into_iter().enumerate() {
+            let c = codicon_center(&out, icon.glyph()).expect("应画出窗口按钮");
+            assert_eq!(c.x, W - WINDOW_BTN_W * (i as f32 + 0.5));
+            assert_eq!(c.y, TITLEBAR_H / 2.0);
+        }
+
+        // 5) 悬停底色：关闭按钮是 VS Code 的 `#e81123e6` + 白图标（46×35 的整块）。
+        let close = egui::pos2(W - WINDOW_BTN_W / 2.0, TITLEBAR_H / 2.0);
+        let mut input = probe_raw_input();
+        input.events.push(egui::Event::PointerMoved(close));
+        let out = ctx.run(input, |ctx| app.draw_title_bar(ctx));
+        let hover = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Rect(r)
+                    if r.fill == egui::Color32::from_rgba_unmultiplied(0xe8, 0x11, 0x23, 0xe6) =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .expect("关闭按钮悬停应出底色");
+        assert_eq!(hover.width(), WINDOW_BTN_W);
+        assert_eq!(hover.height(), TITLEBAR_H);
+        assert_eq!(hover.right(), W);
     }
 
     /// 把搜索侧栏画一帧，返回（输入框矩形, 徽标矩形, 文本及其左上角）。

@@ -12,6 +12,15 @@ pub const BG_ACTIVITYBAR: &str = "#333333";
 pub const BG_STATUSBAR:   &str = "#007acc";
 pub const FG_LINENUMBER:  &str = "#858585";
 pub const BG_CURRENTLINE: &str = "#2a2d2e";
+// 标题栏：dark_vs.json 未定义 `titleBar.activeBackground`，取 VSCode 内置深色默认
+// #3c3c3c（前景 #cccccc）；`titleBar.inactiveBackground` 由 dark_vs.json 覆盖为 #323233。
+pub const BG_TITLEBAR: &str = "#3c3c3c";
+pub const BG_TITLEBAR_INACTIVE: &str = "#323233";
+pub const FG_TITLEBAR: &str = "#cccccc";
+// 下拉菜单：dark_vs.json 的 `menu.background` / `menu.border` / `menu.selectionBackground`。
+pub const BG_MENU: &str = "#252526";
+pub const BORDER_MENU: &str = "#454545";
+pub const BG_MENU_SELECTION: &str = "#0078d4";
 
 // ---- Light+ ----
 pub const L_BG_EDITOR:      &str = "#FFFFFF";
@@ -24,6 +33,15 @@ pub const L_BG_CURRENTLINE: &str = "#E8E8E8";
 /// Light+ 选区/光标色（官方 editor.selectionBackground = #ADD6FF）。
 pub const L_SELECTION: &str = "#ADD6FF";
 pub const L_CURSOR:    &str = "#000000";
+// 标题栏：内置浅色默认 `titleBar.activeBackground` #dddddd / 前景 #333333；
+// `titleBar.inactiveBackground` 取 light_vs.json 的 #e5e5e5。
+pub const L_BG_TITLEBAR: &str = "#dddddd";
+pub const L_BG_TITLEBAR_INACTIVE: &str = "#e5e5e5";
+pub const L_FG_TITLEBAR: &str = "#333333";
+// 下拉菜单：light_vs.json 只覆盖了 `menu.border`，其余取内置浅色默认。
+pub const L_BG_MENU: &str = "#ffffff";
+pub const L_BORDER_MENU: &str = "#d4d4d4";
+pub const L_BG_MENU_SELECTION: &str = "#0060c0";
 
 // ---- C/C++ Themes 扩展的 "Dark (Visual Studio - C/C++)" ----
 // 色值来源：ms-vscode.cpptools-themes 的 `themes/cpptools_dark_vs_new.json`
@@ -84,6 +102,15 @@ pub struct PaletteHex {
     pub bg_currentline: &'static str,
     pub selection: &'static str,
     pub cursor: &'static str,
+    /// 自绘标题栏底色（聚焦 / 未聚焦）。
+    pub bg_titlebar: &'static str,
+    pub bg_titlebar_inactive: &'static str,
+    /// 标题栏文字与图标色。
+    pub fg_titlebar: &'static str,
+    /// 下拉菜单底色 / 描边 / 选中项底色。
+    pub bg_menu: &'static str,
+    pub border_menu: &'static str,
+    pub bg_menu_selection: &'static str,
 }
 
 /// 取指定主题的色板。
@@ -99,6 +126,12 @@ pub fn palette(kind: ThemeKind) -> PaletteHex {
             bg_currentline: BG_CURRENTLINE,
             selection: "#264f78",
             cursor: "#aeafad",
+            bg_titlebar: BG_TITLEBAR,
+            bg_titlebar_inactive: BG_TITLEBAR_INACTIVE,
+            fg_titlebar: FG_TITLEBAR,
+            bg_menu: BG_MENU,
+            border_menu: BORDER_MENU,
+            bg_menu_selection: BG_MENU_SELECTION,
         },
         ThemeKind::LightPlus => PaletteHex {
             bg_editor: L_BG_EDITOR,
@@ -110,6 +143,12 @@ pub fn palette(kind: ThemeKind) -> PaletteHex {
             bg_currentline: L_BG_CURRENTLINE,
             selection: L_SELECTION,
             cursor: L_CURSOR,
+            bg_titlebar: L_BG_TITLEBAR,
+            bg_titlebar_inactive: L_BG_TITLEBAR_INACTIVE,
+            fg_titlebar: L_FG_TITLEBAR,
+            bg_menu: L_BG_MENU,
+            border_menu: L_BORDER_MENU,
+            bg_menu_selection: L_BG_MENU_SELECTION,
         },
         ThemeKind::CppDark => PaletteHex {
             bg_editor: C_BG_EDITOR,
@@ -121,6 +160,13 @@ pub fn palette(kind: ThemeKind) -> PaletteHex {
             bg_currentline: C_BG_CURRENTLINE,
             selection: C_SELECTION,
             cursor: C_CURSOR,
+            // C/C++ 主题没有覆盖标题栏/菜单，沿用 VSCode 内置深色默认（与 Dark+ 相同）。
+            bg_titlebar: BG_TITLEBAR,
+            bg_titlebar_inactive: BG_TITLEBAR_INACTIVE,
+            fg_titlebar: FG_TITLEBAR,
+            bg_menu: BG_MENU,
+            border_menu: BORDER_MENU,
+            bg_menu_selection: BG_MENU_SELECTION,
         },
     }
 }
@@ -202,5 +248,31 @@ mod tests {
         assert_eq!(l.bg_statusbar, L_BG_STATUSBAR);
         assert_eq!(l.selection, L_SELECTION);
         assert_eq!(l.cursor, L_CURSOR);
+    }
+
+    #[test]
+    fn titlebar_colors_match_vscode() {
+        // dark_vs.json + VSCode 内置深色默认（Dark+）。
+        assert_eq!(BG_TITLEBAR, "#3c3c3c");
+        assert_eq!(BG_TITLEBAR_INACTIVE, "#323233");
+        assert_eq!(FG_TITLEBAR, "#cccccc");
+        assert_eq!(BG_MENU, "#252526");
+        assert_eq!(BORDER_MENU, "#454545");
+        assert_eq!(BG_MENU_SELECTION, "#0078d4");
+        // light_vs.json + 内置浅色默认（Light+）。
+        assert_eq!(L_BG_TITLEBAR, "#dddddd");
+        assert_eq!(L_BG_TITLEBAR_INACTIVE, "#e5e5e5");
+        assert_eq!(L_FG_TITLEBAR, "#333333");
+        assert_eq!(L_BORDER_MENU, "#d4d4d4");
+        // C/C++ 主题不覆盖标题栏/菜单，与 Dark+ 同值。
+        let c = palette(ThemeKind::CppDark);
+        assert_eq!(c.bg_titlebar, BG_TITLEBAR);
+        assert_eq!(c.bg_titlebar_inactive, BG_TITLEBAR_INACTIVE);
+        assert_eq!(c.bg_menu, BG_MENU);
+        assert_eq!(c.bg_menu_selection, BG_MENU_SELECTION);
+        let l = palette(ThemeKind::LightPlus);
+        assert_eq!(l.bg_titlebar, L_BG_TITLEBAR);
+        assert_eq!(l.fg_titlebar, L_FG_TITLEBAR);
+        assert_eq!(l.bg_menu, L_BG_MENU);
     }
 }

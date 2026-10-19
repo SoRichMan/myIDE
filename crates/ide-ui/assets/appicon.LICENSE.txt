@@ -1,0 +1,16 @@
+appicon.png —— 应用图标位图（40×40，深色圆角方块 + 白色小写 “e”）
+=================================================================
+
+来源
+----
+取自 eframe 0.28.1 crate 内的 `data/icon.png`（eframe / egui 的默认窗口图标，512×512）：
+先裁掉原图四周各 40px 的透明留白（得到 431×431 的圆角方块），再用高质量重采样缩到 40×40。
+
+之所以内嵌一份位图而不是直接依赖 eframe 的默认值：标题栏（`draw_title_bar`）要按 20px 绘制
+这个图标，而 egui 的纹理没有 mipmap，用 512px 原图缩到 20px 会因采样不足而走样；40×40 缩到
+20px 正好是干净的 2:1 平均。
+
+许可
+----
+eframe / egui 由 Emil Ernerfeldt 及贡献者以 MIT OR Apache-2.0 双许可发布，
+详见 https://github.com/emilk/egui （eframe 与 egui 各自目录下的 LICENSE-MIT / LICENSE-APACHE）。
