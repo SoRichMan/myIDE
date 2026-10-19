@@ -1,0 +1,44 @@
+﻿# ================= 构建产物 / Release 文件（不入库） =================
+# cargo
+/target
+**/*.rs.bk
+*.rlib
+*.rmeta
+
+# 本项目的便携版 / 安装包产物
+/dist
+/installer/Output
+
+# 原生产物（含 WSL g++ 编出来的调试目标）
+*.exe
+*.dll
+*.pdb
+*.lib
+*.o
+*.a
+*.so
+*.dylib
+testdata/debug_target
+
+# 本地构建日志
+/_rel*.log
+*.log
+
+# ================= 本地配置 / 缓存 =================
+**/.cache/
+*.bk
+
+# ================= 编辑器 / IDE =================
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+
+# ================= 系统 =================
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+.DS_Store

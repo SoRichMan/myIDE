@@ -1,0 +1,13 @@
+[package]
+name = "ide-dap"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

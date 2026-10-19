@@ -1,0 +1,8 @@
+# 仓库内文本一律 LF 存储与检出。
+# 本项目同时在 Windows 与 WSL 下使用：scripts/*.sh 一旦带 CRLF，
+# 在 WSL 里执行会直接报 `$'\r': command not found`。
+* text=auto eol=lf
+
+# 二进制资源
+*.png binary
+*.idx binary

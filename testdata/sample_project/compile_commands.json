@@ -1,0 +1,12 @@
+[
+  {
+    "directory": "/mnt/e/TestDeepSeek/testdata/sample_project",
+    "command": "/usr/bin/c++ -std=c++17 -I/mnt/e/TestDeepSeek/testdata/sample_project/src -c /mnt/e/TestDeepSeek/testdata/sample_project/src/main.cpp -o /dev/null",
+    "file": "/mnt/e/TestDeepSeek/testdata/sample_project/src/main.cpp"
+  },
+  {
+    "directory": "/mnt/e/TestDeepSeek/testdata/sample_project",
+    "command": "/usr/bin/c++ -std=c++17 -I/mnt/e/TestDeepSeek/testdata/sample_project/src -c /mnt/e/TestDeepSeek/testdata/sample_project/src/math_utils.cpp -o /dev/null",
+    "file": "/mnt/e/TestDeepSeek/testdata/sample_project/src/math_utils.cpp"
+  }
+]

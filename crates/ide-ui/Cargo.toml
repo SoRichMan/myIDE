@@ -1,0 +1,21 @@
+[package]
+name = "ide-ui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "liteide"
+path = "src/main.rs"
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+ide-lsp = { path = "../ide-lsp" }
+ide-dap = { path = "../ide-dap" }
+ide-search = { path = "../ide-search" }
+ide-git = { path = "../ide-git" }
+eframe.workspace = true
+egui.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
