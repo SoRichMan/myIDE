@@ -21,7 +21,7 @@ use ide_lsp::path_map::{uri_to_win, win_to_uri};
 use ide_search::{Event as SearchEvent, SearchManager, SearchMatch, SearchOptions};
 use settings::AppSettings;
 use tabs::{CloseResult, Tab, TabList};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -82,6 +82,12 @@ const CJK_FONT_CANDIDATES: &[&str] = &[
     "C:\\Windows\\Fonts\\msyh.ttf",
 ];
 
+/// 内置 codicon 图标字体的 egui 字体族名。
+///
+/// VS Code 官方图标字体（MIT，见 `assets/codicon.LICENSE.txt`）随二进制一起编译进来：
+/// 图标字形与 VS Code 完全一致，且不依赖任何外部环境（无需 Node、无需系统字体）。
+const CODICON_FAMILY: &str = "codicon";
+
 /// 按设置的字体系列重建 egui 字体表（Consolas / Cascadia Code / 默认 + CJK）。
 /// `LITEIDE_NO_CJK=1` 时跳过 CJK 字体（诊断内存用）。
 fn apply_fonts(ctx: &egui::Context, family: &str) {
@@ -123,7 +129,24 @@ fn apply_fonts(ctx: &egui::Context, family: &str) {
             break;
         }
     }
+    // 图标字体：内置 codicon.ttf（VS Code 同款字形），专用字体族，避免与文本字体互相回退。
+    add_icon_font(&mut fonts);
     ctx.set_fonts(fonts);
+}
+
+/// 把内置 codicon 图标字体注册进字体表。
+///
+/// 单独抽出的原因是绘制类测试也要用：`FontFamily::Name("codicon")` 未绑定时
+/// epaint 会直接 panic，而不是退化成方框。
+fn add_icon_font(fonts: &mut egui::FontDefinitions) {
+    fonts.font_data.insert(
+        CODICON_FAMILY.to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/codicon.ttf")),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name(CODICON_FAMILY.into()),
+        vec![CODICON_FAMILY.to_owned()],
+    );
 }
 
 fn load_initial_file() -> (Option<PathBuf>, String) {
@@ -291,6 +314,26 @@ struct LiteIdeApp {
     search_regex: bool,
     search_word: bool,
     search_glob: String,
+    /// 排除的文件 glob（VS Code「搜索详细信息 → 排除的文件」）。
+    search_exclude_glob: String,
+    // ---- VS Code 搜索视图（替换框 / 视图切换 / 折叠状态 / 输入防抖） ----
+    /// 「搜索详细信息」（包含/排除的文件）是否展开。
+    search_details_open: bool,
+    /// 是否所有结果都已折叠（标题栏按钮随之在「全部折叠 / 全部展开」间切换）。
+    search_all_collapsed: bool,
+    /// 是否展开「替换」输入框（搜索框左侧的箭头）。
+    search_replace_open: bool,
+    search_replace_text: String,
+    /// 替换时保留大小写（VS Code 的 `AB` 开关）。
+    search_preserve_case: bool,
+    /// 结果按目录树展示（否则为按文件平铺）。
+    search_view_tree: bool,
+    /// 已折叠的文件路径（平铺/树状视图共用）。
+    search_collapsed_files: HashSet<String>,
+    /// 已折叠的目录路径（树状视图）。
+    search_collapsed_dirs: HashSet<String>,
+    /// 输入防抖：到什么时刻该自动搜索（VS Code 是边输入边搜）。
+    search_debounce_at: Option<Instant>,
     // ---- 复核改进：资源管理器文件树 ----
     explorer_files: Vec<String>,
     explorer_tree: tree::FileTree,
@@ -439,6 +482,16 @@ impl LiteIdeApp {
             search_regex: false,
             search_word: false,
             search_glob: String::new(),
+            search_exclude_glob: String::new(),
+            search_details_open: false,
+            search_all_collapsed: false,
+            search_replace_open: false,
+            search_replace_text: String::new(),
+            search_preserve_case: false,
+            search_view_tree: false,
+            search_collapsed_files: HashSet::new(),
+            search_collapsed_dirs: HashSet::new(),
+            search_debounce_at: None,
             explorer_files: Vec::new(),
             explorer_tree: tree::FileTree::default(),
             explorer_rows: Vec::new(),
@@ -1598,7 +1651,7 @@ impl LiteIdeApp {
                             go_dir = Some(parent.to_path_buf());
                         }
                     }
-                    if icon_button(ui, IconKind::Refresh, "重新读取当前目录").clicked() {
+                    if icon_button(ui, Codicon::Refresh, "重新读取当前目录").clicked() {
                         go_dir = Some(dir.clone());
                     }
                 });
@@ -1633,9 +1686,9 @@ impl LiteIdeApp {
                         for &i in &shown[range] {
                             let (name, is_dir) = &entries[i];
                             let (icon, color) = if *is_dir {
-                                (IconKind::Folder, hex("#dcb67a"))
+                                (Codicon::Folder, hex("#dcb67a"))
                             } else {
-                                (IconKind::File, file_icon_color(name))
+                                (Codicon::File, file_icon_color(name))
                             };
                             if browser_row(ui, row_w, row_h, icon, name, color) {
                                 let p = dir.join(name);
@@ -1687,156 +1740,575 @@ impl LiteIdeApp {
             regex: self.search_regex,
             whole_word: self.search_word,
             glob: Some(self.search_glob.clone()).filter(|g| !g.trim().is_empty()),
+            exclude_glob: Some(self.search_exclude_glob.clone()).filter(|g| !g.trim().is_empty()),
         };
         let seq = self.search.search(&root, &q, &opts);
         self.pending_search_seq = Some(seq);
+        // 新结果集默认全展开，标题栏回到「全部折叠」。
+        self.search_all_collapsed = false;
     }
 
-    /// 侧栏「搜索」视图：查询框 + 选项 + 结果列表（VS Code 布局）。
+    /// 侧栏「搜索」视图：与 VS Code 一致的标题栏动作、搜索/替换框、选项与结果树。
     fn draw_search_content(&mut self, ui: &mut egui::Ui) {
+        let c = search_colors(self.applied_theme);
+        let mut want_refresh = false;
+        let mut want_clear = false;
+        let mut want_collapse_all = false;
+        let mut want_expand_all = false;
+        let mut want_open_editor = false;
+        let mut want_search = false;
+        let mut rerun = false;
+
+        // ---- 标题栏：SEARCH + 右侧动作 ----
+        // 动作与顺序照搬 VS Code（从左到右）：刷新 / 清除搜索结果 / 以树（列表）形式查看 /
+        // 全部折叠。VS Code 这里没有「⋯ 更多」菜单，故不再提供；「打开新的搜索编辑器」
+        // 本 IDE 用不上，按用户要求去掉。
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(RichText::new("SEARCH").size(11.0).color(hex("#bbbbbb")));
+            ui.add_space(SEARCH_INPUT_LEFT);
+            ui.label(RichText::new("SEARCH").size(11.0).color(c.header));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
-                if icon_button(ui, IconKind::Refresh, "按当前条件重新搜索").clicked() {
-                    self.start_content_search();
+                // 全部折叠 / 全部展开 是同一个位置的两个动作（与 VS Code 一致）。
+                if self.search_all_collapsed {
+                    if icon_button(ui, Codicon::ExpandAll, "全部展开").clicked() {
+                        want_expand_all = true;
+                    }
+                } else if icon_button(ui, Codicon::CollapseAll, "全部折叠").clicked() {
+                    want_collapse_all = true;
+                }
+                // VS Code 的这个按钮：图标表示「当前模式」，提示语表示「点击后切到的模式」。
+                let (view_icon, view_tip) = if self.search_view_tree {
+                    (Codicon::ListTree, "以列表形式查看")
+                } else {
+                    (Codicon::ListFlat, "以树形式查看")
+                };
+                if icon_button(ui, view_icon, view_tip).clicked() {
+                    self.search_view_tree = !self.search_view_tree;
+                }
+                if icon_button(ui, Codicon::ClearAll, "清除搜索结果与输入").clicked() {
+                    want_clear = true;
+                }
+                if icon_button(ui, Codicon::Refresh, "按当前条件重新搜索").clicked() {
+                    want_refresh = true;
                 }
             });
         });
-        ui.add_space(2.0);
+        ui.add_space(3.0);
 
+        // 这个视图里每一段间隔都是显式 `add_space`（VS Code 的间距都是写死的），
+        // 所以关掉 egui 默认的纵向 item_spacing，避免每段之间各多出 4px 空行。
+        ui.spacing_mut().item_spacing.y = 0.0;
+
+        // ---- 搜索框 / 替换框 ----
+        // 布局照搬 VS Code searchView：左侧一条 18px 窄槽放「折叠替换」箭头（整条可点、
+        // 箭头在两个框之间垂直居中），输入框 26px 高、4px 圆角，左沿 20px、右沿 8px；
+        // 框内右侧一组 20px 的选项开关（Aa / ab / .*），最右留 2px。
         let mut query = self.content_query.clone();
-        let mut do_search = false;
-        let edit = ui.add(
-            egui::TextEdit::singleline(&mut query)
-                .hint_text("在工程中搜索…")
-                .desired_width(f32::INFINITY),
-        );
-        if self.content_search_focus {
-            self.content_search_focus = false;
-            edit.request_focus();
-        }
-        if edit.lost_focus()
-            && ui.input(|i| i.key_pressed(egui::Key::Enter))
-            && !query.trim().is_empty()
-        {
-            do_search = true;
-        }
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .selectable_label(self.search_case, "Aa")
-                .on_hover_text("区分大小写")
-                .clicked()
-            {
-                self.search_case = !self.search_case;
+        let mut edit_changed = false;
+        let mut edit_enter = false;
+        let row_w = ui.available_width();
+        let box_w = (row_w - SEARCH_INPUT_LEFT - SEARCH_INPUT_RIGHT).max(96.0);
+        let inner_w = input_box_inner_w(box_w);
+        // 搜索框内容：输入框 + 2px + 三个开关（各自 20px、间距 2px）。开关右侧不再留白，
+        // 由框的 2px 内边距提供 VS Code 那 2px 间距。
+        let search_edit_w =
+            (inner_w - 2.0 - 3.0 * SEARCH_TOGGLE - 2.0 * 2.0 - TEXT_EDIT_EXTRA_W).max(48.0);
+        // 替换框窄一些：右侧要留出「全部替换」按钮（4px 间距 + 20px 按钮 + 2px 边距）。
+        let replace_box_w = (box_w - 28.0).max(80.0);
+        let replace_edit_w =
+            (input_box_inner_w(replace_box_w) - 2.0 - SEARCH_TOGGLE - TEXT_EDIT_EXTRA_W).max(48.0);
+        let replace_open = self.search_replace_open;
+        let widget_h = if replace_open {
+            2.0 * SEARCH_INPUT_H + SEARCH_INPUT_GAP
+        } else {
+            SEARCH_INPUT_H
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            // 左侧窄槽：整条可点，与 VS Code 的 `.toggle-replace-button` 一样贯穿两个输入框
+            // （展开时箭头正好落在两个框之间）。
+            let (gutter, gutter_resp) =
+                ui.allocate_exact_size(egui::vec2(SEARCH_GUTTER_W, widget_h), egui::Sense::click());
+            if gutter_resp.hovered() {
+                ui.painter().rect_filled(gutter, 3.0, c.toggle_hover);
             }
-            if ui
-                .selectable_label(self.search_regex, ".*")
-                .on_hover_text("正则表达式")
-                .clicked()
-            {
-                self.search_regex = !self.search_regex;
-            }
-            if ui
-                .selectable_label(self.search_word, "ab")
-                .on_hover_text("全词匹配")
-                .clicked()
-            {
-                self.search_word = !self.search_word;
-            }
-            ui.label(
-                RichText::new(format!("{} 处匹配", self.content_results.len()))
-                    .size(11.0)
-                    .color(hex("#9cdcfe")),
+            draw_twistie(
+                ui.painter(),
+                egui::pos2(gutter.center().x + 1.0, gutter.center().y),
+                replace_open,
+                c.fg,
             );
+            if gutter_resp.clicked() {
+                self.search_replace_open = !replace_open;
+            }
+            gutter_resp.on_hover_text(if replace_open {
+                "隐藏替换"
+            } else {
+                "显示替换"
+            });
+
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // ---- 搜索输入框 ----
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(SEARCH_INPUT_LEFT - SEARCH_GUTTER_W);
+                    input_box_frame(c).show(ui, |ui| {
+                        ui.set_min_width(inner_w);
+                        ui.set_min_height(SEARCH_INPUT_INNER_H);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut query)
+                                    .frame(false)
+                                    .hint_text("搜索")
+                                    .desired_width(search_edit_w)
+                                    .text_color(c.fg),
+                            );
+                            if self.content_search_focus {
+                                self.content_search_focus = false;
+                                edit.request_focus();
+                            }
+                            edit_changed = edit.changed();
+                            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                edit_enter = true;
+                            }
+                            ui.add_space(2.0);
+                            if option_toggle(
+                                ui,
+                                Codicon::CaseSensitive,
+                                self.search_case,
+                                c,
+                                "区分大小写",
+                            )
+                            .clicked()
+                            {
+                                self.search_case = !self.search_case;
+                                rerun = true;
+                            }
+                            ui.add_space(2.0);
+                            if option_toggle(
+                                ui,
+                                Codicon::WholeWord,
+                                self.search_word,
+                                c,
+                                "全词匹配",
+                            )
+                            .clicked()
+                            {
+                                self.search_word = !self.search_word;
+                                rerun = true;
+                            }
+                            ui.add_space(2.0);
+                            if option_toggle(
+                                ui,
+                                Codicon::Regex,
+                                self.search_regex,
+                                c,
+                                "使用正则表达式",
+                            )
+                            .clicked()
+                            {
+                                self.search_regex = !self.search_regex;
+                                rerun = true;
+                            }
+                        });
+                    });
+                });
+                // ---- 替换输入框（框内右侧是 AB，再往右是「全部替换」）----
+                if replace_open {
+                    ui.add_space(SEARCH_INPUT_GAP);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.add_space(SEARCH_INPUT_LEFT - SEARCH_GUTTER_W);
+                        input_box_frame(c).show(ui, |ui| {
+                            ui.set_min_width(input_box_inner_w(replace_box_w));
+                            ui.set_min_height(SEARCH_INPUT_INNER_H);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_replace_text)
+                                        .frame(false)
+                                        .hint_text("替换")
+                                        .desired_width(replace_edit_w)
+                                        .text_color(c.fg),
+                                );
+                                ui.add_space(2.0);
+                                if option_toggle(
+                                    ui,
+                                    Codicon::PreserveCase,
+                                    self.search_preserve_case,
+                                    c,
+                                    "替换时保留大小写",
+                                )
+                                .clicked()
+                                {
+                                    self.search_preserve_case = !self.search_preserve_case;
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        // VS Code 的「全部替换」：本 IDE 尚未实现替换写入，保持禁用态外观。
+                        icon_button_disabled(ui, Codicon::ReplaceAll, "全部替换（暂未实现）");
+                    });
+                }
+            });
         });
-        ui.add(
-            egui::TextEdit::singleline(&mut self.search_glob)
-                .hint_text("包含的文件，如 *.cpp")
-                .desired_width(f32::INFINITY),
-        );
+
+        // ---- 搜索详细信息（VSCode：替换框正下方的「⋯」，展开后是包含 / 排除的文件）----
+        // VS Code 的 `.query-details` 紧贴输入框、只有 16px 高，这里同样不留多余空行。
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.set_min_height(16.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                if ellipsis_button(ui, c).clicked() {
+                    self.search_details_open = !self.search_details_open;
+                }
+            });
+        });
+        if self.search_details_open {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.add_space(SEARCH_INPUT_LEFT);
+                ui.label(RichText::new("包含的文件").size(12.0).color(c.dim));
+            });
+            if search_input_row(ui, &mut self.search_glob, "例如 *.cpp, *.h", c) {
+                rerun = true;
+            }
+            ui.add_space(SEARCH_INPUT_GAP);
+            ui.horizontal(|ui| {
+                ui.add_space(SEARCH_INPUT_LEFT);
+                ui.label(RichText::new("排除的文件").size(12.0).color(c.dim));
+            });
+            if search_input_row(ui, &mut self.search_exclude_glob, "例如 node_modules", c) {
+                rerun = true;
+            }
+            ui.add_space(2.0);
+        }
+
         self.content_query = query;
-        if do_search {
-            self.start_content_search();
-            // 搜索框保持焦点：接着改条件再回车即可（VS Code 同款手感）。
+        if rerun {
+            want_search = true;
+        }
+        if edit_changed {
+            // 边输入边搜（350ms 防抖，与 VS Code 同款手感）。
+            self.search_debounce_at = Some(Instant::now() + Duration::from_millis(350));
+        }
+        if edit_enter {
+            self.search_debounce_at = None;
+            want_search = true;
+            // 搜索框保持焦点：接着改条件再回车即可。
             self.content_search_focus = true;
         }
-        ui.separator();
+        if let Some(t) = self.search_debounce_at {
+            if Instant::now() >= t {
+                self.search_debounce_at = None;
+                want_search = true;
+            }
+        }
 
-        // 扁平化行列表（文件头 + 每条匹配），show_rows 虚拟滚动；
-        // 避免万级匹配结果全量布局拖垮内存/帧率。
-        let results = self.content_results.clone();
-        let mut jumps: Vec<(String, u64)> = Vec::new();
-        #[derive(Clone)]
-        enum Row<'a> {
-            Header(String, usize),
-            Match(&'a SearchMatch),
-        }
-        let mut rows: Vec<Row<'_>> = Vec::new();
-        let mut by_file: HashMap<String, Vec<&SearchMatch>> = HashMap::new();
-        for m in &results {
-            by_file.entry(m.file.clone()).or_default().push(m);
-        }
-        // 文件名排序，保证结果顺序稳定（HashMap 迭代顺序随机）。
-        let mut files: Vec<&String> = by_file.keys().collect();
-        files.sort();
-        for file in files {
-            let matches = &by_file[file];
-            rows.push(Row::Header(file.clone(), matches.len()));
-            rows.extend(matches.iter().map(|m| Row::Match(m)));
-        }
-        if rows.is_empty() {
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new("(无结果)")
-                    .size(11.0)
-                    .color(hex("#6a6a6a")),
-            );
-        }
-        let row_h = ui.fonts(|f| f.row_height(&egui::FontId::monospace(12.0))) + 3.0;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_rows(ui, row_h, rows.len(), |ui, range| {
-                for i in range {
-                    match &rows[i] {
-                        Row::Header(file, n) => {
-                            ui.label(
-                                RichText::new(format!("{file}  ({n})"))
-                                    .monospace()
-                                    .size(11.5)
-                                    .color(hex("#9cdcfe")),
-                            );
-                        }
-                        Row::Match(m) => {
-                            let text = format!("{}  {}", m.line, m.text.trim());
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(text)
-                                            .monospace()
-                                            .size(11.0)
-                                            .color(hex("#d4d4d4")),
-                                    )
-                                    .frame(false),
-                                )
-                                .on_hover_text(format!("{}:{}", m.file, m.line))
-                                .clicked()
-                            {
-                                jumps.push((m.file.clone(), m.line));
-                            }
-                        }
+        // ---- 汇总 + 结果列表（借用结果集，避免每帧克隆上万条匹配） ----
+        let mut toggle_file: Option<String> = None;
+        let mut toggle_dir: Option<String> = None;
+        let mut jump: Option<(String, u64)> = None;
+        let mut collapse_files: Vec<String> = Vec::new();
+        let mut collapse_dirs: Vec<String> = Vec::new();
+        let searching = self.pending_search_seq.is_some();
+        {
+            let results = &self.content_results;
+            let file_count = results
+                .iter()
+                .map(|m| m.file.as_str())
+                .collect::<HashSet<_>>()
+                .len();
+
+            // VS Code：一条消息行「N 个结果 - 在编辑器中打开」，紧贴上面的「⋯」行
+            // （`.messages { margin-top: -5px }` 会压掉消息行自身的高度，这里退 3px 对齐）。
+            ui.add_space(-3.0);
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                let summary = if searching && results.is_empty() {
+                    "正在搜索…".to_string()
+                } else {
+                    search_summary(results.len(), file_count)
+                };
+                ui.label(RichText::new(summary).size(12.0).color(c.dim));
+                if !results.is_empty() {
+                    ui.label(RichText::new("-").size(12.0).color(c.dim));
+                    let link = ui.add(
+                        egui::Button::new(RichText::new("在编辑器中打开").size(12.0).color(c.link))
+                            .frame(false),
+                    );
+                    if link.clicked() {
+                        want_open_editor = true;
                     }
                 }
             });
+            ui.add_space(8.0);
 
-        for (file, line) in jumps {
+            let rows = build_search_rows(
+                results,
+                self.search_view_tree,
+                &self.search_collapsed_files,
+                &self.search_collapsed_dirs,
+            );
+            let tree = self.search_view_tree;
+            // VS Code 搜索结果行高固定 22px（line-height: 22px）。
+            let row_h = 22.0_f32;
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show_rows(ui, row_h, rows.len(), |ui, range| {
+                    for i in range {
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_h),
+                            egui::Sense::click(),
+                        );
+                        let painter = ui.painter();
+                        if resp.hovered() {
+                            // VS Code 的列表行左右各内缩 4px，悬停条不贴边。
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(rect.left() + ROW_INSET, rect.top()),
+                                    egui::pos2(rect.right() - ROW_INSET, rect.bottom()),
+                                ),
+                                0.0,
+                                c.hover,
+                            );
+                        }
+                        let cy = rect.center().y;
+                        match &rows[i] {
+                            SearchRow::Dir {
+                                path,
+                                name,
+                                depth,
+                                expanded,
+                                count,
+                            } => {
+                                // VS Code 的树缩进：行内容左沿 = 34 + 8×层级；箭头在其左侧
+                                // 12px，图标贴内容左沿，文字再往右 22px。
+                                let x = rect.left() + row_contents_x(*depth);
+                                draw_twistie(painter, egui::pos2(x - 12.0, cy), *expanded, c.fg);
+                                draw_codicon(
+                                    painter,
+                                    egui::pos2(x + 8.0, cy),
+                                    16.0,
+                                    if *expanded {
+                                        Codicon::FolderOpened
+                                    } else {
+                                        Codicon::Folder
+                                    },
+                                    hex("#dcb67a"),
+                                );
+                                painter.text(
+                                    egui::pos2(x + 22.0, cy),
+                                    egui::Align2::LEFT_CENTER,
+                                    name.as_str(),
+                                    egui::FontId::proportional(12.0),
+                                    c.fg,
+                                );
+                                draw_badge(painter, rect, *count, c);
+                                if resp.clicked() {
+                                    toggle_dir = Some(path.clone());
+                                }
+                            }
+                            SearchRow::File {
+                                file,
+                                depth,
+                                expanded,
+                                count,
+                            } => {
+                                let (name, dir) = split_file_path(file);
+                                let x = rect.left() + row_contents_x(*depth);
+                                draw_twistie(painter, egui::pos2(x - 12.0, cy), *expanded, c.fg);
+                                draw_codicon(
+                                    painter,
+                                    egui::pos2(x + 8.0, cy),
+                                    16.0,
+                                    Codicon::File,
+                                    file_icon_color(name),
+                                );
+                                let name_rect = painter.text(
+                                    egui::pos2(x + 22.0, cy),
+                                    egui::Align2::LEFT_CENTER,
+                                    name,
+                                    egui::FontId::proportional(12.0),
+                                    c.fg,
+                                );
+                                if !tree && !dir.is_empty() {
+                                    painter.text(
+                                        egui::pos2(name_rect.right() + 7.0, cy),
+                                        egui::Align2::LEFT_CENTER,
+                                        dir,
+                                        egui::FontId::proportional(10.0),
+                                        c.dim,
+                                    );
+                                }
+                                draw_badge(painter, rect, *count, c);
+                                if resp.clicked() {
+                                    toggle_file = Some((*file).to_string());
+                                }
+                            }
+                            SearchRow::Match { file, m, depth } => {
+                                // 匹配行与文件行共用同一套缩进基准：匹配文字正好落在文件行的
+                                // 内容左沿（比文件名略左，与 VS Code 一致）。
+                                let indent = row_contents_x(*depth);
+                                let lead = m.text.len() - m.text.trim_start().len();
+                                let display = m.text.trim_start();
+                                let shifted: Vec<(usize, usize)> = m
+                                    .submatches
+                                    .iter()
+                                    .map(|&(s, e)| {
+                                        (s.saturating_sub(lead), e.saturating_sub(lead))
+                                    })
+                                    .collect();
+                                let max_w =
+                                    (rect.right() - 6.0 - (rect.left() + indent)).max(24.0);
+                                let job = highlighted_job(
+                                    display,
+                                    &shifted,
+                                    egui::FontId::monospace(11.0),
+                                    c.fg,
+                                    c.match_bg,
+                                    max_w,
+                                );
+                                let galley = ui.fonts(|f| f.layout_job(job));
+                                painter.galley(
+                                    egui::pos2(rect.left() + indent, cy - galley.size().y * 0.5),
+                                    galley,
+                                    c.fg,
+                                );
+                                if resp.clicked() {
+                                    jump = Some(((*file).to_string(), m.line));
+                                }
+                            }
+                        }
+                    }
+                });
+
+            // 供「全部折叠」使用（借用期内取好，随后统一应用）。
+            if want_collapse_all || want_expand_all {
+                for m in results {
+                    collapse_files.push(m.file.clone());
+                    collapse_dirs.extend(file_ancestor_dirs(&m.file));
+                }
+            }
+        }
+
+        // ---- 应用动作（借用已结束） ----
+        if let Some(file) = toggle_file {
+            if !self.search_collapsed_files.insert(file.clone()) {
+                self.search_collapsed_files.remove(&file);
+            }
+            self.search_all_collapsed = false;
+        }
+        if let Some(dir) = toggle_dir {
+            if !self.search_collapsed_dirs.insert(dir.clone()) {
+                self.search_collapsed_dirs.remove(&dir);
+            }
+            self.search_all_collapsed = false;
+        }
+        if want_collapse_all {
+            self.search_collapsed_files.extend(collapse_files);
+            self.search_collapsed_dirs.extend(collapse_dirs);
+            // 标题栏那个按钮随即变成「全部展开」（VS Code 同一个位置的两个动作）。
+            self.search_all_collapsed = true;
+        }
+        if want_expand_all {
+            self.search_collapsed_files.clear();
+            self.search_collapsed_dirs.clear();
+            self.search_all_collapsed = false;
+        }
+        if want_clear {
+            // VS Code 的「清除搜索结果」只清结果；本 IDE 按用户要求连四个输入框
+            // （搜索 / 替换 / 包含的文件 / 排除的文件）一起清空，点它就是回到干净面板。
+            // 注意：此时本帧的输入框内容已经写回 `content_query`，直接清字段即可。
+            self.content_results.clear();
+            self.pending_search_seq = None;
+            self.search_debounce_at = None;
+            self.content_query.clear();
+            self.search_replace_text.clear();
+            self.search_glob.clear();
+            self.search_exclude_glob.clear();
+        }
+        if want_refresh {
+            want_search = true;
+        }
+        // 「在编辑器中打开」要读结果集，放在清除之后再判断。
+        if want_open_editor {
+            self.open_search_results_editor();
+        }
+        if want_search {
+            if self.content_query.trim().is_empty() {
+                self.content_results.clear();
+                self.pending_search_seq = None;
+            } else {
+                self.start_content_search();
+            }
+        }
+
+        for (file, line) in jump.into_iter() {
             let root = self.project_root();
             let full = std::path::Path::new(&root).join(&file);
             let win = full.to_string_lossy().into_owned();
             self.jump_to(&win, line.saturating_sub(1) as usize, 0);
         }
+    }
+
+    /// 「在编辑器中打开」：把当前结果集整理成一个只读文本标签页（VS Code search editor 的轻量版）。
+    fn open_search_results_editor(&mut self) {
+        if self.content_results.is_empty() {
+            return;
+        }
+        const MAX_LINES: usize = 5000;
+        let mut text = String::new();
+        text.push_str(&format!(
+            "Search: {}\n\n",
+            if self.content_query.trim().is_empty() {
+                "(empty)"
+            } else {
+                self.content_query.trim()
+            }
+        ));
+        let mut by_file: BTreeMap<&str, Vec<&SearchMatch>> = BTreeMap::new();
+        for m in &self.content_results {
+            by_file.entry(m.file.as_str()).or_default().push(m);
+        }
+        let mut written = 0usize;
+        let mut truncated = false;
+        for (file, ms) in &by_file {
+            if written >= MAX_LINES {
+                truncated = true;
+                break;
+            }
+            text.push_str(&format!("{file}  ({} matches)\n", ms.len()));
+            for m in ms {
+                if written >= MAX_LINES {
+                    truncated = true;
+                    break;
+                }
+                text.push_str(&format!("  {:>6}: {}\n", m.line, m.text.trim_end()));
+                written += 1;
+            }
+            text.push('\n');
+        }
+        if truncated {
+            text.push_str("… (结果过多，仅展示前 5000 条)\n");
+        }
+
+        self.stash_active_tab();
+        if let Some(old_uri) = self.current_uri.clone() {
+            if self.lsp_status.is_ready() {
+                self.lsp.close_document(old_uri);
+            }
+        }
+        let idx = self.tabs.open_untitled();
+        if let Some(t) = self.tabs.get_mut(idx) {
+            t.title = "Search Results".to_string();
+            t.text = text;
+        }
+        self.load_tab_into_editor(idx);
     }
 
     fn draw_git_panel(&mut self, ctx: &egui::Context) {
@@ -3276,7 +3748,7 @@ impl LiteIdeApp {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.vertical_centered(|ui| {
-                let item = |ui: &mut egui::Ui, icon: IconKind, tip: &str, on: bool| -> bool {
+                let item = |ui: &mut egui::Ui, icon: Codicon, tip: &str, on: bool| -> bool {
                     let (rect, resp) =
                         ui.allocate_exact_size(egui::vec2(46.0, 44.0), egui::Sense::click());
                     let color = if on {
@@ -3302,13 +3774,13 @@ impl LiteIdeApp {
                             accent,
                         );
                     }
-                    draw_icon(painter, rect.center(), 22.0, icon, color);
+                    draw_codicon(painter, rect.center(), 24.0, icon, color);
                     resp.on_hover_text(tip).clicked()
                 };
                 // 高亮跟随“当前选中视图”，与侧栏是否可见解耦（VS Code 的 checked 语义）：
                 // 拖分割线收起 / Ctrl+B 隐藏后，活动栏按钮仍保持选中高亮，不会“丢失焦点”。
                 let explorer_on = self.sidebar_content == SidebarContent::Explorer;
-                if item(ui, IconKind::Explorer, "资源管理器 (Ctrl+B)", explorer_on) {
+                if item(ui, Codicon::Files, "资源管理器 (Ctrl+B)", explorer_on) {
                     if explorer_on && self.settings.show_sidebar {
                         // 再次点击已选中的视图 → 收起侧栏
                         self.settings.show_sidebar = false;
@@ -3321,7 +3793,7 @@ impl LiteIdeApp {
                 // 搜索视图与 VS Code 一致：占用侧栏位置（资源管理器所在处），
                 // 再次点击已选中的搜索图标 → 收起侧栏。
                 let search_on = self.sidebar_content == SidebarContent::Search;
-                if item(ui, IconKind::Search, "搜索 (Ctrl+Shift+F)", search_on) {
+                if item(ui, Codicon::SearchLarge, "搜索 (Ctrl+Shift+F)", search_on) {
                     if search_on && self.settings.show_sidebar {
                         self.settings.show_sidebar = false;
                     } else {
@@ -3334,7 +3806,7 @@ impl LiteIdeApp {
                 }
                 if item(
                     ui,
-                    IconKind::SourceControl,
+                    Codicon::SourceControl,
                     "源代码管理 (Ctrl+Shift+G)",
                     self.git_panel_open,
                 ) {
@@ -3343,11 +3815,11 @@ impl LiteIdeApp {
                         self.refresh_git_now();
                     }
                 }
-                if item(ui, IconKind::Run, "运行与调试 (F5)", self.debug_open) {
+                if item(ui, Codicon::RunView, "运行与调试 (F5)", self.debug_open) {
                     self.debug_open = !self.debug_open;
                 }
                 let outline_on = self.sidebar_content == SidebarContent::Outline;
-                if item(ui, IconKind::Outline, "大纲", outline_on) {
+                if item(ui, Codicon::SymbolStructure, "大纲", outline_on) {
                     if outline_on && self.settings.show_sidebar {
                         self.settings.show_sidebar = false;
                     } else {
@@ -3357,7 +3829,7 @@ impl LiteIdeApp {
                     self.save_settings();
                 }
                 ui.add_space(8.0);
-                if item(ui, IconKind::Settings, "设置 (Ctrl+,)", self.settings_open) {
+                if item(ui, Codicon::SettingsGear, "设置 (Ctrl+,)", self.settings_open) {
                     self.settings_open = !self.settings_open;
                 }
                 });
@@ -3450,7 +3922,7 @@ impl LiteIdeApp {
             ui.label(RichText::new("EXPLORER").size(11.0).color(hex("#bbbbbb")));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
-                if icon_button(ui, IconKind::Refresh, "重新扫描（rg --files）").clicked() {
+                if icon_button(ui, Codicon::Refresh, "重新扫描（rg --files）").clicked() {
                     let root = self.project_root();
                     self.search.load_files(&root);
                 }
@@ -3507,32 +3979,29 @@ impl LiteIdeApp {
                     let cy = rect.center().y;
                     let is_open = row.is_dir && expanded.contains(&row.path);
                     if row.is_dir {
-                        draw_chevron(
+                        draw_twistie(
                             painter,
-                            egui::Rect::from_center_size(
-                                egui::pos2(rect.left() + indent + 5.0, cy),
-                                egui::vec2(10.0, 10.0),
-                            ),
+                            egui::pos2(rect.left() + indent + 6.0, cy),
                             is_open,
                             hex("#cccccc"),
                         );
-                        draw_icon(
+                        draw_codicon(
                             painter,
-                            egui::pos2(rect.left() + indent + 19.0, cy),
+                            egui::pos2(rect.left() + indent + 20.0, cy),
                             16.0,
                             if is_open {
-                                IconKind::FolderOpen
+                                Codicon::FolderOpened
                             } else {
-                                IconKind::Folder
+                                Codicon::Folder
                             },
                             hex("#dcb67a"),
                         );
                     } else {
-                        draw_icon(
+                        draw_codicon(
                             painter,
-                            egui::pos2(rect.left() + indent + 19.0, cy),
+                            egui::pos2(rect.left() + indent + 20.0, cy),
                             16.0,
-                            IconKind::File,
+                            Codicon::File,
                             file_icon_color(&row.name),
                         );
                     }
@@ -3825,6 +4294,10 @@ impl eframe::App for LiteIdeApp {
             self.fonts_ready = true;
             apply_fonts(ctx, &self.settings.font_family);
             self.applied_family = self.settings.font_family.clone();
+            // egui 把新的字体定义排到「帧末」才生效，本帧仍用内置字体表；
+            // 而内置表里没有 codicon 族（画图标会 panic），所以这一帧先不画。
+            ctx.request_repaint();
+            return;
         }
 
         // 启动后 1.5s 持续请求重绘：保证字体表/异步文件列表加载后首屏不黑屏；
@@ -4072,172 +4545,135 @@ fn lsp_status_label(s: &LspStatus) -> String {
     }
 }
 
-// ---- 复核改进：矢量图标绘制（避免字体缺字显示成方框） ----
+// ---- 图标：内置 VS Code codicon 字体（字形与 VS Code 完全一致，离线可用） ----
 
-/// 图标种类（活动栏 + 资源管理器）。
+/// 用到的 codicon 图标。
+///
+/// 码位取自 VS Code 的 codicon 字体定义（`search-*` 等是 VS Code 的内置产品图标，
+/// 同样落在 codicon 字体里）；字形由随二进制内置的 `assets/codicon.ttf` 渲染，
+/// 不再自绘矢量图形——自绘无论怎么调都不可能和 VS Code 的形状一致。
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum IconKind {
-    Explorer,
-    Search,
-    SourceControl,
-    Run,
-    Outline,
-    Settings,
-    Refresh,
-    Folder,
-    FolderOpen,
-    File,
+enum Codicon {
+    // 活动栏
+    Files,           // eaf0 explorer-view-icon
+    SearchLarge,     // ec70 search-view-icon
+    SourceControl,   // ea68
+    RunView,         // eb91 debug-alt
+    SymbolStructure, // ea91 大纲
+    SettingsGear,    // eb51
+    // 文件 / 目录
+    File,         // ea7b
+    Folder,       // ea83
+    FolderOpened, // eaf7
+    // 搜索视图标题栏动作
+    Refresh,     // eb37 search-refresh
+    ClearAll,    // eabf search-clear-results
+    ListFlat,    // eb84 search-list
+    ListTree,    // eb86 search-tree
+    CollapseAll, // eac5 search-collapse-results
+    ExpandAll,   // eb95 search-expand-results
+    // 搜索框内的小开关
+    Ellipsis,      // ea7c search-details
+    CaseSensitive, // eab1
+    WholeWord,     // eb7e
+    Regex,         // eb38
+    PreserveCase,  // eb2e
+    ReplaceAll,    // eb3c search-replace-all
+    // 树/行内的展开箭头
+    ChevronRight, // eab6
+    ChevronDown,  // eab4
 }
 
-/// 在 `center` 处按 `size` 画一个矢量图标（纯 painter 图元，不依赖字体字形）。
-fn draw_icon(
+impl Codicon {
+    /// 全部图标；单测据此校验内置字体确实包含这些字形、且没有码位写重。
+    #[cfg(test)]
+    const ALL: &'static [Codicon] = &[
+        Codicon::Files,
+        Codicon::SearchLarge,
+        Codicon::SourceControl,
+        Codicon::RunView,
+        Codicon::SymbolStructure,
+        Codicon::SettingsGear,
+        Codicon::File,
+        Codicon::Folder,
+        Codicon::FolderOpened,
+        Codicon::Refresh,
+        Codicon::ClearAll,
+        Codicon::ListFlat,
+        Codicon::ListTree,
+        Codicon::CollapseAll,
+        Codicon::ExpandAll,
+        Codicon::Ellipsis,
+        Codicon::CaseSensitive,
+        Codicon::WholeWord,
+        Codicon::Regex,
+        Codicon::PreserveCase,
+        Codicon::ReplaceAll,
+        Codicon::ChevronRight,
+        Codicon::ChevronDown,
+    ];
+
+    /// 字体里的码位（U+Exxx）。
+    fn glyph(self) -> char {
+        let cp = match self {
+            Codicon::Files => 0xeaf0,
+            Codicon::SearchLarge => 0xec70,
+            Codicon::SourceControl => 0xea68,
+            Codicon::RunView => 0xeb91,
+            Codicon::SymbolStructure => 0xea91,
+            Codicon::SettingsGear => 0xeb51,
+            Codicon::File => 0xea7b,
+            Codicon::Folder => 0xea83,
+            Codicon::FolderOpened => 0xeaf7,
+            Codicon::Refresh => 0xeb37,
+            Codicon::ClearAll => 0xeabf,
+            Codicon::ListFlat => 0xeb84,
+            Codicon::ListTree => 0xeb86,
+            Codicon::CollapseAll => 0xeac5,
+            Codicon::ExpandAll => 0xeb95,
+            Codicon::Ellipsis => 0xea7c,
+            Codicon::CaseSensitive => 0xeab1,
+            Codicon::WholeWord => 0xeb7e,
+            Codicon::Regex => 0xeb38,
+            Codicon::PreserveCase => 0xeb2e,
+            Codicon::ReplaceAll => 0xeb3c,
+            Codicon::ChevronRight => 0xeab6,
+            Codicon::ChevronDown => 0xeab4,
+        };
+        char::from_u32(cp).unwrap_or(' ')
+    }
+}
+
+/// codicon 字体 id（内置 codicon.ttf 的专用族）。
+fn codicon_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(CODICON_FAMILY.into()))
+}
+
+/// 在 `center` 处按 `size` 画一个 codicon（字形来自内置字体，与 VS Code 一致）。
+fn draw_codicon(
     painter: &egui::Painter,
     center: egui::Pos2,
     size: f32,
-    icon: IconKind,
+    icon: Codicon,
     color: egui::Color32,
 ) {
-    let (cx, cy) = (center.x, center.y);
-    let p = painter;
-    let stroke = |w: f32| egui::Stroke::new(w, color);
-    match icon {
-        IconKind::Explorer => {
-            let (w, h) = (size * 0.56, size * 0.72);
-            let back = egui::Rect::from_min_size(
-                egui::pos2(cx - w * 0.5 + size * 0.14, cy - h * 0.5 - size * 0.08),
-                egui::vec2(w, h),
-            );
-            let front = egui::Rect::from_min_size(
-                egui::pos2(cx - w * 0.5 - size * 0.10, cy - h * 0.5 + size * 0.10),
-                egui::vec2(w, h),
-            );
-            p.rect_stroke(back, 1.0, stroke(1.3));
-            p.rect_stroke(front, 1.0, stroke(1.4));
-        }
-        IconKind::Search => {
-            let r = size * 0.30;
-            let c = egui::pos2(cx - size * 0.08, cy - size * 0.08);
-            p.circle_stroke(c, r, stroke(1.6));
-            p.line_segment(
-                [
-                    egui::pos2(c.x + r * 0.72, c.y + r * 0.72),
-                    egui::pos2(cx + size * 0.34, cy + size * 0.34),
-                ],
-                stroke(1.6),
-            );
-        }
-        IconKind::SourceControl => {
-            let r = size * 0.10;
-            let a = egui::pos2(cx - size * 0.22, cy - size * 0.32);
-            let b = egui::pos2(cx - size * 0.22, cy + size * 0.32);
-            let c = egui::pos2(cx + size * 0.28, cy);
-            p.line_segment([a, b], stroke(1.4));
-            p.line_segment([a, c], stroke(1.4));
-            for n in [a, b, c] {
-                p.circle_filled(n, r, color);
-            }
-        }
-        IconKind::Run => {
-            p.add(egui::Shape::convex_polygon(
-                vec![
-                    egui::pos2(cx - size * 0.22, cy - size * 0.34),
-                    egui::pos2(cx - size * 0.22, cy + size * 0.34),
-                    egui::pos2(cx + size * 0.34, cy),
-                ],
-                color,
-                egui::Stroke::NONE,
-            ));
-        }
-        IconKind::Outline => {
-            for k in 0..3 {
-                let y = cy + size * (k as f32 - 1.0) * 0.28;
-                p.circle_filled(egui::pos2(cx - size * 0.30, y), 1.6, color);
-                p.line_segment(
-                    [
-                        egui::pos2(cx - size * 0.16, y),
-                        egui::pos2(cx + size * 0.32, y),
-                    ],
-                    stroke(1.4),
-                );
-            }
-        }
-        IconKind::Settings => {
-            let c = egui::pos2(cx, cy);
-            let r1 = size * 0.28;
-            let r2 = size * 0.42;
-            p.circle_stroke(c, r1, stroke(1.4));
-            p.circle_stroke(c, r1 * 0.34, stroke(1.4));
-            for i in 0..8 {
-                let a = std::f32::consts::TAU * (i as f32) / 8.0;
-                let (s, co) = a.sin_cos();
-                p.line_segment(
-                    [
-                        egui::pos2(cx + co * r1, cy + s * r1),
-                        egui::pos2(cx + co * r2, cy + s * r2),
-                    ],
-                    stroke(1.4),
-                );
-            }
-        }
-        IconKind::Refresh => {
-            let c = egui::pos2(cx, cy);
-            let r = size * 0.28;
-            p.circle_stroke(c, r, stroke(1.4));
-            let a = egui::pos2(cx + r * 0.72, cy - r * 0.72);
-            p.add(egui::Shape::convex_polygon(
-                vec![
-                    egui::pos2(a.x - size * 0.11, a.y - size * 0.05),
-                    egui::pos2(a.x + size * 0.05, a.y - size * 0.07),
-                    egui::pos2(a.x - size * 0.01, a.y + size * 0.11),
-                ],
-                color,
-                egui::Stroke::NONE,
-            ));
-        }
-        IconKind::Folder | IconKind::FolderOpen => {
-            let (w, h) = (size * 0.66, size * 0.46);
-            let x0 = cx - w * 0.5;
-            let y0 = cy - h * 0.5 + size * 0.07;
-            p.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(x0, y0 - size * 0.12),
-                    egui::vec2(w * 0.46, size * 0.13),
-                ),
-                1.0,
-                color,
-            );
-            p.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(w, h)),
-                1.5,
-                color,
-            );
-            if icon == IconKind::FolderOpen {
-                p.rect_filled(
-                    egui::Rect::from_min_size(
-                        egui::pos2(x0, y0 + h * 0.55),
-                        egui::vec2(w, h * 0.45),
-                    ),
-                    0.5,
-                    color.gamma_multiply(0.7),
-                );
-            }
-        }
-        IconKind::File => {
-            let (w, h) = (size * 0.46, size * 0.62);
-            let rect = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(w, h));
-            p.rect_stroke(rect, 1.0, stroke(1.3));
-            for k in 0..3 {
-                let y = rect.top() + h * (0.28 + k as f32 * 0.20);
-                p.line_segment(
-                    [
-                        egui::pos2(rect.left() + w * 0.20, y),
-                        egui::pos2(rect.right() - w * 0.20, y),
-                    ],
-                    stroke(1.0),
-                );
-            }
-        }
-    }
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        icon.glyph(),
+        codicon_font(size),
+        color,
+    );
+}
+
+/// 展开/折叠箭头（资源管理器 / 搜索结果树）：VS Code 用 codicon 的 chevron。
+fn draw_twistie(painter: &egui::Painter, center: egui::Pos2, expanded: bool, color: egui::Color32) {
+    let icon = if expanded {
+        Codicon::ChevronDown
+    } else {
+        Codicon::ChevronRight
+    };
+    draw_codicon(painter, center, 14.0, icon, color);
 }
 
 /// 调试面板的分节标题（VS Code 风格：折叠箭头 + 名称 + 数量）。
@@ -4277,26 +4713,6 @@ fn section(ui: &mut egui::Ui, title: &str, count: usize) {
     }
 }
 
-/// 展开/折叠三角（资源管理器）。
-fn draw_chevron(painter: &egui::Painter, rect: egui::Rect, expanded: bool, color: egui::Color32) {
-    let c = rect.center();
-    let r = 3.5_f32;
-    let pts = if expanded {
-        vec![
-            egui::pos2(c.x - r, c.y - r * 0.5),
-            egui::pos2(c.x + r, c.y - r * 0.5),
-            egui::pos2(c.x, c.y + r * 0.8),
-        ]
-    } else {
-        vec![
-            egui::pos2(c.x - r * 0.5, c.y - r),
-            egui::pos2(c.x - r * 0.5, c.y + r),
-            egui::pos2(c.x + r * 0.8, c.y),
-        ]
-    };
-    painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
-}
-
 /// 文件图标颜色（按扩展名，近似 VSCode 文件图标配色）。
 fn file_icon_color(name: &str) -> egui::Color32 {
     match name.rsplit('.').next().unwrap_or("") {
@@ -4310,20 +4726,469 @@ fn file_icon_color(name: &str) -> egui::Color32 {
     }
 }
 
-/// 小图标按钮（侧边栏标题栏动作用）。
-fn icon_button(ui: &mut egui::Ui, icon: IconKind, tip: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-    let color = if resp.hovered() {
+// ---- VS Code 风格搜索视图（纯逻辑部分，便于单测） ----
+
+/// 搜索视图配色（Dark+ / Light+ 各一套）。
+#[derive(Clone, Copy)]
+struct SearchColors {
+    fg: egui::Color32,
+    dim: egui::Color32,
+    header: egui::Color32,
+    hover: egui::Color32,
+    input_bg: egui::Color32,
+    border: egui::Color32,
+    badge: egui::Color32,
+    badge_fg: egui::Color32,
+    match_bg: egui::Color32,
+    link: egui::Color32,
+    /// 选项开关的悬停底色（`inputOption.hoverBackground`）。
+    toggle_hover: egui::Color32,
+    /// 选项开关选中时的底色 / 描边（`inputOption.activeBackground` / `activeBorder`）。
+    toggle_on_bg: egui::Color32,
+    toggle_on_border: egui::Color32,
+}
+
+fn search_colors(theme: ThemeKind) -> SearchColors {
+    match theme {
+        ThemeKind::LightPlus => SearchColors {
+            fg: hex("#333333"),
+            dim: hex("#6a6a6a"),
+            header: hex("#333333"),
+            hover: hex("#e8e8e8"),
+            input_bg: hex("#ffffff"),
+            border: hex("#cecece"),
+            badge: hex("#c4c4c4"),
+            badge_fg: hex("#333333"),
+            match_bg: egui::Color32::from_rgba_unmultiplied(0xea, 0x5c, 0x00, 0x40),
+            link: hex("#006ab1"),
+            toggle_hover: egui::Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0x1a),
+            toggle_on_bg: hex("#0078d4"),
+            toggle_on_border: hex("#0078d4"),
+        },
+        _ => SearchColors {
+            fg: hex("#cccccc"),
+            dim: hex("#8a8a8a"),
+            header: hex("#bbbbbb"),
+            hover: hex("#2a2d2e"),
+            input_bg: hex("#3c3c3c"),
+            border: hex("#3c3c3c"),
+            badge: hex("#616161"),
+            badge_fg: hex("#f8f8f8"),
+            match_bg: egui::Color32::from_rgba_unmultiplied(0xea, 0x5c, 0x00, 0x55),
+            link: hex("#3794ff"),
+            toggle_hover: egui::Color32::from_rgba_unmultiplied(0x5a, 0x5d, 0x5e, 0x80),
+            toggle_on_bg: hex("#0078d4"),
+            toggle_on_border: hex("#0078d4"),
+        },
+    }
+}
+
+/// 搜索结果汇总文案（VS Code 同款单复数）。
+fn search_summary(results: usize, files: usize) -> String {
+    if results == 0 {
+        return "No results found".to_string();
+    }
+    let r = if results == 1 { "result" } else { "results" };
+    let f = if files == 1 { "file" } else { "files" };
+    format!("{results} {r} in {files} {f}")
+}
+
+/// 拆分 `src/app/main.cpp` → (`main.cpp`, `src/app`)。
+fn split_file_path(path: &str) -> (&str, &str) {
+    match path.rsplit_once('/') {
+        Some((dir, name)) => (name, dir),
+        None => (path, ""),
+    }
+}
+
+/// 把 rg 的字节区间收敛成「合法、有序、互不重叠」的区间：
+/// 夹到文本范围内、对齐 UTF-8 字符边界、排序并合并重叠段。
+fn clamp_submatches(text: &str, subs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = subs
+        .iter()
+        .map(|&(s, e)| (s.min(text.len()), e.min(text.len())))
+        .map(|(mut s, mut e)| {
+            while s < e && !text.is_char_boundary(s) {
+                s += 1;
+            }
+            while e > s && !text.is_char_boundary(e) {
+                e -= 1;
+            }
+            (s, e)
+        })
+        .filter(|(s, e)| e > s)
+        .collect();
+    out.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(out.len());
+    for (s, e) in out {
+        match merged.last_mut() {
+            Some((_, pe)) if s <= *pe => *pe = (*pe).max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+}
+
+/// 生成一行「命中高亮」的排版任务（单行、超宽省略）。
+fn highlighted_job(
+    text: &str,
+    subs: &[(usize, usize)],
+    font: egui::FontId,
+    color: egui::Color32,
+    background: egui::Color32,
+    max_width: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob {
+        wrap: egui::text::TextWrapping {
+            max_width,
+            max_rows: 1,
+            break_anywhere: false,
+            overflow_character: Some('…'),
+        },
+        ..Default::default()
+    };
+    let normal = egui::TextFormat {
+        font_id: font.clone(),
+        color,
+        ..Default::default()
+    };
+    let hit = egui::TextFormat {
+        font_id: font,
+        color,
+        background,
+        ..Default::default()
+    };
+    let mut pos = 0usize;
+    for (s, e) in clamp_submatches(text, subs) {
+        if s > pos {
+            job.append(&text[pos..s], 0.0, normal.clone());
+        }
+        job.append(&text[s..e], 0.0, hit.clone());
+        pos = e;
+    }
+    if pos < text.len() {
+        job.append(&text[pos..], 0.0, normal);
+    }
+    job
+}
+
+/// 搜索结果的一行。
+enum SearchRow<'a> {
+    Dir {
+        path: String,
+        name: String,
+        depth: usize,
+        expanded: bool,
+        count: usize,
+    },
+    File {
+        file: &'a str,
+        depth: usize,
+        expanded: bool,
+        count: usize,
+    },
+    Match {
+        file: &'a str,
+        m: &'a SearchMatch,
+        depth: usize,
+    },
+}
+
+/// 树状视图的目录节点。
+#[derive(Default)]
+struct SearchDir<'a> {
+    dirs: BTreeMap<String, SearchDir<'a>>,
+    files: BTreeMap<String, (&'a str, Vec<&'a SearchMatch>)>,
+    count: usize,
+}
+
+/// 构建可见行：`tree = false` 按文件平铺；`tree = true` 按目录嵌套。
+fn build_search_rows<'a>(
+    results: &'a [SearchMatch],
+    tree: bool,
+    collapsed_files: &HashSet<String>,
+    collapsed_dirs: &HashSet<String>,
+) -> Vec<SearchRow<'a>> {
+    let mut by_file: BTreeMap<&'a str, Vec<&'a SearchMatch>> = BTreeMap::new();
+    for m in results {
+        by_file.entry(m.file.as_str()).or_default().push(m);
+    }
+    for ms in by_file.values_mut() {
+        ms.sort_by_key(|m| (m.line, m.submatches.first().map(|s| s.0).unwrap_or(0)));
+    }
+
+    let mut rows = Vec::new();
+    if !tree {
+        for (file, ms) in &by_file {
+            let expanded = !collapsed_files.contains(*file);
+            rows.push(SearchRow::File {
+                file,
+                depth: 0,
+                expanded,
+                count: ms.len(),
+            });
+            if expanded {
+                rows.extend(ms.iter().map(|m| SearchRow::Match {
+                    file,
+                    m,
+                    depth: 1,
+                }));
+            }
+        }
+        return rows;
+    }
+
+    let mut root = SearchDir::default();
+    for (file, ms) in &by_file {
+        let parts: Vec<&str> = file.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            continue;
+        }
+        root.count += ms.len();
+        let mut node = &mut root;
+        for seg in &parts[..parts.len().saturating_sub(1)] {
+            node = node.dirs.entry((*seg).to_string()).or_default();
+            node.count += ms.len();
+        }
+        node.files
+            .insert(parts[parts.len() - 1].to_string(), (file, ms.clone()));
+    }
+    push_tree_rows(&root, "", 0, collapsed_files, collapsed_dirs, &mut rows);
+    rows
+}
+
+fn push_tree_rows<'a>(
+    node: &SearchDir<'a>,
+    prefix: &str,
+    depth: usize,
+    collapsed_files: &HashSet<String>,
+    collapsed_dirs: &HashSet<String>,
+    rows: &mut Vec<SearchRow<'a>>,
+) {
+    for (name, child) in &node.dirs {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let expanded = !collapsed_dirs.contains(&path);
+        rows.push(SearchRow::Dir {
+            path: path.clone(),
+            name: name.clone(),
+            depth,
+            expanded,
+            count: child.count,
+        });
+        if expanded {
+            push_tree_rows(child, &path, depth + 1, collapsed_files, collapsed_dirs, rows);
+        }
+    }
+    for (file, ms) in node.files.values() {
+        let file = *file;
+        let expanded = !collapsed_files.contains(file);
+        rows.push(SearchRow::File {
+            file,
+            depth,
+            expanded,
+            count: ms.len(),
+        });
+        if expanded {
+            rows.extend(ms.iter().map(|m| SearchRow::Match {
+                file,
+                m,
+                depth: depth + 1,
+            }));
+        }
+    }
+}
+
+/// 文件的全部祖先目录（`a/b/c.cpp` → [`a`, `a/b`]），用于「全部折叠」。
+fn file_ancestor_dirs(file: &str) -> Vec<String> {
+    let parts: Vec<&str> = file.split('/').filter(|s| !s.is_empty()).collect();
+    let mut out = Vec::new();
+    let mut acc = String::new();
+    for seg in parts.iter().take(parts.len().saturating_sub(1)) {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(seg);
+        out.push(acc.clone());
+    }
+    out
+}
+
+/// 小图标按钮（侧边栏标题栏动作用，对应 VS Code 的 title action）。
+fn icon_button(ui: &mut egui::Ui, icon: Codicon, tip: &str) -> egui::Response {
+    action_button(ui, icon, tip, false, true)
+}
+
+/// 禁用态的小图标按钮（如 VS Code 里「全部替换」在提交搜索前不可点）。
+fn icon_button_disabled(ui: &mut egui::Ui, icon: Codicon, tip: &str) -> egui::Response {
+    action_button(ui, icon, tip, false, false)
+}
+
+fn action_button(
+    ui: &mut egui::Ui,
+    icon: Codicon,
+    tip: &str,
+    active: bool,
+    enabled: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+    let hovered = enabled && resp.hovered();
+    if active || hovered {
+        ui.painter().rect_filled(
+            rect,
+            3.0,
+            hex("#ffffff").gamma_multiply(if active { 0.12 } else { 0.08 }),
+        );
+    }
+    let color = if !enabled {
+        hex("#6a6a6a")
+    } else if active || hovered {
         egui::Color32::WHITE
     } else {
         hex("#9a9a9a")
     };
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, 3.0, hex("#ffffff").gamma_multiply(0.08));
-    }
-    draw_icon(ui.painter(), rect.center(), 15.0, icon, color);
+    draw_codicon(ui.painter(), rect.center(), 16.0, icon, color);
     resp.on_hover_text(tip)
+}
+
+/// 搜索选项开关（区分大小写 / 全词 / 正则 / 保留大小写）。
+///
+/// 外观逐项对齐 VS Code 的 `.monaco-custom-toggle`：20×20、1px 边框（常态透明）、
+/// 3px 圆角、悬停 `inputOption.hoverBackground`；选中为
+/// `inputOption.activeBackground` + `activeBorder` + `activeForeground`（白字）。
+fn option_toggle(
+    ui: &mut egui::Ui,
+    icon: Codicon,
+    active: bool,
+    c: SearchColors,
+    tip: &str,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(SEARCH_TOGGLE, SEARCH_TOGGLE),
+        egui::Sense::click(),
+    );
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, 3.0, c.toggle_on_bg);
+        painter.rect_stroke(
+            rect.shrink(0.5),
+            3.0,
+            egui::Stroke::new(1.0_f32, c.toggle_on_border),
+        );
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 3.0, c.toggle_hover);
+    }
+    let fg = if active { egui::Color32::WHITE } else { c.fg };
+    draw_codicon(painter, rect.center(), 15.0, icon, fg);
+    resp.on_hover_text(tip)
+}
+
+/// 「切换搜索详细信息」的「⋯」（VS Code：16×16、紧贴替换框右下角）。
+fn ellipsis_button(ui: &mut egui::Ui, c: SearchColors) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 3.0, c.toggle_hover);
+    }
+    draw_codicon(ui.painter(), rect.center(), 16.0, Codicon::Ellipsis, c.fg);
+    resp.on_hover_text("切换搜索详细信息")
+}
+
+/// 搜索结果行的计数徽标（右对齐；VS Code 是 19px 高的圆角药丸 + 主题 badge 配色）。
+fn draw_badge(painter: &egui::Painter, rect: egui::Rect, count: usize, c: SearchColors) {
+    let text = count.to_string();
+    let h = 19.0_f32;
+    let w = (text.len() as f32 * 5.8 + 12.0).max(h);
+    let brect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - w - BADGE_RIGHT, rect.center().y - h * 0.5),
+        egui::vec2(w, h),
+    );
+    painter.rect_filled(brect, h * 0.5, c.badge);
+    painter.text(
+        brect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(10.0),
+        c.badge_fg,
+    );
+}
+
+/// egui 的 `TextEdit` 会在 `desired_width` 之外再加自己默认的左右 margin（4px×2）。
+/// 布局里算「还剩多少宽度」时必须把这段一起扣掉，否则右对齐的开关会被挤到框外。
+const TEXT_EDIT_EXTRA_W: f32 = 8.0;
+
+// ---- 搜索结果行的几何（逐项对齐 VS Code 的树行） ----
+/// 行内容的左沿（不含层级缩进）：VS Code 里是面板左沿 + 34px。
+const SEARCH_CONTENTS_X: f32 = 34.0;
+/// 每层级的缩进步长。
+const SEARCH_INDENT_STEP: f32 = 8.0;
+/// 列表行的左右内缩（悬停条不贴面板边缘）。
+const ROW_INSET: f32 = 4.0;
+/// 计数徽标距行右沿的距离。
+const BADGE_RIGHT: f32 = 16.0;
+
+/// 某一层级下，行内容（图标左沿）相对面板左沿的横坐标。
+fn row_contents_x(depth: usize) -> f32 {
+    SEARCH_CONTENTS_X + depth as f32 * SEARCH_INDENT_STEP
+}
+
+// ---- 搜索视图的几何（逐项对齐 VS Code `searchView.css`） ----
+/// 输入框（`.monaco-inputbox`）高度。
+const SEARCH_INPUT_H: f32 = 26.0;
+/// 输入框内容高度（26 = 22 + 上下各 2px 内边距）。
+const SEARCH_INPUT_INNER_H: f32 = 22.0;
+/// 搜索框与替换框之间的间距。
+const SEARCH_INPUT_GAP: f32 = 6.0;
+/// 输入框左沿（左侧 18px 窄槽 + 2px）。
+const SEARCH_INPUT_LEFT: f32 = 20.0;
+/// 输入框右沿。
+const SEARCH_INPUT_RIGHT: f32 = 8.0;
+/// 左侧「折叠替换」窄槽宽度（VS Code 的 `.toggle-replace-button`）。
+const SEARCH_GUTTER_W: f32 = 18.0;
+/// 输入框内选项开关（`.monaco-custom-toggle`）边长。
+const SEARCH_TOGGLE: f32 = 20.0;
+
+/// VS Code 的 `.monaco-inputbox`：主题输入框底色 + 1px 描边 + 4px 圆角。
+///
+/// 高 26px、圆角 4px、文字距左沿 6px，全部由「内边距 + 内容高度」撑出。
+fn input_box_frame(c: SearchColors) -> egui::Frame {
+    egui::Frame::none()
+        .fill(c.input_bg)
+        .stroke(egui::Stroke::new(1.0_f32, c.border))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(2.0, 2.0))
+}
+
+/// 输入框内部的内容宽度（`Frame` 只把左右各 2px 内边距算进尺寸，描边另画）。
+fn input_box_inner_w(box_w: f32) -> f32 {
+    (box_w - 4.0).max(40.0)
+}
+
+/// 「包含的文件 / 排除的文件」输入行，返回内容是否变化。
+fn search_input_row(ui: &mut egui::Ui, text: &mut String, hint: &str, c: SearchColors) -> bool {
+    let mut changed = false;
+    let box_w = (ui.available_width() - SEARCH_INPUT_LEFT - SEARCH_INPUT_RIGHT).max(96.0);
+    let inner_w = input_box_inner_w(box_w);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(SEARCH_INPUT_LEFT);
+        input_box_frame(c).show(ui, |ui| {
+            ui.set_min_width(inner_w);
+            ui.set_min_height(SEARCH_INPUT_INNER_H);
+            changed = ui
+                .add(
+                    egui::TextEdit::singleline(text)
+                        .frame(false)
+                        .hint_text(hint)
+                        .desired_width((inner_w - TEXT_EDIT_EXTRA_W).max(32.0))
+                        .text_color(c.fg),
+                )
+                .changed();
+        });
+    });
+    changed
 }
 
 /// 读取目录项 `(名称, 是否目录)`。
@@ -4383,7 +5248,7 @@ fn browser_row(
     ui: &mut egui::Ui,
     row_w: f32,
     row_h: f32,
-    icon: IconKind,
+    icon: Codicon,
     name: &str,
     color: egui::Color32,
 ) -> bool {
@@ -4393,7 +5258,7 @@ fn browser_row(
     if resp.hovered() {
         painter.rect_filled(rect, 3.0, hex("#2a2d2e"));
     }
-    draw_icon(
+    draw_codicon(
         painter,
         egui::pos2(rect.left() + 12.0, rect.center().y),
         15.0,
@@ -4690,11 +5555,20 @@ mod tests {
         assert_eq!(detect_indent("  a\n\tb\n"), "Tabs"); // 制表符优先
     }
 
+    /// 绘制类测试用的 egui 上下文：注册好内置图标字体（否则 codicon 族未绑定会 panic）。
+    fn drawing_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        super::add_icon_font(&mut fonts);
+        ctx.set_fonts(fonts);
+        ctx
+    }
+
     /// 守护用例：模拟 100 次快捷键/命令操作，无 panic。
     /// 只跑 safe 命令（仅内存操作，不写盘、不拉起子进程）。
     #[test]
     fn safe_commands_smoke_100_ops() {
-        let ctx = egui::Context::default();
+        let ctx = drawing_ctx();
         let mut app = LiteIdeApp::new();
         let safe_ids = [
             "file.newFile", "file.close", "file.closeAll", "file.reopenClosed", "file.copyPath",
@@ -4814,7 +5688,7 @@ mod tests {
         let Some(parent) = before.parent().map(|p| p.to_path_buf()) else {
             return; // 已在根目录，跳过
         };
-        let ctx = egui::Context::default();
+        let ctx = drawing_ctx();
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
 
         // 先空跑一帧：窗口首帧才请求焦点，同帧到达的按键会被 TextEdit 丢掉。
@@ -4867,5 +5741,339 @@ mod tests {
         let dir = app.file_picker_dir.clone();
         app.open_file_picker();
         assert_eq!(app.file_picker_dir, dir);
+    }
+
+    // ---- VS Code 风格搜索视图：纯逻辑守护 ----
+
+    fn sm(file: &str, line: u64, text: &str, subs: Vec<(usize, usize)>) -> SearchMatch {
+        SearchMatch {
+            file: file.to_string(),
+            line,
+            text: text.to_string(),
+            submatches: subs,
+        }
+    }
+
+    #[test]
+    fn codicon_font_contains_every_used_glyph() {
+        // 内置字体不依赖外部环境，但必须真的包含用到的码位，否则图标会显示成方框。
+        let ctx = drawing_ctx();
+        // Fonts 要到第一帧之后才可用（egui 要先知道 pixels_per_point）。
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let font = super::codicon_font(16.0);
+        let mut seen = std::collections::HashSet::new();
+        for &icon in super::Codicon::ALL {
+            let g = icon.glyph();
+            assert!(seen.insert(g), "码位 {g:?} 被多个图标复用");
+            assert!(
+                ctx.fonts(|f| f.has_glyph(&font, g)),
+                "内置 codicon.ttf 缺少码位 {g:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_summary_matches_vscode_pluralization() {
+        assert_eq!(super::search_summary(0, 0), "No results found");
+        assert_eq!(super::search_summary(1, 1), "1 result in 1 file");
+        assert_eq!(super::search_summary(2474, 117), "2474 results in 117 files");
+    }
+
+    #[test]
+    fn split_file_path_returns_name_and_directory() {
+        assert_eq!(super::split_file_path("src/app/main.cpp"), ("main.cpp", "src/app"));
+        assert_eq!(super::split_file_path("main.cpp"), ("main.cpp", ""));
+    }
+
+    #[test]
+    fn clamp_submatches_merges_sorts_and_clips() {
+        let text = "hello world";
+        assert_eq!(
+            super::clamp_submatches(text, &[(6, 11), (0, 5)]),
+            vec![(0, 5), (6, 11)],
+            "应按起点排序"
+        );
+        assert_eq!(
+            super::clamp_submatches(text, &[(0, 3), (2, 5)]),
+            vec![(0, 5)],
+            "重叠区间应合并"
+        );
+        assert_eq!(
+            super::clamp_submatches(text, &[(0, 999)]),
+            vec![(0, 11)],
+            "越界区间应裁剪"
+        );
+        // 多字节：把落在字符内部的边界对齐到字符边界。
+        let cjk = "你好世界";
+        assert_eq!(super::clamp_submatches(cjk, &[(2, 7)]), vec![(3, 6)]);
+    }
+
+    #[test]
+    fn search_rows_flat_groups_by_file_sorted_by_line() {
+        let ms = vec![
+            sm("b.rs", 2, "x", vec![]),
+            sm("a.rs", 3, "y", vec![]),
+            sm("a.rs", 1, "z", vec![]),
+        ];
+        let rows = super::build_search_rows(&ms, false, &HashSet::new(), &HashSet::new());
+        assert_eq!(rows.len(), 5, "两个文件头 + 三条匹配");
+        match &rows[0] {
+            SearchRow::File { file, count, expanded, .. } => {
+                assert_eq!(*file, "a.rs");
+                assert_eq!(*count, 2);
+                assert!(*expanded);
+            }
+            _ => panic!("第一行应是文件头"),
+        }
+        match &rows[1] {
+            SearchRow::Match { m, .. } => assert_eq!(m.line, 1),
+            _ => panic!("应是匹配行"),
+        }
+        match &rows[2] {
+            SearchRow::Match { m, .. } => assert_eq!(m.line, 3),
+            _ => panic!("应是匹配行"),
+        }
+
+        // 折叠 a.rs 后只剩文件头 + b.rs 的一行匹配。
+        let mut collapsed = HashSet::new();
+        collapsed.insert("a.rs".to_string());
+        let rows = super::build_search_rows(&ms, false, &collapsed, &HashSet::new());
+        assert_eq!(rows.len(), 3);
+        match &rows[0] {
+            SearchRow::File { file, expanded, .. } => {
+                assert_eq!(*file, "a.rs");
+                assert!(!*expanded);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn search_rows_tree_nests_directories_and_counts() {
+        let ms = vec![
+            sm("src/app/main.cpp", 1, "a", vec![]),
+            sm("src/app/main.cpp", 2, "b", vec![]),
+            sm("src/lib.cpp", 1, "c", vec![]),
+            sm("README.md", 1, "d", vec![]),
+        ];
+        let rows = super::build_search_rows(&ms, true, &HashSet::new(), &HashSet::new());
+        // src(dir) → app(dir) → main.cpp → 2 行 → lib.cpp → 1 行 → README.md → 1 行
+        assert_eq!(rows.len(), 9);
+        match &rows[0] {
+            SearchRow::Dir { path, count, depth, expanded, .. } => {
+                assert_eq!(path, "src");
+                assert_eq!(*count, 3);
+                assert_eq!(*depth, 0);
+                assert!(*expanded);
+            }
+            _ => panic!("树状视图第一行应是目录"),
+        }
+        match &rows[1] {
+            SearchRow::Dir { path, count, depth, .. } => {
+                assert_eq!(path, "src/app");
+                assert_eq!(*count, 2);
+                assert_eq!(*depth, 1);
+            }
+            _ => panic!(),
+        }
+        match &rows[2] {
+            SearchRow::File { file, depth, .. } => {
+                assert_eq!(*file, "src/app/main.cpp");
+                assert_eq!(*depth, 2);
+            }
+            _ => panic!(),
+        }
+
+        // 折叠 src 后：src 目录行 + README.md + 其匹配。
+        let mut collapsed = HashSet::new();
+        collapsed.insert("src".to_string());
+        let rows = super::build_search_rows(&ms, true, &HashSet::new(), &collapsed);
+        assert_eq!(rows.len(), 3);
+        match &rows[0] {
+            SearchRow::Dir { path, expanded, .. } => {
+                assert_eq!(path, "src");
+                assert!(!*expanded);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn file_ancestor_dirs_returns_all_levels() {
+        assert_eq!(super::file_ancestor_dirs("a/b/c.rs"), vec!["a", "a/b"]);
+        assert_eq!(super::file_ancestor_dirs("c.rs"), Vec::<String>::new());
+    }
+
+    /// 搜索视图的测试用 App（侧栏打开、搜索结果固定一条）。
+    fn search_probe_app(sidebar_w: f32, replace: bool, details: bool) -> LiteIdeApp {
+        let mut app = LiteIdeApp::new();
+        app.settings.show_sidebar = true;
+        app.sidebar_width = sidebar_w;
+        app.sidebar_content = SidebarContent::Search;
+        app.search_replace_open = replace;
+        app.search_details_open = details;
+        app.content_query = "file".to_string();
+        app.content_results = vec![SearchMatch {
+            file: "src/main.rs".into(),
+            line: 12,
+            text: "let x = file;".into(),
+            submatches: vec![(8, 12)],
+        }];
+        app
+    }
+
+    fn probe_raw_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// 在 `pos` 处点一下（按下 + 抬起两帧，交给 egui 判定 `clicked`）。
+    fn click_sidebar(ctx: &egui::Context, app: &mut LiteIdeApp, pos: egui::Pos2) {
+        for pressed in [true, false] {
+            let mut input = probe_raw_input();
+            input.events.push(egui::Event::PointerMoved(pos));
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            });
+            let _ = ctx.run(input, |ctx| app.draw_sidebar(ctx));
+        }
+    }
+
+    /// 从一帧里找出某个 codicon 的中心点。
+    fn codicon_center(out: &egui::FullOutput, glyph: char) -> Option<egui::Pos2> {
+        out.shapes.iter().find_map(|cs| match &cs.shape {
+            egui::Shape::Text(t) if t.galley.text() == glyph.to_string() => {
+                Some(t.pos + t.galley.size() * 0.5)
+            }
+            _ => None,
+        })
+    }
+
+    /// 把搜索侧栏画一帧，返回（输入框矩形, 徽标矩形, 文本及其左上角）。
+    fn probe_search_ui(
+        sidebar_w: f32,
+        replace: bool,
+        details: bool,
+    ) -> (Vec<egui::Rect>, Vec<egui::Rect>, Vec<(String, egui::Pos2)>) {
+        let ctx = drawing_ctx();
+        let mut app = search_probe_app(sidebar_w, replace, details);
+        // 第一帧让 `set_fonts` 生效（egui 的字体表在帧末才替换）。
+        let _ = ctx.run(probe_raw_input(), |_ctx| {});
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        let c = super::search_colors(app.applied_theme);
+        let (mut boxes, mut badges, mut texts) = (Vec::new(), Vec::new(), Vec::new());
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::Shape::Rect(r) if r.fill == c.input_bg => boxes.push(r.rect),
+                egui::Shape::Rect(r) if r.fill == c.badge => badges.push(r.rect),
+                egui::Shape::Text(t) => texts.push((t.galley.text().to_string(), t.pos)),
+                _ => {}
+            }
+        }
+        (boxes, badges, texts)
+    }
+
+    /// 「清除搜索结果」除了清结果，还要把四个输入框一起清空（用户要求）。
+    #[test]
+    fn clear_button_wipes_results_and_every_input() {
+        let ctx = drawing_ctx();
+        let mut app = search_probe_app(260.0, true, true);
+        app.search_replace_text = "file".to_string();
+        app.search_glob = "*.rs".to_string();
+        app.search_exclude_glob = "target".to_string();
+        // 第一帧让字体表生效，第二帧拿到按钮位置。
+        let _ = ctx.run(probe_raw_input(), |_ctx| {});
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        let clear = codicon_center(&out, '\u{eabf}').expect("应画出「清除搜索结果」按钮");
+
+        click_sidebar(&ctx, &mut app, clear);
+
+        assert!(app.content_query.is_empty(), "搜索框");
+        assert!(app.search_replace_text.is_empty(), "替换框");
+        assert!(app.search_glob.is_empty(), "包含的文件");
+        assert!(app.search_exclude_glob.is_empty(), "排除的文件");
+        assert!(app.content_results.is_empty(), "结果集");
+    }
+
+    /// 搜索视图的关键几何：逐项对齐 VS Code `searchView.css` 的实测值。
+    #[test]
+    fn search_view_matches_vscode_geometry() {
+        const W: f32 = 260.0;
+        let (boxes, badges, texts) = probe_search_ui(W, true, false);
+
+        // 输入框：26px 高、左沿 20、右沿 面板 - 8。
+        assert_eq!(boxes.len(), 2, "搜索框 + 替换框：{boxes:?}");
+        let (search, replace) = (boxes[0], boxes[1]);
+        assert_eq!(search.left(), SEARCH_INPUT_LEFT);
+        assert_eq!(search.right(), W - SEARCH_INPUT_RIGHT);
+        assert_eq!(search.height(), SEARCH_INPUT_H);
+        // 替换框比搜索框窄 28px（给「全部替换」按钮留位），两框间距 6px。
+        assert_eq!(replace.width(), search.width() - 28.0);
+        assert_eq!(replace.top() - search.bottom(), SEARCH_INPUT_GAP);
+
+        // 三个选项开关都在输入框内、靠右（最右那个距框右边 2px）。
+        let toggles: Vec<f32> = texts
+            .iter()
+            .filter(|(s, _)| s == "\u{eab1}" || s == "\u{eb7e}" || s == "\u{eb38}")
+            .map(|(_, pos)| pos.x)
+            .collect();
+        assert_eq!(toggles.len(), 3, "Aa / ab / .*");
+        let last_right = toggles[2] + 7.5 + 10.0; // 字形左沿 → 开关右沿
+        assert_eq!(search.right() - 2.0, last_right);
+
+        // 「⋯」紧贴输入框下方（16px 行，右沿距面板右 6px）；汇总行左沿 22px，
+        // 且与「⋯」只隔约 15px（VS Code 的 `.messages` 负外边距效果）。
+        let dots = texts
+            .iter()
+            .find(|(s, _)| s == "\u{ea7c}")
+            .expect("应画出「⋯」");
+        assert_eq!(dots.1.x + 16.0 + 6.0, W);
+        assert!((dots.1.y - replace.bottom()).abs() <= 1.0);
+        let summary = texts
+            .iter()
+            .find(|(s, _)| s.starts_with("1 result"))
+            .expect("应画出汇总行");
+        assert_eq!(summary.1.x, 22.0);
+        let gap = (summary.1.y + 7.0) - (dots.1.y + 8.0);
+        assert!((14.0..=16.0).contains(&gap), "汇总行与「⋯」间距 {gap}");
+
+        // 结果行：图标中心 34 + 8×层级 + 8，文件名 56，匹配文字 42（层级 1）；
+        // 计数徽标是 19px 药丸、右沿距面板右 16px。
+        let icon = texts
+            .iter()
+            .find(|(s, _)| s == "\u{ea7b}")
+            .expect("应画出文件图标");
+        assert_eq!(icon.1.x + 8.0, SEARCH_CONTENTS_X + 8.0);
+        let name = texts
+            .iter()
+            .find(|(s, _)| s == "main.rs")
+            .expect("应画出文件名");
+        assert_eq!(name.1.x, SEARCH_CONTENTS_X + 22.0);
+        let m = texts
+            .iter()
+            .find(|(s, _)| s == "let x = file;")
+            .expect("应画出匹配行");
+        assert_eq!(m.1.x, SEARCH_CONTENTS_X + SEARCH_INDENT_STEP);
+        assert_eq!(badges.len(), 1);
+        assert_eq!(badges[0].width(), 19.0);
+        assert_eq!(badges[0].height(), 19.0);
+        assert_eq!(badges[0].right(), W - BADGE_RIGHT);
+
+        // 替换框收起时只剩一个输入框，「⋯」紧跟在它下面。
+        let (boxes, _, texts) = probe_search_ui(W, false, false);
+        assert_eq!(boxes.len(), 1);
+        let dots = texts
+            .iter()
+            .find(|(s, _)| s == "\u{ea7c}")
+            .expect("应画出「⋯」");
+        assert!((dots.1.y - boxes[0].bottom()).abs() <= 1.0);
     }
 }

@@ -76,7 +76,7 @@ E:\TestDeepSeek\
 └── target\release\liteide.exe  9.68 MB
 ```
 
-## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第八轮扩展机制/C++ 配色）
+## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十轮搜索视图按 VS Code **实测几何**对齐，含标题栏精简与「清除」清输入）
 
 ### 已交付
 
@@ -650,6 +650,194 @@ egui-winit 把 `IMEOutput.rect` 当作 `CFS_EXCLUDE` 区交给输入法（`set_i
 | cargo clippy --workspace --all-targets -- -D warnings | ✅ 0 warning |
 | cargo build --release | ✅ 9.68 MB |
 | 光标定位实测 | ✅ 上表 4 项 |
+
+---
+
+## UI 复核改进第八轮：搜索视图对齐 VS Code（2026-10-19）
+
+用户诉求：**把侧栏搜索框的观感与交互改成和 VS Code 一致**，包含所有小按钮、小选项与结果展示。
+
+全部集中在 `crates/ide-ui/src/main.rs`（不新增阶段、不加依赖）。
+
+### 标题栏动作（对齐 VS Code Search 视图标题栏）
+
+`SEARCH` 右侧按序排列：**刷新 / 清除结果 / 全部折叠 / 以树状图查看（可切换，选中高亮）/ 更多操作 ⋯**。
+「⋯」弹出菜单：清除搜索结果、全部折叠、全部展开、以树状图查看（勾选）、在编辑器中打开。
+新增矢量图标 `Clear` / `CollapseAll` / `Tree` / `Ellipsis` / `ChevronRight` / `ChevronDown`（`draw_icon`，不依赖字体字形）。
+
+### 搜索 / 替换框 + 选项
+
+- 搜索框左侧一个箭头开合**替换框**（`search_replace_open`），箭头随状态切换 `▸/▾`；
+- 选项行顺序修正为 VS Code 的 **`Aa`（大小写）/ `ab`（全词）/ `.*`（正则）**，并为替换模式在右侧显示 **`AB`（保留大小写）**；开关外观改为 VS Code 的 input-option 方形小块（选中蓝底白字）；
+- 保留「包含的文件」glob 输入；
+- **边输入边搜**：输入 350ms 防抖自动搜索（`search_debounce_at`），改选项/glob 立即重搜；空查询清空结果。
+
+### 结果展示
+
+- 汇总行：`N results in M files`（VS Code 单复数），下方蓝色链接「在编辑器中打开」（把结果整理成未命名标签页，上限 5000 行）；
+- 每个文件一行：**折叠三角 + 文件图标（按扩展名着色）+ 文件名 + 灰色目录 + 右侧蓝色计数徽标**；
+- 命中行：缩进 + **命中片段高亮**（`submatches` 字节区间 → `clamp_submatches` 收敛/排序/合并/对齐字符边界 → `LayoutJob` 背景色）+ 超宽省略号；
+- **树状图查看**：按目录嵌套（`SearchDir`，目录行带小计徽标），可逐目录/逐文件折叠；「全部折叠/展开」一键切换；
+- 结果仍走 `show_rows` 虚拟滚动（沿用第五轮内存优化）；同时把结果集由「每帧克隆」改为**借用**，避免万级匹配的重复分配。
+
+### 新增单测（+6，纯逻辑）
+
+`search_summary_matches_vscode_pluralization`、`split_file_path_returns_name_and_directory`、
+`clamp_submatches_merges_sorts_and_clips`、`search_rows_flat_groups_by_file_sorted_by_line`、
+`search_rows_tree_nests_directories_and_counts`、`file_ancestor_dirs_returns_all_levels`。
+
+| 指标 | 结果 |
+|---|---|
+| cargo test --workspace | ✅ **全绿**（含 `python` 在 PATH 时的 7 个 mock 集成；ide-ui 91 passed） |
+| cargo clippy --workspace --all-targets -- -D warnings | ✅ 0 warning |
+| cargo build --release | ✅ 10,204,160 B ≈ 9.73 MB（< 15 MB） |
+| 截图核验 | ✅ egui 帧缓冲截屏（临时钩子已移除）：列表视图 / 树状图 / 展开替换框 三种状态与参考图一致 |
+
+### 本轮已知边界
+
+- 替换框与 `AB` 开关只做了 **UI 对齐**，未实现「替换 / 全部替换」写盘（避免无 `regex` 依赖下的语义偏差与误写盘）；
+  需要时再单开一轮做工作区替换（含确认框）。
+- 「在编辑器中打开」为轻量版：打开一个未命名只读文本标签页列结果，非 VS Code 的 search editor（不可就地点改）。
+
+---
+
+## UI 复核改进第九轮：搜索视图与 VS Code **逐像素对齐**（2026-10-19）
+
+用户诉求：上一轮「有些地方没做一致，图标选用也不一样」，要求**尽量完全一致**，且资源要独立、不依赖外部
+Node 或其它运行时（保持轻量）。
+
+因此本轮做了两件关键决定：
+
+1. **图标不再自绘**，改用 VS Code 官方 **codicon 字体**。自绘矢量图形无论怎么调都不可能和 VS Code 形状一致；
+2. 字体随二进制内置：`crates/ide-ui/assets/codicon.ttf`（126,704 B）用 `include_bytes!` 编进程序，
+   注册成独立的 `FontFamily::Name("codicon")`（`add_icon_font`）。**运行时零外部依赖**，也不需要系统装字体。
+   许可证一并入库：`assets/codicon.LICENSE.txt`（MIT）。
+
+### 图标系统重写
+
+- 删除原来的 `IconKind` / `draw_icon`（约 290 行自绘图元）与 `draw_chevron`，改为 `Codicon` 枚举 + `draw_codicon`；
+- 码位与 VS Code 一一对应（`search-refresh` 等是 VS Code 内置产品图标，同样在 codicon 字体里）：
+  活动栏 `files eaf0 / search-large ec70 / source-control ea68 / debug-alt eb91 / symbol-structure ea91 / settings-gear eb51`；
+  文件 `file ea7b / folder ea83 / folder-opened eaf7`；
+  标题栏 `refresh eb37 / clear-all eabf / new-file ea7f / list-flat eb84 / list-tree eb86 / collapse-all eac5 / expand-all eb95`；
+  输入框 `ellipsis ea7c / case-sensitive eab1 / whole-word eb7e / regex eb38 / preserve-case eb2e / replace-all eb3c`；
+  树 `chevron-down eab4 / chevron-right eab6`；
+- 新增单测 `codicon_font_contains_every_used_glyph`：遍历 `Codicon::ALL`，断言内置字体**确实包含**这些码位、
+  且没有两个图标复用同一码位 —— 以后加图标忘了同步、或资源被换掉，测试会直接失败。
+
+### 布局按 VS Code 真实 DOM/CSS 重做
+
+- **标题栏 5 个动作**（左→右：刷新 / 清除搜索结果 / 打开新的搜索编辑器 / 以树（列表）形式查看 / 全部折叠），
+  去掉了 VS Code 里根本不存在的「⋯ 更多」菜单；
+- **开关搬进输入框内右侧**（VS Code 是 `position:absolute; top:3px; right:2px`），顺序 `Aa` / `ab` / `.*`；
+  替换框同理：输入框内右侧是 `AB`，**框外右边**单放一个图标按钮「全部替换」（VS Code 提交搜索前是禁用态，本轮保持禁用观感 + tooltip 说明）；
+- **视图切换按钮的图标语义**照抄 VS Code 的怪癖：列表模式显示 `list-flat` + 提示「以树形式查看」；
+  树模式显示 `list-tree` + 提示「以列表形式查看」；
+- 「全部折叠」按钮在结果全折叠后**原地变成「全部展开」**（`search_all_collapsed`，对应 VS Code 同一位置的两个 action）；
+- **搜索详细信息**：输入框下方的 `⋯`（`ea7c`）展开「包含的文件 / 排除的文件」两个输入框，默认隐藏；
+- 汇总行合成一条：`N results in M files - 在编辑器中打开`（VS Code 的 `.messages .message` + 链接）；
+- 行高改为 VS Code 的 `line-height: 22px`；缩进改为每级 8px（箭头 `8+8d`、图标 `24+8d`、文件名 `34+8d`、
+  命中行文字 `24+8d`）；计数徽标改成 17px 高的圆角药丸 + 主题 badge 配色（深色 `#616161`/浅色 `#c4c4c4`）。
+
+### 搜索后端：排除 glob + VS Code 的逗号拆分
+
+`crates/ide-search/src/process.rs`：`SearchOptions` 新增 `exclude_glob`，`build_search_args` 里按
+`split_globs`（对齐 VS Code 的 `splitGlobAware`，**`{}` 内的逗号不算分隔符**）拆分，包含项用 `-g <p>`、
+排除项用 `-g !<p>`。新增单测 `split_globs_keeps_brace_groups_together`、`build_args_expands_include_and_exclude_globs`。
+
+### 顺带修掉一个真 bug：首帧字体表
+
+egui 的 `Context::set_fonts` 要到**帧末**才生效。原来第一帧「调完 apply_fonts 就继续画」，本帧仍用内置字体表，
+而内置表里没有 `codicon` 族 —— 直接 panic（`FontFamily::Name("codicon") is not bound to any fonts`）。
+现在首帧只装字体并 `request_repaint()` 后提前返回，不画内容。
+
+| 指标 | 结果 |
+|---|---|
+| cargo test --workspace | ✅ 全绿（ide-ui 新增 2 个单测，共 93 passed；ide-search +2） |
+| cargo clippy --workspace --all-targets -- -D warnings | ✅ 0 warning |
+| cargo build --release | ✅ 10,325,504 B ≈ 9.85 MB（+126 KB 内置 codicon 字体；仍 < 15 MB） |
+| 截图核验 | ✅ egui 帧缓冲截屏（临时钩子已移除）：列表 / 树状图 / 展开替换框 / 搜索详细信息 四种状态 |
+| 外部依赖 | ✅ 0（codicon 字体随二进制内置，无需 Node / 无需装字体） |
+
+### 本轮已知边界
+
+- 「全部替换」仍是**禁用外观**（未实现写盘替换），行为与 VS Code「未提交搜索时」一致；
+- 「包含的文件 / 排除的文件」输入框内 VS Code 还有两个小开关（`edit-code` / `book`、`exclude`），本轮未做；
+- 搜索结果的文件图标仍是「按扩展名着色 + codicon 文件形状」，没有复刻 Seti 文件图标主题（那是另一套插件资源）；
+- 缩进参考线（`.indent-guide`）未画。
+
+---
+
+## UI 复核改进第十轮：搜索视图输入框与留白**实测对齐**（2026-10-19）
+
+用户反馈两条：1) 输入框的风格和 VSCode 不一致；2) 「⋯」那一行到搜索结果统计之间的空行太多。
+
+这轮先把基准**量出来**再改：本机还开着一个 vscode.dev 搜索视图，用浏览器工具直接读它的 DOM 几何 +
+`getComputedStyle`（即 VS Code `searchView.css` 换算成像素），逐项对齐。
+
+### 基准数据（VS Code 实测：面板宽 247、面板左沿 49）
+
+- `.monaco-inputbox`：26px 高、`border-radius: 4px`、`input.background` 底 + 1px `input.border`
+  （Dark+ 两者同色 = 无描边，Dark Modern 是 `#313131` 底 + `#3c3c3c` 描边）；
+  搜索框左沿 = 面板 + 20、右沿 = 面板 - 8；替换框右沿 = 面板 - 36（右边留给「全部替换」）；
+- `.toggle-replace-button`：**不在输入框里**，是左侧 16px 宽、贯穿两个输入框的窄槽（`height: 100%`），
+  箭头垂直居中 —— 所以展开替换框时，箭头正好落在两个框中间；
+- `.monaco-custom-toggle`：20×20、1px 边框（常态透明）、3px 圆角，最右那个距框右沿 2px；
+  选中 = `inputOption.activeBackground` + `activeBorder` + 白字；
+- `.query-details` 只有 13~16px 高、紧贴替换框；`.message` = 左 22px / 下 8px 内边距，
+  `margin-top: -5px`（把消息行往上压，与「⋯」几乎贴在一起）；
+- 结果行：内容左沿 = 面板 + 34 + 8×层级，文件名 = 内容 + 22，图标中心 = 内容 + 8；
+  徽标 19×19 药丸、右沿距面板右 16px；列表悬停条左右各内缩 4px。
+
+### 本轮改动
+
+- **输入框**：抽出 `input_box_frame()`（26px 高 / 4px 圆角 / 1px 描边）与 `input_box_inner_w()`，
+  搜索框、替换框、「包含的文件」、「排除的文件」四处共用；左沿 20px、右沿 8px（原先贴边满宽）；
+  替换框窄 28px 给「全部替换」按钮；左侧 18px 窄槽（`SEARCH_GUTTER_W`）整条可点、箭头垂直居中，
+  **折叠箭头从输入框内搬到框外**（与 VS Code 一致）；框内右侧三个开关 20×20、间距 2px、最右距框沿 2px；
+- **开关样式**：`option_toggle` 常态透明 + 悬停 `inputOption.hoverBackground` + 选中蓝底 / 蓝描边 / 白字
+  （原先是 20×18 的纯色块，没有描边、尺寸也不对）；
+- **留白**：这个视图里 egui 默认的纵向 `item_spacing`（每段 4px）全部关掉，改为显式 `add_space`；
+  「⋯」行从 20px 收到 16px，汇总行只回退 3px（对齐 VS Code `margin-top: -5px` 的观感）——
+  「⋯」中心到汇总行中心 = **15px**（VS Code 实测 15.1px，改前约 29px）；
+  汇总行字号 11 → 12，左沿 22px（对齐 `.message` 的 `padding-left: 22px`）；
+- **结果行**：内容基准从 `8 + 8×层级` 改成 `34 + 8×层级`（文件名 56、命中行文字 34 + 8×层级）；
+  计数徽标 17px → 19px 药丸、右沿距面板 16px；列表悬停条左右各内缩 4px；标题栏「SEARCH」文字左沿与输入框对齐（20px）。
+
+### 守护测试
+
+新增 `search_view_matches_vscode_geometry`：用真实 egui 帧跑 `draw_sidebar`，从 `FullOutput.shapes`
+里读回矩形 / 文字位置，把上面那张基准表逐项断言下来
+（输入框 26 高 / 左 20 / 右 8、替换框窄 28 且间距 6、开关最右距框沿 2px、「⋯」紧贴输入框且右沿距面板 6、
+汇总行左 22 且与「⋯」相距 14~16、文件名 56、命中行 34 + 8、徽标 19 药丸右沿距面板 16；
+另跑一遍「替换框收起」状态）。
+
+| 指标 | 结果 |
+|---|---|
+| cargo test --workspace | ✅ 全绿（ide-ui 94 passed，本轮 +2） |
+| cargo clippy --workspace --all-targets -- -D warnings | ✅ 0 warning |
+| 几何核验 | ✅ `search_view_matches_vscode_geometry`（展开替换 / 收起替换两种状态） |
+| 新依赖 | ✅ 0（仍然只用 egui + 内置 codicon 字体） |
+
+### 追加（同日）：标题栏精简 + 「清除」语义
+
+- **去掉「打开新的搜索编辑器」按钮**（codicon `ea7f`，本 IDE 用不上）。标题栏动作变为 4 个：
+  刷新 / 清除 / 列表-树切换 / 全部折叠。`Codicon::NewFile` 变体、`ALL` 表、`glyph()` 表一并删除
+  （留着会触发 `dead_code`，`-D warnings` 过不去）；
+- **「清除搜索结果」（`eabf`）现在连输入一起清**：除结果集外，搜索框、替换框、「包含的文件」、
+  「排除的文件」四个输入框全部清空（VS Code 原语义只清结果，按用户要求扩展）。提示语相应改为
+  「清除搜索结果与输入」。清理点放在结果区渲染之后的 `want_clear` 分支——那里本帧输入内容已经写回
+  `content_query`，直接清字段即可，同时 `pending_search_seq` / `search_debounce_at` 置空，不会
+  反过来触发一次空搜索；
+- 新增端到端单测 `clear_button_wipes_results_and_every_input`：用真实 egui 帧 + 指针事件点在
+  按钮上（按下 + 抬起两帧），断言五个字段全部清空。
+
+### 本轮已知边界（沿用第九轮）
+
+- 「全部替换」仍是**禁用外观**（未实现写盘替换）；「包含的文件 / 排除的文件」里 VS Code 的两个小开关
+  （`edit-code` / `book`、`exclude`）未做；结果行文件图标仍是「按扩展名着色 + codicon 文件形状」，
+  没有复刻 Seti 主题；缩进参考线未画；汇总行与「⋯」的行高比 VS Code 各高 2px 左右（egui 的
+  `interact_size.y` 决定，视觉差 < 3px）。
 
 ---
 

@@ -124,7 +124,39 @@ pub struct SearchOptions {
     /// 全词匹配（`-w`）。
     pub whole_word: bool,
     /// 文件 glob 过滤（`-g`，如 `*.cpp`）；空表示不过滤。
+    ///
+    /// 支持 VS Code 搜索框的写法：逗号分隔多个模式，`{}` 内的逗号不算分隔符
+    /// （`*.{ts,tsx}, src/**` 是两个模式）。分隔与拆分见 [`split_globs`]。
     pub glob: Option<String>,
+    /// 排除文件 glob（`-g !<glob>`，VS Code 搜索框的「排除的文件」）；空表示不排除。
+    pub exclude_glob: Option<String>,
+}
+
+/// 按 VS Code 的 `splitGlobAware` 拆分逗号分隔的 glob 列表：
+/// `{...}` 花括号内的逗号不当作分隔符，保证 `*.{ts,tsx}` 仍是一个模式。
+pub fn split_globs(input: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0usize;
+    for (i, ch) in input.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let part = input[start..i].trim();
+                if !part.is_empty() {
+                    out.push(part);
+                }
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let part = input[start..].trim();
+    if !part.is_empty() {
+        out.push(part);
+    }
+    out
 }
 
 /// 组装内容搜索的 rg 参数（在 `run_rg` 的公共 flag 之后追加）。便于单元测试。
@@ -139,9 +171,18 @@ pub fn build_search_args(query: &str, opts: &SearchOptions) -> Vec<String> {
     if opts.whole_word {
         a.push("-w".into());
     }
-    if let Some(g) = opts.glob.as_ref().map(|g| g.trim()).filter(|g| !g.is_empty()) {
-        a.push("-g".into());
-        a.push(g.to_string());
+    if let Some(g) = opts.glob.as_deref() {
+        for part in split_globs(g) {
+            a.push("-g".into());
+            a.push(part.to_string());
+        }
+    }
+    if let Some(g) = opts.exclude_glob.as_deref() {
+        for part in split_globs(g) {
+            // rg 用 `!` 前缀表示排除（与 VS Code「排除的文件」语义一致）。
+            a.push("-g".into());
+            a.push(format!("!{part}"));
+        }
     }
     a.push("--".into());
     a.push(query.to_string());
@@ -239,6 +280,7 @@ mod tests {
             regex: true,
             whole_word: true,
             glob: Some("*.cpp".to_string()),
+            exclude_glob: None,
         };
         let a = build_search_args("a+b", &opts);
         assert!(!a.contains(&"--fixed-strings".to_string())); // 正则
@@ -254,5 +296,39 @@ mod tests {
             ..Default::default()
         };
         assert!(!build_search_args("x", &opts).contains(&"-g".to_string()));
+    }
+
+    #[test]
+    fn split_globs_keeps_brace_groups_together() {
+        assert_eq!(
+            split_globs("*.{ts,tsx}, src/**"),
+            vec!["*.{ts,tsx}", "src/**"]
+        );
+        assert_eq!(split_globs(" *.cpp , *.h ,, "), vec!["*.cpp", "*.h"]);
+        assert_eq!(split_globs(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn build_args_expands_include_and_exclude_globs() {
+        let opts = SearchOptions {
+            glob: Some("*.{ts,tsx}, src/**".to_string()),
+            exclude_glob: Some("node_modules, vendor".to_string()),
+            ..Default::default()
+        };
+        let a = build_search_args("x", &opts);
+        let pairs: Vec<(String, String)> = a
+            .windows(2)
+            .filter(|w| w[0] == "-g")
+            .map(|w| (w[0].clone(), w[1].clone()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("-g".to_string(), "*.{ts,tsx}".to_string()),
+                ("-g".to_string(), "src/**".to_string()),
+                ("-g".to_string(), "!node_modules".to_string()),
+                ("-g".to_string(), "!vendor".to_string()),
+            ]
+        );
     }
 }
