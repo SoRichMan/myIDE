@@ -44,11 +44,16 @@ const TAB_ACTIVE_INDICATOR_H: f32 = 2.0;
 /// 慢一点的双击会漏判；这里自实现识别并放宽到 Windows 的语义。
 const DOUBLE_CLICK_SECS: f64 = 0.55;
 
+/// 解析 `#RRGGBB` / `#RRGGBBAA`（VS Code 主题 JSON 里两种写法都有）。
 fn hex(s: &str) -> egui::Color32 {
     let s = s.trim_start_matches('#');
     let r = u8::from_str_radix(&s[0..2], 16).unwrap_or(0);
     let g = u8::from_str_radix(&s[2..4], 16).unwrap_or(0);
     let b = u8::from_str_radix(&s[4..6], 16).unwrap_or(0);
+    if s.len() >= 8 {
+        let a = u8::from_str_radix(&s[6..8], 16).unwrap_or(0xff);
+        return egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+    }
     egui::Color32::from_rgb(r, g, b)
 }
 
@@ -3547,14 +3552,16 @@ impl LiteIdeApp {
                     );
                 }
                 if active {
-                    // 激活标签：上边缘加一条蓝色细条
+                    // 激活标签：上边缘加一条高亮细条（`tab.selectedBorderTop`）。
+                    // 注意不能用状态栏色：状态栏已改成 Dark 2026 的深灰，
+                    // 那样标签条会跟着变灰。
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(
                             resp.rect.left_top(),
                             egui::vec2(resp.rect.width(), TAB_ACTIVE_INDICATOR_H),
                         ),
                         0.0,
-                        hex(p.bg_statusbar),
+                        hex(p.tab_active_border),
                     );
                 }
                 if resp.clicked() || resp.double_clicked() {
@@ -4202,30 +4209,60 @@ impl LiteIdeApp {
         let dap_color = dap_status_color(&self.dap_status);
         let indent = self.indent_hint.clone();
         let theme_name = self.settings.theme.clone();
-        let white = egui::Color32::WHITE;
+        let remote = self.lsp.remote_name();
+        let p = palette(self.applied_theme);
+        let fg = hex(p.fg_statusbar);
+        let hover = hex(p.bg_statusbar_hover);
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(24.0)
-            .frame(egui::Frame::none().fill(hex(ide_core::theme::BG_STATUSBAR)))
+            .frame(egui::Frame::none().fill(hex(p.bg_statusbar)))
             .show(ctx, |ui| {
+                // 顶部 1px 分隔线（VS Code `statusBar.border`）。
+                let top = ui.max_rect();
+                ui.painter().line_segment(
+                    [top.left_top(), top.right_top()],
+                    egui::Stroke::new(1.0_f32, hex(p.border_statusbar)),
+                );
+                // 状态栏项自带左右内边距，不再画 VS Code 里没有的分隔竖线。
+                ui.spacing_mut().item_spacing.x = 0.0;
                 ui.horizontal_centered(|ui| {
+                    // ---- 最左：远程连接项（VS Code 位置）----
+                    statusbar_remote(ui, &p, remote.as_deref());
+
                     // ---- 左：分支 / LSP / DBG ----
                     if let Some(branch) = &self.git_status.branch {
-                        ui.label(RichText::new(format!("branch: {branch}")).color(white).size(12.0));
-                        ui.separator();
+                        statusbar_item(
+                            ui,
+                            Some(&format!("branch: {branch}")),
+                            None,
+                            fg,
+                            egui::Color32::TRANSPARENT,
+                            hover,
+                            Some(&format!("当前分支：{branch}")),
+                        );
                     }
                     let lsp_color = match &self.lsp_status {
                         LspStatus::Ready => egui::Color32::from_rgb(0x89, 0xd1, 0x85),
                         LspStatus::Crashed(_) | LspStatus::Unavailable(_) => {
                             egui::Color32::from_rgb(0xf4, 0x87, 0x71)
                         }
-                        _ => egui::Color32::from_rgb(0xbb, 0xbb, 0xbb),
+                        _ => fg,
                     };
-                    ui.label(RichText::new(lsp_label).color(lsp_color).size(12.0));
+                    statusbar_item(
+                        ui,
+                        Some(&lsp_label),
+                        None,
+                        lsp_color,
+                        egui::Color32::TRANSPARENT,
+                        hover,
+                        None,
+                    );
                     if recoverable {
                         let txt = match &self.lsp_status {
                             LspStatus::Crashed(_) => "[ Restart clangd ]",
                             _ => "[ Retry ]",
                         };
+                        ui.add_space(4.0);
                         if ui
                             .add(egui::Button::new(txt).small())
                             .on_hover_text("重启 clangd")
@@ -4233,31 +4270,71 @@ impl LiteIdeApp {
                         {
                             self.lsp.restart();
                         }
+                        ui.add_space(4.0);
                     }
-                    ui.separator();
-                    ui.label(RichText::new(dap_label).color(dap_color).size(12.0));
+                    statusbar_item(
+                        ui,
+                        Some(&dap_label),
+                        None,
+                        dap_color,
+                        egui::Color32::TRANSPARENT,
+                        hover,
+                        None,
+                    );
                     if matches!(
                         self.dap_status,
                         DapStatus::Crashed(_) | DapStatus::Unavailable(_)
-                    ) && ui
-                        .add(egui::Button::new("[ Restart Debug ]").small())
-                        .on_hover_text("重启调试（F5）")
-                        .clicked()
-                    {
-                        self.on_debug_start();
+                    ) {
+                        ui.add_space(4.0);
+                        if ui
+                            .add(egui::Button::new("[ Restart Debug ]").small())
+                            .on_hover_text("重启调试（F5）")
+                            .clicked()
+                        {
+                            self.on_debug_start();
+                        }
                     }
 
                     // ---- 右：Ln/Col / 缩进 / 编码 / 主题（VSCode 布局）----
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            ui.label(RichText::new(theme_name).color(white).size(12.0));
-                            ui.separator();
-                            ui.label(RichText::new("UTF-8").color(white).size(12.0));
-                            ui.separator();
-                            ui.label(RichText::new(indent).color(white).size(12.0));
-                            ui.separator();
-                            ui.label(RichText::new(status.as_ref()).color(white).size(12.0));
+                            statusbar_item(
+                                ui,
+                                Some(&theme_name),
+                                None,
+                                fg,
+                                egui::Color32::TRANSPARENT,
+                                hover,
+                                None,
+                            );
+                            statusbar_item(
+                                ui,
+                                Some("UTF-8"),
+                                None,
+                                fg,
+                                egui::Color32::TRANSPARENT,
+                                hover,
+                                None,
+                            );
+                            statusbar_item(
+                                ui,
+                                Some(&indent),
+                                None,
+                                fg,
+                                egui::Color32::TRANSPARENT,
+                                hover,
+                                None,
+                            );
+                            statusbar_item(
+                                ui,
+                                Some(status.as_ref()),
+                                None,
+                                fg,
+                                egui::Color32::TRANSPARENT,
+                                hover,
+                                None,
+                            );
                         },
                     );
                 });
@@ -4404,6 +4481,101 @@ impl LiteIdeApp {
         }
     }
 }
+
+    /// 一个状态栏项：可选图标 + 可选文字，悬停时整块底色变 `hover`
+    /// （VS Code `statusBarItem.hoverBackground`）。
+    #[allow(clippy::too_many_arguments)]
+    fn statusbar_item(
+        ui: &mut egui::Ui,
+        text: Option<&str>,
+        icon: Option<Codicon>,
+        fg: egui::Color32,
+        bg: egui::Color32,
+        hover: egui::Color32,
+        tooltip: Option<&str>,
+    ) -> egui::Response {
+        const PAD_X: f32 = 6.0;
+        const ICON_W: f32 = 16.0;
+        const GAP: f32 = 4.0;
+        let font = egui::FontId::proportional(12.0);
+        let text_w = text
+            .map(|t| {
+                ui.painter()
+                    .layout_no_wrap(t.to_owned(), font.clone(), fg)
+                    .size()
+                    .x
+            })
+            .unwrap_or(0.0);
+        let width = PAD_X * 2.0
+            + if icon.is_some() { ICON_W } else { 0.0 }
+            + if icon.is_some() && text.is_some() { GAP } else { 0.0 }
+            + text_w;
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::hover());
+        let bg = if response.hovered() { hover } else { bg };
+        if bg != egui::Color32::TRANSPARENT {
+            ui.painter().rect_filled(rect, 0.0, bg);
+        }
+        let mut x = rect.left() + PAD_X;
+        if let Some(icon) = icon {
+            draw_codicon(
+                ui.painter(),
+                egui::pos2(x + ICON_W / 2.0, rect.center().y),
+                14.0,
+                icon,
+                fg,
+            );
+            x += ICON_W;
+            if text.is_some() {
+                x += GAP;
+            }
+        }
+        if let Some(text) = text {
+            ui.painter().text(
+                egui::pos2(x, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                text,
+                font,
+                fg,
+            );
+        }
+        match tooltip {
+            Some(tip) => response.on_hover_text(tip),
+            None => response,
+        }
+    }
+
+    /// 左下角「远程连接」项：未连接只显示 remote 图标；连上 WSL 后变蓝并显示 `WSL: <distro>`。
+    fn statusbar_remote(ui: &mut egui::Ui, p: &PaletteHex, remote: Option<&str>) {
+        let connected = remote.is_some();
+        let text = remote.map(|d| format!("WSL: {d}"));
+        let (fg, bg, hover) = if connected {
+            (
+                hex(p.fg_statusbar_remote),
+                hex(p.bg_statusbar_remote),
+                hex(p.bg_statusbar_remote),
+            )
+        } else {
+            (
+                hex(p.fg_statusbar),
+                egui::Color32::TRANSPARENT,
+                hex(p.bg_statusbar_hover),
+            )
+        };
+        let tip = match remote {
+            Some(d) => format!("已连接到 WSL: {d}（clangd 经 WSL 运行）"),
+            None => "远程连接：未连接（WSL/SSH）".to_string(),
+        };
+        statusbar_item(
+            ui,
+            text.as_deref(),
+            Some(Codicon::Remote),
+            fg,
+            bg,
+            hover,
+            Some(&tip),
+        );
+    }
 
 impl eframe::App for LiteIdeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -4706,6 +4878,8 @@ enum Codicon {
     ChromeMaximize, // eab9
     ChromeRestore,  // eabb
     ChromeClose,    // eab8
+    // 状态栏左下角的「远程连接」图标（VS Code `remote`）。
+    Remote, // eb3a
 }
 
 impl Codicon {
@@ -4739,6 +4913,7 @@ impl Codicon {
         Codicon::ChromeMaximize,
         Codicon::ChromeRestore,
         Codicon::ChromeClose,
+        Codicon::Remote,
     ];
 
     /// 字体里的码位（U+Exxx）。
@@ -4771,6 +4946,7 @@ impl Codicon {
             Codicon::ChromeMaximize => 0xeab9,
             Codicon::ChromeRestore => 0xeabb,
             Codicon::ChromeClose => 0xeab8,
+            Codicon::Remote => 0xeb3a,
         };
         char::from_u32(cp).unwrap_or(' ')
     }
@@ -5785,6 +5961,9 @@ mod tests {
         assert_eq!(super::hex("#1e1e1e").r(), 0x1e);
         assert_eq!(super::hex("#007acc").g(), 0x7a);
         assert_eq!(super::hex("#007acc").b(), 0xcc);
+        assert_eq!(super::hex("#1e1e1e").a(), 0xff);
+        // VS Code 主题里的 8 位写法（Light 2026 的 statusBarItem.hoverBackground）。
+        assert_eq!(super::hex("#dadada4f").a(), 0x4f);
     }
 
     #[test]
@@ -6066,6 +6245,74 @@ mod tests {
                 "内置 codicon.ttf 缺少码位 {g:?}"
             );
         }
+    }
+
+    /// 状态栏「连接」项：未连接只有图标；连上 WSL 后蓝底白字并显示发行版名。
+    #[test]
+    fn statusbar_remote_matches_vscode_states() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let p = palette(ThemeKind::DarkPlus);
+
+        // 未连接：只有 remote 图标，没有文字，也没有蓝底。
+        let out = ctx.run(probe_raw_input(), |ctx| {
+            egui::TopBottomPanel::bottom("test_statusbar_off")
+                .exact_height(24.0)
+                .show(ctx, |ui| statusbar_remote(ui, &p, None));
+        });
+        let icon_center = codicon_center(&out, Codicon::Remote.glyph()).expect("应显示连接图标");
+        assert!(
+            !out.shapes.iter().any(|cs| matches!(
+                &cs.shape,
+                egui::Shape::Text(t) if t.galley.text().starts_with("WSL:")
+            )),
+            "未连接时不应显示发行版名"
+        );
+        assert!(
+            !out.shapes.iter().any(|cs| matches!(
+                &cs.shape,
+                egui::Shape::Rect(r) if r.fill == hex(p.bg_statusbar_remote)
+            )),
+            "未连接时不应有远程蓝底"
+        );
+
+        // 悬停：整块变 `#262728`（statusBarItem.hoverBackground）。
+        let mut input = probe_raw_input();
+        input.events.push(egui::Event::PointerMoved(icon_center));
+        let out = ctx.run(input, |ctx| {
+            egui::TopBottomPanel::bottom("test_statusbar_off")
+                .exact_height(24.0)
+                .show(ctx, |ui| statusbar_remote(ui, &p, None));
+        });
+        assert!(
+            out.shapes.iter().any(|cs| matches!(
+                &cs.shape,
+                egui::Shape::Rect(r) if r.fill == hex(p.bg_statusbar_hover)
+            )),
+            "悬停时应使用 #262728 高亮"
+        );
+
+        // 已连接：整块蓝底 + 白字 `WSL: <distro>`。
+        let out = ctx.run(probe_raw_input(), |ctx| {
+            egui::TopBottomPanel::bottom("test_statusbar_on")
+                .exact_height(24.0)
+                .show(ctx, |ui| statusbar_remote(ui, &p, Some("Ubuntu-24.04")));
+        });
+        assert!(
+            out.shapes.iter().any(|cs| matches!(
+                &cs.shape,
+                egui::Shape::Rect(r) if r.fill == hex(p.bg_statusbar_remote)
+            )),
+            "连上 WSL 后应有 #0078D4 蓝底"
+        );
+        assert!(
+            out.shapes.iter().any(|cs| matches!(
+                &cs.shape,
+                egui::Shape::Text(t) if t.galley.text() == "WSL: Ubuntu-24.04"
+            )),
+            "连上 WSL 后应显示发行版名"
+        );
+        assert!(codicon_center(&out, Codicon::Remote.glyph()).is_some());
     }
 
     #[test]

@@ -77,6 +77,8 @@ pub struct LspManager {
     cmd_tx: mpsc::UnboundedSender<Command>,
     ev_rx: std::sync::mpsc::Receiver<Event>,
     status: Arc<Mutex<LspStatus>>,
+    /// 当前连接的 WSL 发行版（无远程连接时为 None）。状态栏「连接」项读取。
+    remote: Arc<Mutex<Option<String>>>,
     rt: Option<tokio::runtime::Runtime>,
     seq: u64,
 }
@@ -92,6 +94,7 @@ impl LspManager {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Event>();
         let status = Arc::new(Mutex::new(LspStatus::Off));
+        let remote = Arc::new(Mutex::new(None));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("lsp-worker")
@@ -99,15 +102,17 @@ impl LspManager {
             .build()
             .expect("tokio runtime 启动失败");
         let status_c = status.clone();
+        let remote_c = remote.clone();
         let ev_tx_c = ev_tx.clone();
         rt.spawn(async move {
-            session_loop(cmd_rx, ev_tx_c, status_c).await;
+            session_loop(cmd_rx, ev_tx_c, status_c, remote_c).await;
         });
         let _ = ev_tx;
         Self {
             cmd_tx,
             ev_rx,
             status,
+            remote,
             rt: Some(rt),
             seq: 0,
         }
@@ -116,6 +121,11 @@ impl LspManager {
     /// 当前状态（状态栏直接读）。
     pub fn status(&self) -> LspStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    /// 已连接的 WSL 发行版名（未连接时为 None）。
+    pub fn remote_name(&self) -> Option<String> {
+        self.remote.lock().unwrap().clone()
     }
 
     /// 拉取一个事件（每帧调用一次，非阻塞）。
@@ -197,6 +207,7 @@ impl Drop for LspManager {
 struct SessionState {
     ui_tx: std::sync::mpsc::Sender<Event>,
     status: Arc<Mutex<LspStatus>>,
+    remote: Arc<Mutex<Option<String>>>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     root_uri: Option<String>,
 }
@@ -215,10 +226,12 @@ async fn session_loop(
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     ui_tx: std::sync::mpsc::Sender<Event>,
     status: Arc<Mutex<LspStatus>>,
+    remote: Arc<Mutex<Option<String>>>,
 ) {
     let mut st = SessionState {
         ui_tx,
         status,
+        remote,
         cmd_rx,
         root_uri: None,
     };
@@ -254,6 +267,9 @@ async fn session_loop(
                 just_crashed = true;
                 continue;
             };
+            // 探测到发行版即视为已建立 WSL 连接（即使 clangd 缺失/崩溃，
+            // 状态栏「连接」项仍应显示 WSL: <distro>）。
+            *st.remote.lock().unwrap() = Some(d.clone());
             match probe_clangd(&d).await {
                 Ok(path) => {
                     tracing::info!("WSL distro={d}, clangd at {path}");
@@ -271,6 +287,7 @@ async fn session_loop(
             Some(d)
         } else {
             tracing::info!("使用 LITEIDE_LSP_CMD 覆盖启动命令（跳过 WSL 探测）");
+            *st.remote.lock().unwrap() = None;
             None
         };
 

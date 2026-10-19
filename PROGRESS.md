@@ -894,6 +894,59 @@ egui 的 `Context::set_fonts` 要到**帧末**才生效。原来第一帧「调�
 
 ---
 
+## UI 复核改进第十二轮：状态栏改回 VS Code「Dark 2026」+ 左下角连接项（2026-10-19）
+
+用户实测了本机 VS Code（1.116.0，`workbench.colorTheme` 未设置 → 内置默认 **Dark 2026**）的真实取值，
+指出我们的状态栏还是老 Dark+ 的蓝底白字，与 VS Code 现状不一致。方案确认：**整套外壳状态栏走现代主题**
+（Dark 2026 / Light 2026），**连接项只做「显示 + 悬停提示」**（不实现真正连 SSH）。
+
+### 色板（`crates/ide-core/src/theme.rs`，全部来自官方 2026 主题 JSON）
+
+| 语义 | Dark 2026 | Light 2026 |
+|---|---|---|
+| `statusBar.background` | `#191a1b` | `#fafafd` |
+| `statusBar.foreground` | `#8c8c8c` | `#606060` |
+| 项悬停 `statusBarItem.hoverBackground` | `#262728` | `#dadada4f` |
+| 项按下 `statusBarItem.activeBackground` | `#4b4c4d` | `#eeeeee` |
+| `statusBar.border`（顶部 1px） | `#2a2b2c` | `#f0f1f2` |
+| 远程项（连上 WSL/SSH） | `#0078d4` / 白字 | `#005fb8` / 白字 |
+
+C/C++ Themes 主题没有覆盖 `statusBar.*`，因此也沿用 Dark 2026 那套；`PaletteHex` 相应新增
+`fg_statusbar` / `bg_statusbar_hover` / `bg_statusbar_active` / `border_statusbar` /
+`bg_statusbar_remote` / `fg_statusbar_remote` / `tab_active_border` 七个字段。
+
+**顺带修掉一个连带 bug**：激活标签顶部的 2px 高亮条原先借用 `bg_statusbar` 上色（那时它就是蓝色），
+状态栏改深灰后标签条会跟着变灰。现在单独引入 `tab_active_border`（Dark `#0078d4` / Light `#005fb8`，
+即现代主题的 `tab.selectedBorderTop`）。
+
+### 状态栏绘制（`draw_status_bar`）
+
+- 底色/前景/悬停全部改读色板，不再硬编码白色文字；顶部画 1px `statusBar.border`；
+- 去掉原来那排 `ui.separator()` 竖线（VS Code 状态栏没有），改为**每项自带 6px 左右内边距**、
+  悬停时整块变 `#262728`（`statusbar_item` 统一实现：图标 + 文字 + tooltip 三态）；
+- 最左侧新增**连接项**：未连接只显示 codicon `remote`（U+EB3A，和 VS Code 同一个字形）；
+  连上 WSL 后整块变蓝底白字并显示 `WSL: <distro>`（发行版名来自 LSP 管理器新暴露的
+  `LspManager::remote_name()`——探测到 WSL 发行版即记录，即使 clangd 崩溃/缺失也保留）；
+  悬停提示区分「未连接（WSL/SSH）」与「已连接到 WSL: xxx」；
+- `hex()` 支持 8 位 `#RRGGBBAA`（Light 2026 的悬停色就是带 alpha 的写法）。
+
+### 验收（真机 + 逐像素取样）
+
+| 指标 | 结果 |
+|---|---|
+| cargo test --workspace | ✅ 全绿（ide-ui 96；新增 `statusbar_remote_matches_vscode_states`，theme 新增 `all_themes_use_modern_statusbar`） |
+| cargo clippy（ide-ui / ide-core / ide-lsp） | ✅ 0 warning |
+| 真机截图取样（PrintWindow） | ✅ 状态栏底色 `#191a1b`；顶部边框行 `#2a2b2b`（1px，抗锯齿后 ±1）；连接项区域 `#0078d4` + 白字；激活标签条 `#0078d4` |
+| 悬停 | ✅ 单测用合成指针事件断言未连接态悬停底为 `#262728`，且未连接时不出现蓝底/发行版名 |
+
+### 本轮已知边界
+
+- 连接项只做显示与提示（按确认的方案）：点击/菜单不弹「连接到 WSL/SSH」列表，也不发起新连接；
+- 发行版名取自 LSP 侧探测结果；若显式使用 `LITEIDE_LSP_CMD`（跳过 WSL 探测）则不显示连接态；
+- 状态栏没有 VS Code 的「远程指示」蓝色分隔块与多窗口/通知图标。
+
+---
+
 ## 下一步任务：项目主体已完成
 
 myIDE.md 阶段 0-6 全部交付。后续仅按需处理技术债清单，不主动开工。
