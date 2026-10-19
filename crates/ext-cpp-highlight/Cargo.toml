@@ -1,0 +1,11 @@
+[package]
+name = "ext-cpp-highlight"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+ide-ext = { path = "../ide-ext" }
+tracing.workspace = true
+tree-sitter = "0.25"
+tree-sitter-cpp = "0.23"

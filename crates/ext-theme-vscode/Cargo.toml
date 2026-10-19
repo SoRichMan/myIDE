@@ -1,0 +1,8 @@
+[package]
+name = "ext-theme-vscode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+ide-ext = { path = "../ide-ext" }

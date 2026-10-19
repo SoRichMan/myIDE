@@ -7,6 +7,10 @@ members = [
     "crates/ide-dap",
     "crates/ide-search",
     "crates/ide-git",
+    # 扩展机制：宿主 + 内置扩展
+    "crates/ide-ext",
+    "crates/ext-cpp-highlight",
+    "crates/ext-theme-vscode",
 ]
 
 [workspace.package]

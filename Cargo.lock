@@ -1188,6 +1188,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext-cpp-highlight"
+version = "0.1.0"
+dependencies = [
+ "ide-core",
+ "ide-ext",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-cpp",
+]
+
+[[package]]
+name = "ext-theme-vscode"
+version = "0.1.0"
+dependencies = [
+ "ide-core",
+ "ide-ext",
+]
+
+[[package]]
 name = "fastrand"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1704,8 +1723,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
- "tree-sitter",
- "tree-sitter-cpp",
 ]
 
 [[package]]
@@ -1718,6 +1735,15 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ide-ext"
+version = "0.1.0"
+dependencies = [
+ "ide-core",
+ "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -1765,8 +1791,11 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "ext-cpp-highlight",
+ "ext-theme-vscode",
  "ide-core",
  "ide-dap",
+ "ide-ext",
  "ide-git",
  "ide-lsp",
  "ide-search",

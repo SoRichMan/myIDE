@@ -28,7 +28,7 @@ Rust 写的轻量 IDE，Windows + WSL2(Ubuntu2404) 下做 C++ 开发，对标 VS
 
 ```
 E:\TestDeepSeek\
-├── Cargo.toml              workspace, 6 members
+├── Cargo.toml              workspace, 9 members
 ├── Cargo.lock
 ├── rust-toolchain.toml
 ├── .cargo\config.toml      rsproxy 源
@@ -36,12 +36,17 @@ E:\TestDeepSeek\
 ├── README.md
 ├── PROGRESS.md              ← 本文档
 ├── docs\architecture.md
+├── docs\extensions.md       扩展开发指南（贡献语言高亮 / 主题配色 + 性能契约）
 ├── crates\
-│   ├── ide-core\            主题/错误/领域模型 + buffer/rope + tree-sitter 高亮
+│   ├── ide-core\            主题外壳色板/错误/领域模型 + buffer/rope + HighlightGroup 词汇表
 │   │   └── tests\bench_stage1.rs   #[ignore] 性能基准
+│   ├── ide-ext\             第八轮：进程内扩展宿主（清单/贡献点/注册表/激活计时/回滚）
+│   ├── ext-cpp-highlight\   第八轮：内置扩展 = C/C++ 语法高亮（queries/cpp-highlights.scm）
+│   │   └── tests\bench_highlight.rs  #[ignore] 高亮性能基准（全量/增量）
+│   ├── ext-theme-vscode\    第八轮：内置扩展 = Dark+ / Light+ / Dark(Visual Studio - C/C++)
 │   ├── ide-ui\              eframe/egui 前端, bin = liteide
-│   │   ├── main.rs          阶段5：设置落地/命令面板/多标签/UI 打磨/虚拟滚动
-│   │   ├── editor.rs        虚拟滚动编辑器 + EditorAction + 动态字号/主题/minimap
+│   │   ├── main.rs          阶段5：设置落地/命令面板/多标签/UI 打磨/虚拟滚动 + 扩展宿主装配
+│   │   ├── editor.rs        虚拟滚动编辑器 + EditorAction + 动态字号/主题/语言高亮器注入
 │   │   ├── settings.rs      阶段5：AppSettings 加载/校验/JSON 热重载
 │   │   ├── tabs.rs          阶段5：多标签模型（打开/关闭/拖拽/脏标记/恢复）
 │   │   ├── tree.rs          资源管理器文件树（FileTree/Row，可展开折叠，4 单测）
@@ -62,15 +67,16 @@ E:\TestDeepSeek\
 │   └── ci.ps1
 ├── testdata\
 │   ├── large.cpp            5470 行 C++ (128 KB)
+│   ├── highlight_demo.cpp   第八轮：语法高亮验收样本（覆盖 17 个 token 分组）
 │   ├── mock_clangd.py       mock LSP 服务器（帧协议 + 崩溃触发）
 │   ├── mock_gdb.py          mock GDB MI2 服务器
 │   ├── debug_target.cpp     阶段3 调试目标
 │   ├── debug_target         WSL g++ -g -O0 编译产物
 │   └── sample_project\      最小 CMake 项目 + compile_commands.json
-└── target\release\liteide.exe  9.48 MB
+└── target\release\liteide.exe  9.68 MB
 ```
 
-## 当前状态：阶段 6 已完成 ✅（阶段 1-6 全部交付；阶段 5 本会话已复核验收）
+## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第八轮扩展机制/C++ 配色）
 
 ### 已交付
 
@@ -149,6 +155,7 @@ cargo test -p ide-git -- --nocapture     # 11 单测 + 2 集成（Windows git）
 - **clippy `explicit_auto_deref`**：`iter().map(|m| Row::Match(*m))` 应写 `|m| Row::Match(m)`（函数参数位自动解引用；`Row::Match` 直接作函数指针不行，E0631）。
 - 其余沿用阶段 4 清单：PowerShell 改中文源文件 GBK 乱码（用 Write 工具）；egui 闭包借用"快照 + 动作队列"；egui 0.28 API 差异；git porcelain 短格式；rg 退出码语义；cargo 前设 RUSTUP_OFFLINE=1。
 - **GUI 截图取证**：Win32 `PrintWindow`（含 `PW_RENDERFULLCONTENT`）与窗口 DC `BitBlt` 都**抓不到 eframe/glow 的 OpenGL 客户端区**（只得到标题栏 + 白底），桌面 `CopyFromScreen` 又会被其他全屏窗口盖住。可靠做法是用 **egui 自带帧缓冲截屏**：`ViewportCommand::Screenshot` → 下一帧从 `Event::Screenshot { image, .. }` 取 `ColorImage`，直接写 PPM/PNG（本次复核即用此法，用后临时钩子已移除）。
+- **PowerShell 取证脚本要写纯 ASCII**：用工具生成的 `.ps1` 带中文且无 BOM 时，Windows PowerShell 5.1 会按 ANSI 解码源码，脚本解析错乱（症状：`Add-Type -AssemblyName System.Drawing` 之后的类型全报 `找不到类型`、行号还对不上）。像素分析这类一次性脚本一律写英文/ASCII；项目文档里的中文仍在 `.md` 里。
 
 ---
 
@@ -410,6 +417,7 @@ egui 内置双击判定窗口是 `MAX_DOUBLE_CLICK_DELAY = 0.3s`，而 **Windows
 ### 顺手修掉的三个真 bug
 
 - **文本框里回车无效**：`TextEdit` 一拿到焦点，egui 就请求开启系统 IME，而 winit 0.29.15 在 IME 开启时把 `WM_KEYDOWN` 交给输入法（回车/退格/方向键被吞），只透出 `WM_KEYUP`，于是 `key_pressed(Enter)` 永远为假 —— 表现就是「搜索框里敲回车没反应」。本项目编辑器是自绘文本通道、本来就不需要 IME，于是在 `update()` 末尾清空 `platform_output.ime`，全程关掉 IME；同时 `text_focus` 取「绘制前 || 绘制后」的并集，避免回车那一帧 TextEdit 已交出焦点而把回车漏给编辑器。
+  - ⚠️ **已被取代**（见文末「补丁：编辑器里打不进中文」）：代价是全 App 再也打不出中文。该补丁已撤销 —— 实测「非组合态」下回车/退格/方向键的 `WM_KEYDOWN` 是正常到达的，只有输入法组合中才会被吞。
 - **内容搜索永远 0 命中**：`Command::output()` 会把子进程 stdin 接到空设备（不是 tty），而 `rg` 在「没给路径参数、stdin 又不是 tty」时会去搜 stdin（空的）→ 永远 0 命中。现在 `build_search_args` 显式追加搜索路径 `.`，并去掉 rg 输出里的 `./` 前缀，保持与 `rg --files` 一致的相对路径。
 - **异步结果到不了界面**：egui 是「按需重绘」，后台线程（rg / LSP / DAP）送到的结果没人重绘就一直停在旧帧（表现同样是「搜索没反应」）。现在有搜索在飞 / LSP 探测中 / DAP 启动中时用 `request_repaint_after(100ms)` 低频轮询事件通道。
 
@@ -419,6 +427,229 @@ egui 内置双击判定窗口是 `MAX_DOUBLE_CLICK_DELAY = 0.3s`，而 **Windows
 | cargo clippy --workspace --all-targets -- -D warnings | ✅ 0 warning |
 | cargo build --release | ✅ 9.64 MB |
 | 核验（真实注入鼠标/键盘） | ✅ 侧栏搜 `struct` → 339 处匹配、按文件分组、点击结果跳到 `clangd_real.rs:21`；Ctrl+Shift+F 聚焦搜索框；Ctrl+P 输入 `D:\Python311` 回车进入该目录、接着敲 `py` 过滤出 `python.exe/python3.dll/...`；Esc 关闭；浮窗上滚 6 格 → 编辑器区域 **0 像素变化**（指针移到编辑器上滚则正常滚动）；最后回到编辑器敲 `// zz` 仍正常写入（转为脏） |
+
+---
+
+## 扩展机制 + VSCode C/C++ 配色（2026-10-19，第八轮）
+
+用户诉求：**LiteIDE 里的 C/C++ 语法与变量着色要和 VS Code 一致**，并且这些功能
+要以「扩展」的形式存在（以后新功能都归到扩展里），**但性能不能退**。
+
+范围确认（开工前问过）：扩展机制 = 进程内（trait + 编译期清单 + 注册表，静态编译进单文件）；
+本轮 = 扩展框架 + 高亮/主题迁移 + 配色一起做。
+
+### 1. 新增 `ide-ext` 扩展宿主
+
+| 文件 | 内容 |
+|---|---|
+| `manifest.rs` | `Manifest`（id/名字/版本/描述/**贡献点声明**）、`Capability::{Language,Theme}`、`LanguageContribution`（后缀 → 高亮器工厂）、`ThemeContribution`（外壳色板 + `TokenPalette`）、`Extension` trait |
+| `palette.rs` | `TokenPalette`：按 `HighlightGroup` 索引的 17 个 hex 色值；`from_array()` 是 **const** 构造（长度编译期校验），`new()` 供运行期/测试用 |
+| `lib.rs` | `LanguageHighlighter` trait、`NullHighlighter`、`TextEdit`/`Point`（编辑描述 + 且求 `between()`）、`ExtError`、`register_declared()`（声明式扩展的 `activate`） |
+| `host.rs` | `Registry`（语言/配色查询）、`ExtContext`（激活期唯一写入口）、`ExtensionHost`（激活 + 计时 + 校验 + 回滚 + `report()`） |
+
+关键语义（都有单测）：
+
+- **语言先注册者优先**（内置不会被顶掉）；**配色后注册者优先**（第三方可覆盖内置）。
+- 清单声明了几个贡献点就必须注册几个，否则整份激活**原子回滚**并禁用该扩展。
+- 激活 `catch_unwind` 隔离 panic（release 档 `panic = "abort"` 兜不住，见文档）。
+- 激活耗时逐扩展记录：内置两个扩展各 **~2 µs**（设置面板可见），测试对总耗时设了上限。
+
+### 2. 两个内置扩展（功能全部走扩展，编辑器不认识具体语言）
+
+- `ext-cpp-highlight`：`queries/cpp-highlights.scm`（17 个分组的自查查询）+ `CppHighlighter`
+  （`OnceLock` 共享 Language/Query，每文档一个 parser + 增量树）。
+- `ext-theme-vscode`：`DARK_PLUS` / `LIGHT_PLUS` / `CPPTOOLS_DARK` 三套 const 配色
+  （色值逐条注释来源 scope），`cpptools_dark_vs_new.json` 为最终依据（last-match-wins）。
+
+`ide-core` 只留**词汇表**与外壳色板：17 变体的 `HighlightGroup` + `ThemeKind`
+（新增 `CppDark`，`from_name` 兼容官方标签 `Dark (Visual Studio - C/C++)`）；
+tree-sitter 依赖从 core 移除，core 不再认识任何语言。
+
+### 3. IDE 侧改动（`ide-ui`）
+
+- 编辑器字段 `Highlighter` → `Box<dyn LanguageHighlighter>`，删除 `token_color()` 与
+  Dark+/Light+ 硬编码 token 常量；新增 `TokenColors`（`[egui::Color32; HighlightGroup::COUNT]`），
+  由 `TokenPalette` 在**切主题时**展开一次，绘制路径只剩一次数组下标。
+- `set_theme(kind, &TokenPalette)`、`set_highlighter(..)`、`open_document(text, highlighter)`
+  （打开/切标签时**只高亮一次**：先换高亮器再载入文本）。
+- `main.rs` 启动即 `ExtensionHost::activate(builtin_extensions())`，按**文件后缀**向注册表要
+  高亮器（`.cpp/.h/.hpp/.cc/...` → C++，`.md`/无后缀 → 空实现）；设置面板新增
+  **Extensions 列表**（贡献点数 + 激活耗时 + id）与三个主题按钮（`ThemeKind::ALL`）。
+
+### 4. 增量解析（性能核心）
+
+原来自绘编辑器只把**新文本**交给高亮器，无法告知"改了哪一段"，tree-sitter 只能全量重解析
+（`tree.edit()` 是增量的前提）。现在编辑器用 `TextEdit::between(old, new)` 求出最小差异
+（前后缀按 char 边界对齐，多字节安全）→ 扩展 `Tree::edit(&InputEdit)` → `parse(text, Some(old))`，
+并在解析后**校验 `root.end_byte() == text.len()`**，不满足就退化为全量解析（宁可慢，不可脏）。
+
+实测（`bench_highlight`，release，`testdata/large.cpp` 123 KB / 5470 行 / 23232 个 token）：
+
+| 场景 | 耗时 |
+|---|---|
+| 首次打开（全量解析 + 收集捕获） | **47 ms** |
+| 末尾追加 1 字符（增量，给编辑描述） | **6 ms** |
+| 同上但不给编辑描述（全量重解析） | 19–28 ms |
+| 2000 行合成文件、连续 50 次追加 | 最坏 12 ms / 平均 11 ms |
+
+（仍以"每次改动重跑整棵树的查询"为代价；若将来要在十万行级文件上继续压，下一步是把
+查询执行也限制在改动区间 + 平移区间外的旧高亮，本轮没做，已在文档里写明。）
+
+### 5. 默认主题改为用户的 VS Code 主题
+
+用户 VS Code 用的是 C/C++ Themes 扩展的 **Dark (Visual Studio - C/C++)**，所以
+`AppSettings::default().theme` 与 `Editor::new` 的内置外观都改成它（外壳色 `#1E1E1E`，
+token 色见下表），设置面板里仍可切回 Dark+ / Light+。
+
+### 验收（截图 + 取样，release exe）
+
+- 新增验收样本 `testdata/highlight_demo.cpp`（覆盖 17 个分组：预处理/宏/命名空间/模板/
+  类/枚举/函数/形参/成员访问/字符串转义/字符/数字/运算符/控制流/中文注释）。
+- Ctrl+P 打开样本 → 全窗口取样，13 个目标色值**全部命中**，旧配色（Dark+ 注释 `#6A9955`、
+  Light+ 关键字 `#0000FF`）**全部 MISSING** → 渲染确实来自扩展贡献的配色：
+
+  | 分组 | 色值 | 分组 | 色值 |
+  |---|---|---|---|
+  | Keyword/存储/原始类型 | `#569CD6` | Macro | `#BEB7FF` |
+  | KeywordControl（`if`/`return`） | `#D8A0DF` | EnumMember/Number | `#B5CEA8` |
+  | Type（`Point`/`std::string`） | `#4EC9B0` | String / `<cstdint>` | `#CE9178` |
+  | Namespace | `#C8C8C8` | Comment | `#57A64A` |
+  | Function | `#DCDCAA` | Parameter | `#9A9A9A` |
+  | Variable | `#9CDCFE` | Property/Plain | `#DADADA` |
+  | Operator | `#B4B4B4` | | |
+
+- 现场打字核验：在文档中部插入 `// typed live 0x1F` → 新行按注释着色、其后所有行重新
+  正确着色（增量解析正确性）；设置面板显示 Extensions（1 language · 3 theme）与各扩展耗时。
+
+| 指标 | 结果 |
+|---|---|
+| cargo test --workspace | ✅ **259 passed 0 failed**（本轮新增 3 个 crate 共 50 个单测：宿主 19 + C/C++ 高亮/增量 26 + 主题 5；ide-ui 另有"增量结果 == 全量结果"端到端测试；6 个 `#[ignore]` 基准不计） |
+| cargo clippy --workspace --all-targets -- -D warnings | ✅ 0 warning |
+| cargo build --release | ✅ 9.67 MB |
+| 截图 + 调色板取样 | ✅ 13/13 命中，旧色值 0 命中 |
+| 启动/打开/打字实测 | ✅ 启动即 C/C++ Dark；Ctrl+P 开样本 → 全量高亮；中部插入一行 → 增量重算正确；扩展激活 2 µs/个 |
+
+### 本轮的已知偏差（相对 VS Code + C/C++ Themes，已写入 docs/extensions.md）
+
+全大写标识符按宏着色（命名约定近似）／同一文件内声明的枚举成员才着色／全局变量按局部
+变量着色／字符串内转义序列不再细分／`#define` 宏体按普通 token 着色／字符字面量与字符串
+同色／数字后缀与浮点指数符号不单独着色。这些都需要 clangd 语义高亮（阶段 2 已有 LSP
+通道）才能做得和 VS Code 一样细，属于后续可选优化。
+
+---
+
+## 补丁：编辑器里打不进中文（IME）（2026-10-19）
+
+用户反馈：**编辑框里无法输入中文，切换输入法也没有效果**，并要求确认是不是全 App 都有问题。
+
+### 根因：全 App 的输入法通道被上一轮的「绕过 IME」补丁关掉了
+
+第四轮修「搜索框里回车没反应」时，为了让 winit 0.29.15 不把 `WM_KEYDOWN` 交给输入法，
+在 `App::update()` 末尾每帧清空 `platform_output.ime`（见上文「顺手修掉的三个真 bug」）。
+egui-winit 的判定是 `allow_ime = output.ime.is_some()`，于是窗口的输入法通道**从头到尾是关的**
+—— 编辑器、命令面板、搜索框、文件浏览器统统打不出中文。
+
+另外，自绘编辑器只认 `Event::Text`：Windows 输入法**组合时根本不产生** `Event::Text`
+（拼音走 `ImeEvent::Preedit`、上屏走 `ImeEvent::Commit`），所以就算开了通道，编辑器也收不到。
+
+### 改法
+
+| 位置 | 改动 |
+|---|---|
+| `main.rs` | 删掉每帧 `o.ime = None`：没人上报时 `output.ime` 自然是 `None`，egui-winit 会自己关掉通道；内置 `TextEdit`（面板 / 对话框）本来就会上报 |
+| `Editor::show` | 编辑器接管字符输入时自己上报 `IMEOutput`（`rect` = **光标那一小块**，不是整个编辑区） |
+| `Editor` 事件循环 | 处理 `Event::Ime`：`Commit` 落正文；`Preedit` 组合串**直接插进缓冲区**渲染（复用排版/高亮/滚动），提交时替换、取消时删除、被按键打断时先撤掉；`Disabled` 清组合 |
+| 组合串提示 | 组合期间在正文下方画一条下划线（提示「还没落定」） |
+
+### 为什么 `IMEOutput.rect` 只报光标那一小块
+
+egui-winit 把 `IMEOutput.rect` 当作 `CFS_EXCLUDE` 区交给输入法（`set_ime_cursor_area`）。
+报整个编辑区时候选窗被挤出该区域 → 掉到窗口最下沿（实测：候选窗跑到底边）。
+改成光标处一小块后，候选窗**紧贴光标下方**弹出（与 VS Code 一致）。
+
+### 实测（真实微软拼音 IME，release exe）
+
+| 场景 | 结果 |
+|---|---|
+| 编辑器敲 `nihao` + 空格 | 候选窗贴着光标弹出；`你好` 上屏插入光标处（`// ascii 你好`） |
+| 再敲 `shijie` + 回车 | 上屏原始拼音（微软拼音「回车 = 提交原始串」），正文继续正确 |
+| 焦点在别的框 / 模态窗口打开 | 编辑器不抢输入法通道（交给那个 `TextEdit`） |
+| 文件浏览器里输入 `highlight_demo.cpp` + 回车 | IME 开启（中文模式）下依然能打开文件 → 回车不再「失效」 |
+| IME 组合中 | 字母的 `WM_KEYDOWN` 仍会到达编辑器，所以「字母键不打断组合，只有退格/回车/方向键/带 Ctrl 的键才打断」 |
+| 非组合态 | 回车 / 退格 / 方向键仍是 `pressed: true`，编辑操作照常（日志取证） |
+| 英文模式敲 ASCII | `Text(..)` 事件照旧，正常写码 |
+
+### 已知偏差
+
+- winit 0.29.15 对 `Ime::Preedit(text, None)`（本机微软拼音不上报光标位置）会**丢弃**组合串文本，
+  因此 Windows 上看不到正文内的拼音串 —— 拼音显示在系统候选窗里（贴光标）。
+  代码里的 `Preedit` 路径对能上报光标位置的 IME / 平台则会正文内联显示（已加单测）。
+
+| 指标 | 结果 |
+|---|---|
+| cargo test --workspace | ✅ **268 passed 0 failed**（本轮 +9 IME 单测；6 个 `#[ignore]` 基准不计） |
+| cargo clippy --workspace --all-targets -- -D warnings | ✅ 0 warning |
+| cargo build --release | ✅ 9.67 MB |
+| IME 实测 | ✅ 上表 7 项全过 |
+
+---
+
+## 补丁：中文行里光标不在末尾（列宽按真实字形宽度算）（2026-10-19）
+
+用户反馈：**打中文的时候光标不在末尾跟着走，而是停在字中间**。
+
+### 根因：把「字符列号」当成「等宽格子数」
+
+光标 x 一直是 `列号 × 等宽格宽`（`char_width` = 空格的字形宽度）。这在纯 ASCII 行上成立，
+因为等宽字体每个字符都一样宽；但中文走的是**回退字体**，宽度完全不同：
+
+| 字符 | 字体 | 实测宽度（14px） | 折算成等宽格 |
+|---|---|---|---|
+| ` ` / `A` | Hack（默认等宽） | 8.275 px | 1.00 |
+| `中` / `，` | 微软雅黑（回退） | 13.638 px | **1.65** |
+
+于是 `// ascii 你好`（11 个字符）的光标被画在 `11 × 8.275 = 91 px`，
+而真实宽度是 `9 × 8.275 + 2 × 13.638 = 101.8 px` —— 差了一个多汉字宽，
+光标就落在最后一个「好」字中间（截图实测：光标左沿比文字右沿还靠左 8px）。
+同一处错位还影响**选区高亮**、**组合串下划线**、**括号匹配框**、**鼠标点击定位**（点哪都偏）
+和**横向滚动上限**。
+
+### 改法
+
+| 位置 | 改动 |
+|---|---|
+| `advance_with` / `text_advance` | 一行前 n 个字符的宽度 = **逐个真实字形宽度累加**（`Fonts::glyph_width`，与 `LayoutJob` 用同一个 `FontId`）；tab 按 `INDENT_STEP` 格（与 epaint 的 `TAB_SIZE = 4` 一致）；`advance_with` 的宽度函数可注入 → 可单测 |
+| `col_at_x` | 上面的反函数：给定横向偏移求落在第几个字符（取字符前半段）→ 鼠标点击/拖选定位 |
+| 光标 x、选区 x0/x1、组合串下划线、括号匹配框 | 全部改走 `text_advance` / `col_at_x` |
+| `pos_to_char` | 改走 `col_at_x`；点到行尾之外时夹到行末（换行符之前），与 VS Code 一致 |
+| `char_cells`（新） | 整文档级粗估专用（tab = 4 格、东亚宽字符 = 2 格）：只用于**横向滚动上限**和 **minimap 缩略宽度** —— 那里拿不到字体、也不可能逐行问字形 |
+| `is_wide_char` | 东亚宽/全角字符区间判定（汉字、假名、谚文、全角标点、emoji） |
+
+### 实测（release exe，真实微软拼音，同一段文本 A/B 对比）
+
+| 截图 | 文本 | 光标左沿 | 文字右沿 | 缺口 |
+|---|---|---|---|---|
+| 修复前 `v10_3committed.png` | `// ascii 你好` | 471 | 479 | **−8（光标在「好」字里）** |
+| 修复后 `v13_3committed.png` | `// ascii 你好` | 482 | 479 | **+3（紧贴文字末尾）** |
+| 修复后 `v13_4second.png` | `// ascii 你好世界` | 531 | 527 | +4 |
+| 修复后（打开的文件里）`v13_8comment.png` | `注释// ...` | 407 | 406 | +1（正好落在「释」和 `//` 之间） |
+
+光标右移量 +11px ≈ 2 × (13.638 − 8.275) ≈ 10.7px，与「两个汉字按真实宽度算」的预期一致。
+`v13_8comment.png` 里状态栏也给出 `Ln 1, Col 3`（2 个字符后）—— 位置与绘制一致。
+
+### 新增单测（+6）
+
+`advance_uses_real_glyph_widths_not_char_cells`、`click_column_is_inverse_of_advance`、
+`col_at_x_round_trips_advance_on_cjk_line`、`tab_and_wide_chars_count_as_multiple_cells`、
+`max_cols_accounts_for_wide_chars`、
+`ime_caret_area_follows_real_text_width_on_cjk_line`（端到端：用真实字体链路量光标处 IME 锚点位移 = 2 × 汉字宽度）。
+
+| 指标 | 结果 |
+|---|---|
+| cargo test --workspace | ✅ **274 passed 0 failed**（本轮 +6 单测；6 个 `#[ignore]` 基准不计） |
+| cargo clippy --workspace --all-targets -- -D warnings | ✅ 0 warning |
+| cargo build --release | ✅ 9.68 MB |
+| 光标定位实测 | ✅ 上表 4 项 |
 
 ---
 

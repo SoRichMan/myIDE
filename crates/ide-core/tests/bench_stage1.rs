@@ -1,34 +1,8 @@
 //! 阶段 1 性能基准（cargo test -- --ignored --nocapture）。
-use ide_core::{Buffer, Highlighter};
-
-#[test]
-#[ignore]
-fn bench_open_large_cpp() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/large.cpp");
-    let t0 = std::time::Instant::now();
-    let text = std::fs::read_to_string(path).expect("read large.cpp");
-    let read_ms = t0.elapsed().as_millis();
-
-    let t1 = std::time::Instant::now();
-    let buf = Buffer::from_text(&text);
-    let buf_ms = t1.elapsed().as_millis();
-
-    let t2 = std::time::Instant::now();
-    let mut h = Highlighter::new();
-    let hl = h.highlight(&text);
-    let hl_ms = t2.elapsed().as_millis();
-
-    let t3 = std::time::Instant::now();
-    let _snap = buf.text();
-    let snap_ms = t3.elapsed().as_millis();
-
-    eprintln!("large.cpp: {} bytes, {} lines", text.len(), buf.line_count());
-    eprintln!("  read file:     {} ms", read_ms);
-    eprintln!("  Buffer build:  {} ms", buf_ms);
-    eprintln!("  highlight:     {} ms ({} tokens)", hl_ms, hl.len());
-    eprintln!("  to_string:     {} ms", snap_ms);
-    eprintln!("  TOTAL open:    {} ms", read_ms + buf_ms + hl_ms);
-}
+//!
+//! 语法高亮的基准已随实现搬到 `ext-cpp-highlight/tests/bench_highlight.rs`
+//! （高亮现在是语言扩展的职责）。
+use ide_core::Buffer;
 
 #[test]
 #[ignore]

@@ -12,6 +12,7 @@ use eframe::egui;
 use eframe::egui::RichText;
 use editor::EditorAction;
 use ide_core::theme::{palette, ThemeKind};
+use ide_ext::ExtensionHost;
 use ide_dap::manager::{BreakpointSpec, DapManager, DapStatus, Event as DapEvent, StackFrame, VarNode};
 use ide_git::{Event as GitEvent, GitManager, GitStatus};
 use ide_lsp::manager::{Event as LspEvent, LspManager, LspStatus};
@@ -49,6 +50,25 @@ fn hex(s: &str) -> egui::Color32 {
     let g = u8::from_str_radix(&s[2..4], 16).unwrap_or(0);
     let b = u8::from_str_radix(&s[4..6], 16).unwrap_or(0);
     egui::Color32::from_rgb(r, g, b)
+}
+
+/// 启动时装配的内置扩展（顺序 = 注册顺序，先注册者优先认领后缀）。
+///
+/// 新增功能 = 新增一个 `Extension` 实现 + 在这里（或运行时的插件目录）登记，
+/// 详见 `docs/extensions.md`。
+fn builtin_extensions() -> Vec<Box<dyn ide_ext::Extension>> {
+    vec![
+        Box::new(ext_cpp_highlight::CppHighlight),
+        Box::new(ext_theme_vscode::VscodeThemes),
+    ]
+}
+
+/// 取某个主题的 token 色板：用主题扩展注册的配色，缺失时退回内置 Dark+。
+fn theme_tokens(host: &ExtensionHost, kind: ThemeKind) -> ide_ext::TokenPalette {
+    host.registry()
+        .tokens(kind)
+        .copied()
+        .unwrap_or(ext_theme_vscode::DARK_PLUS)
 }
 
 /// 拖动侧栏右侧分割线：把宽度夹到 `[SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH]`。
@@ -224,6 +244,8 @@ struct LiteIdeApp {
     git_diff_text: String,
     git_commit_input: String,
     // ---- 阶段 5：设置 / 多标签 / 命令面板 / 视图 ----
+    /// 扩展宿主：启动时激活内置扩展，注册表供界面查询语言/配色。
+    host: ExtensionHost,
     settings: AppSettings,
     config_mtime: Option<SystemTime>,
     applied_family: String,
@@ -283,11 +305,29 @@ struct LiteIdeApp {
 impl LiteIdeApp {
     fn new() -> Self {
         let (settings, config_mtime) = AppSettings::load();
+        // 扩展机制：先激活内置扩展，再按注册表装配编辑器。
+        // 激活只做注册（无 IO / 无重计算），耗时在微秒级——性能契约见 docs/extensions.md。
+        let host = ExtensionHost::activate(builtin_extensions());
+        for rec in host.report() {
+            tracing::info!(
+                "[ext] {} ({}) {:?} · {} 贡献点 · {} us",
+                rec.id,
+                rec.name,
+                rec.outcome,
+                rec.registered,
+                rec.duration.as_micros()
+            );
+        }
         let (path, text) = load_initial_file();
+        let theme_kind = ThemeKind::from_name(&settings.theme);
         let mut editor = editor::Editor::new(&text);
         editor.set_typography(settings.font_size);
-        editor.set_theme(ThemeKind::from_name(&settings.theme));
+        editor.set_theme(theme_kind, &theme_tokens(&host, theme_kind));
         editor.set_minimap(settings.show_minimap);
+        if let Some(p) = path.as_ref() {
+            // 语言扩展按后缀认领：.cpp/.h/... → C++ 高亮，其它文件保持纯文本。
+            editor.set_highlighter(host.registry().create_highlighter(&p.to_string_lossy()));
+        }
         let status_line: Arc<str> = editor.status_text().into();
         let current_file = path.clone();
         let current_uri = current_file
@@ -300,7 +340,7 @@ impl LiteIdeApp {
             tabs.open_untitled();
         }
         let indent_hint = detect_indent(&editor.text());
-        let applied_theme = ThemeKind::from_name(&settings.theme);
+        let applied_theme = theme_kind;
         Self {
             editor: Some(editor),
             status_line,
@@ -356,6 +396,7 @@ impl LiteIdeApp {
             git_log: Vec::new(),
             git_diff_text: String::new(),
             git_commit_input: String::new(),
+            host,
             settings,
             config_mtime,
             applied_family: "Default".to_string(),
@@ -448,8 +489,13 @@ impl LiteIdeApp {
     /// 把指定标签加载进编辑器（并同步 current_file/current_uri/LSP 状态）。
     fn load_tab_into_editor(&mut self, idx: usize) {
         let Some(tab) = self.tabs.get(idx).cloned() else { return };
+        // 语言扩展按后缀认领高亮器；未命名文件用空实现（纯文本）。
+        let highlighter = match tab.path.as_ref() {
+            Some(p) => self.host.registry().create_highlighter(&p.to_string_lossy()),
+            None => Box::new(ide_ext::NullHighlighter),
+        };
         if let Some(ed) = &mut self.editor {
-            ed.load_text(&tab.text);
+            ed.open_document(&tab.text, highlighter);
             ed.set_cursor_line_col(tab.cursor.0, tab.cursor.1);
         }
         self.current_file = tab.path.clone();
@@ -509,7 +555,7 @@ impl LiteIdeApp {
     fn reload_active_editor(&mut self) {
         if self.tabs.is_empty() {
             if let Some(ed) = &mut self.editor {
-                ed.load_text("");
+                ed.open_document("", Box::new(ide_ext::NullHighlighter));
             }
             self.current_file = None;
             self.current_uri = None;
@@ -2030,7 +2076,8 @@ impl LiteIdeApp {
         let kind = ThemeKind::from_name(&self.settings.theme);
         let next = match kind {
             ThemeKind::DarkPlus => ThemeKind::LightPlus,
-            ThemeKind::LightPlus => ThemeKind::DarkPlus,
+            ThemeKind::LightPlus => ThemeKind::CppDark,
+            ThemeKind::CppDark => ThemeKind::DarkPlus,
         };
         self.settings.theme = next.name().to_string();
         self.theme_switch_at = Some(Instant::now());
@@ -2039,13 +2086,15 @@ impl LiteIdeApp {
 
     /// 把当前设置应用到编辑器（字号/主题/minimap）。
     fn apply_settings_to_ui(&mut self) {
+        let kind = ThemeKind::from_name(&self.settings.theme);
+        let tokens = theme_tokens(&self.host, kind);
         if let Some(ed) = &mut self.editor {
             ed.set_typography(self.settings.font_size);
-            ed.set_theme(ThemeKind::from_name(&self.settings.theme));
+            ed.set_theme(kind, &tokens);
             ed.set_minimap(self.settings.show_minimap);
         }
         self.applied_font = self.settings.font_size;
-        self.applied_theme = ThemeKind::from_name(&self.settings.theme);
+        self.applied_theme = kind;
     }
 
     fn draw_settings(&mut self, ctx: &egui::Context) {
@@ -2061,6 +2110,24 @@ impl LiteIdeApp {
         let mut show_breadcrumbs = self.settings.show_breadcrumbs;
         let mut show_sidebar = self.settings.show_sidebar;
         let config_path = AppSettings::config_path();
+        let theme_kind = ThemeKind::from_name(&theme);
+        // 扩展宿主快照（闭包里不再借用 self）。
+        let ext_rows: Vec<(String, String, usize, u128, bool)> = self
+            .host
+            .report()
+            .iter()
+            .map(|r| {
+                (
+                    r.id.to_string(),
+                    r.name.to_string(),
+                    r.registered,
+                    r.duration.as_micros(),
+                    r.is_active(),
+                )
+            })
+            .collect();
+        let lang_count = self.host.registry().languages().len();
+        let theme_count = self.host.registry().themes().len();
         egui::Window::new("Settings  (Ctrl+,)")
             .open(&mut open)
             .collapsible(false)
@@ -2076,13 +2143,15 @@ impl LiteIdeApp {
                     actions.push(SettingsAction::FontSize(font_size));
                 }
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Theme:").size(13.0));
-                    if ui.selectable_label(theme == "Dark+", "Dark+").clicked() {
-                        actions.push(SettingsAction::Theme(ThemeKind::DarkPlus));
-                    }
-                    if ui.selectable_label(theme == "Light+", "Light+").clicked() {
-                        actions.push(SettingsAction::Theme(ThemeKind::LightPlus));
+                    for kind in ThemeKind::ALL {
+                        if ui
+                            .selectable_label(theme_kind == kind, kind.name())
+                            .clicked()
+                        {
+                            actions.push(SettingsAction::Theme(kind));
+                        }
                     }
                 });
                 ui.add_space(6.0);
@@ -2107,6 +2176,35 @@ impl LiteIdeApp {
                 ui.add_space(6.0);
                 if ui.button("Reset to defaults").clicked() {
                     actions.push(SettingsAction::Reset);
+                }
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "Extensions  ({lang_count} language · {theme_count} theme)"
+                    ))
+                    .size(13.0)
+                    .strong(),
+                );
+                for (id, name, registered, us, active) in &ext_rows {
+                    ui.horizontal(|ui| {
+                        let (mark, color) = if *active {
+                            ("✓", hex("#4ec9b0"))
+                        } else {
+                            ("✗", hex("#e51400"))
+                        };
+                        ui.label(RichText::new(mark).color(color).size(12.0));
+                        ui.label(RichText::new(name).size(12.0));
+                        ui.label(
+                            RichText::new(format!("{registered} 贡献点 · {us} us"))
+                                .size(10.5)
+                                .color(hex("#8a8a8a")),
+                        );
+                        ui.label(
+                            RichText::new(id)
+                                .size(10.0)
+                                .color(hex("#6a6a6a")),
+                        );
+                    });
                 }
                 ui.separator();
                 ui.label(
@@ -3753,8 +3851,9 @@ impl eframe::App for LiteIdeApp {
         }
         let theme_kind = ThemeKind::from_name(&self.settings.theme);
         if theme_kind != self.applied_theme {
+            let tokens = theme_tokens(&self.host, theme_kind);
             if let Some(ed) = &mut self.editor {
-                ed.set_theme(theme_kind);
+                ed.set_theme(theme_kind, &tokens);
             }
             self.applied_theme = theme_kind;
         }
@@ -3780,7 +3879,7 @@ impl eframe::App for LiteIdeApp {
         }
 
         let mut visuals = match theme_kind {
-            ThemeKind::DarkPlus => egui::Visuals::dark(),
+            ThemeKind::DarkPlus | ThemeKind::CppDark => egui::Visuals::dark(),
             ThemeKind::LightPlus => egui::Visuals::light(),
         };
         let p = palette(theme_kind);
@@ -3952,13 +4051,13 @@ impl eframe::App for LiteIdeApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        // 关闭系统输入法（IME）通道 —— 绕开 winit 0.29 + 中文输入法的按键丢失问题：
-        // TextEdit 一拿到焦点，egui 就会请求开启 IME；winit 随即把 WM_KEYDOWN（回车、
-        // 退格、方向键…）交给输入法处理并「吞掉」，只把 WM_KEYUP 透出来，于是
-        // `Key{pressed:true}` 永远收不到 —— 表现为文本框里回车确认失效。
-        // 本项目的编辑器是自绘文本通道、本来就不用 IME，这里索性全程关掉，
-        // 让所有按键/字符都走普通事件路径。
-        ctx.output_mut(|o| o.ime = None);
+        // 输入法（IME）通道：**不能**全局关掉 `o.ime`（旧版本为了绕开「回车被输入法吞掉」
+        // 而每帧强制 `o.ime = None`，代价是中文彻底打不进来）。
+        // 现在交给各个文本框自己上报：
+        //   · 内置 `egui::TextEdit`（命令面板 / 文件浏览器 / 搜索框…）本来就会上报；
+        //   · 自绘编辑器在 `Editor::show` 里上报，并在事件循环里处理 `Event::Ime`
+        //     （Preedit 组合串 / Commit 上屏）。
+        // 没人上报时 `output.ime` 自然是 None，egui-winit 会关掉窗口的输入法通道。
     }
 }
 

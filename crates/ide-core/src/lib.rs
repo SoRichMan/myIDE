@@ -5,7 +5,7 @@ pub mod highlight;
 pub mod theme;
 
 pub use buffer::Buffer;
-pub use highlight::{Highlight, HighlightGroup, Highlighter};
+pub use highlight::{Highlight, HighlightGroup};
 
 /// 领域错误类型（库层统一用 thiserror）。
 #[derive(Debug, thiserror::Error)]

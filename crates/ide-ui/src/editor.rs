@@ -11,51 +11,36 @@
 //! 新增断点行号栏红点（可点击）、当前行号高亮、缩进参考线、括号匹配高亮、
 //! 水平滚动 + minimap 保留列（文本不再压到 minimap 底下）、查找/替换所需的字符级 API。
 use ide_core::theme::{palette, ThemeKind};
-use ide_core::{Buffer, HighlightGroup, Highlighter};
+use ide_core::{Buffer, HighlightGroup};
+use ide_ext::{LanguageHighlighter, NullHighlighter, TextEdit, TokenPalette};
 use std::ops::Range;
-
-// ---- VSCode Dark+ 高亮配色（与 theme.rs 的底色配套） ----
-const DARK_KEYWORD: egui::Color32 = egui::Color32::from_rgb(0x56, 0x9c, 0xd6);
-const DARK_STRING: egui::Color32 = egui::Color32::from_rgb(0xce, 0x91, 0x78);
-const DARK_NUMBER: egui::Color32 = egui::Color32::from_rgb(0xb5, 0xce, 0xa8);
-const DARK_COMMENT: egui::Color32 = egui::Color32::from_rgb(0x6a, 0x99, 0x55);
-const DARK_FUNCTION: egui::Color32 = egui::Color32::from_rgb(0xdc, 0xdc, 0xaa);
-const DARK_TYPE: egui::Color32 = egui::Color32::from_rgb(0x4e, 0xc9, 0xb0);
-const DARK_PLAIN: egui::Color32 = egui::Color32::from_rgb(0xd4, 0xd4, 0xd4);
-
-// ---- Light+ 官方 token 色（light_plus.json） ----
-const LIGHT_KEYWORD: egui::Color32 = egui::Color32::from_rgb(0x00, 0x00, 0xff);
-const LIGHT_STRING: egui::Color32 = egui::Color32::from_rgb(0xa3, 0x15, 0x15);
-const LIGHT_NUMBER: egui::Color32 = egui::Color32::from_rgb(0x09, 0x86, 0x58);
-const LIGHT_COMMENT: egui::Color32 = egui::Color32::from_rgb(0x00, 0x80, 0x00);
-const LIGHT_FUNCTION: egui::Color32 = egui::Color32::from_rgb(0x79, 0x5e, 0x26);
-const LIGHT_TYPE: egui::Color32 = egui::Color32::from_rgb(0x26, 0x7f, 0x99);
-const LIGHT_PLAIN: egui::Color32 = egui::Color32::from_rgb(0x00, 0x00, 0x00);
 
 /// 断点红点色（VSCode Dark+ debug breakpoint）。
 const BREAKPOINT_RED: egui::Color32 = egui::Color32::from_rgb(0xe5, 0x14, 0x00);
 
-fn token_color(g: HighlightGroup, kind: ThemeKind) -> egui::Color32 {
-    let dark = match g {
-        HighlightGroup::Keyword => DARK_KEYWORD,
-        HighlightGroup::String => DARK_STRING,
-        HighlightGroup::Number => DARK_NUMBER,
-        HighlightGroup::Comment => DARK_COMMENT,
-        HighlightGroup::Function => DARK_FUNCTION,
-        HighlightGroup::Type => DARK_TYPE,
-        HighlightGroup::Operator | HighlightGroup::Plain => DARK_PLAIN,
-    };
-    if kind == ThemeKind::DarkPlus {
-        return dark;
+/// 一套 token 颜色：把主题扩展贡献的 [`TokenPalette`] 展开成**定长数组**。
+///
+/// 这是"配色可插拔"与"逐帧性能"的分界：扩展只在切换主题/创建编辑器时跑一次，
+/// 绘制路径上只做一次数组下标访问（不解析字符串、不查表、不分配）。
+#[derive(Debug, Clone, Copy)]
+pub struct TokenColors {
+    colors: [egui::Color32; HighlightGroup::COUNT],
+}
+
+impl TokenColors {
+    /// 从扩展配色表展开（配合 `ExtensionHost` 的注册表使用）。
+    pub fn from_palette(p: &TokenPalette) -> Self {
+        let mut colors = [egui::Color32::GRAY; HighlightGroup::COUNT];
+        for (group, hex_str) in p.pairs() {
+            colors[group.index()] = hex(hex_str);
+        }
+        Self { colors }
     }
-    match g {
-        HighlightGroup::Keyword => LIGHT_KEYWORD,
-        HighlightGroup::String => LIGHT_STRING,
-        HighlightGroup::Number => LIGHT_NUMBER,
-        HighlightGroup::Comment => LIGHT_COMMENT,
-        HighlightGroup::Function => LIGHT_FUNCTION,
-        HighlightGroup::Type => LIGHT_TYPE,
-        HighlightGroup::Operator | HighlightGroup::Plain => LIGHT_PLAIN,
+
+    /// 取分组颜色（无分支、无分配）。
+    #[inline]
+    pub fn get(&self, group: HighlightGroup) -> egui::Color32 {
+        self.colors[group.index()]
     }
 }
 
@@ -179,7 +164,8 @@ pub struct Editor {
     scroll: f32,
     /// 水平滚动偏移（像素）。
     h_scroll: f32,
-    highlighter: Highlighter,
+    /// 语言扩展提供的高亮器（默认空实现 = 无语法高亮）。
+    highlighter: Box<dyn LanguageHighlighter>,
     highlights: Vec<ide_core::Highlight>,
     /// 整个文档的字符串快照（高亮区间是字节偏移，按行切片时用）。
     raw_text: String,
@@ -205,11 +191,23 @@ pub struct Editor {
     line_height: f32,
     kind: ThemeKind,
     colors: PanelColors,
+    /// token 颜色（主题扩展贡献；默认 Dark+，由应用层按注册表覆盖）。
+    tokens: TokenColors,
     minimap: bool,
     /// 模态窗口（命令面板/设置/搜索等）打开时置 false，屏蔽编辑器快捷键防冲突。
     keys_enabled: bool,
     /// 别的文本框（侧栏搜索框等）持有键盘焦点：只放行全局快捷键。
     text_focus: bool,
+    // ---- 输入法（IME）----
+    /// 组合串（预编辑拼音）内容；空 = 当前没有正在组合的输入。
+    ///
+    /// 组合期间把拼音串**直接插进缓冲区**渲染（而不是自绘 overlay）：排版、换行、高亮、
+    /// 滚动全都复用现成逻辑，肉眼所见与 VS Code 一致；提交/取消/被打断时再替换或删除。
+    /// 这里记下内容，是为了在撤销 / 替换全部等外部改动后能认出「跟踪已失效」，
+    /// 宁可不动、也绝不误删正文。
+    ime_preedit: String,
+    /// 组合串在缓冲区里的起始**字符**下标。
+    ime_preedit_start: usize,
 }
 
 impl Editor {
@@ -222,7 +220,7 @@ impl Editor {
             selection: None,
             scroll: 0.0,
             h_scroll: 0.0,
-            highlighter: Highlighter::new(),
+            highlighter: Box::new(NullHighlighter),
             highlights: Vec::new(),
             raw_text: String::new(),
             line_byte_starts: Vec::new(),
@@ -236,15 +234,26 @@ impl Editor {
             mouse_pos: None,
             font_size: 14.0,
             line_height: 21.0, // 14 * 1.5
-            kind: ThemeKind::DarkPlus,
-            colors: PanelColors::from_kind(ThemeKind::DarkPlus),
+            kind: ThemeKind::CppDark,
+            colors: PanelColors::from_kind(ThemeKind::CppDark),
+            tokens: TokenColors::from_palette(&ext_theme_vscode::CPPTOOLS_DARK),
             minimap: true,
             keys_enabled: true,
             text_focus: false,
+            ime_preedit: String::new(),
+            ime_preedit_start: 0,
         };
         ed.refresh_highlights();
         ed.load_ms = t0.elapsed().as_millis();
         ed
+    }
+
+    /// 用新文本整体替换当前内容，并把高亮器换成该文档对应的语言扩展
+    /// （打开文件/切换标签走这里：**只高亮一次**）。
+    pub fn open_document(&mut self, source: &str, highlighter: Box<dyn LanguageHighlighter>) {
+        self.highlighter = highlighter;
+        self.highlighter.reset();
+        self.load_text(source);
     }
 
     /// 用新文本整体替换当前内容（打开/切换文件用），重置光标与滚动。
@@ -253,6 +262,8 @@ impl Editor {
         self.buffer = Buffer::from_text(source);
         self.cursor = 0;
         self.selection = None;
+        self.ime_preedit.clear();
+        self.ime_preedit_start = 0;
         self.scroll = 0.0;
         self.h_scroll = 0.0;
         self.mark_edited();
@@ -302,10 +313,20 @@ impl Editor {
         self.line_height = (fs * 1.5).round();
     }
 
-    /// 切换主题（面板底色 + token 色）。
-    pub fn set_theme(&mut self, kind: ThemeKind) {
+    /// 切换主题：面板底色取自 core 的外壳色板，token 色取自主题扩展贡献的配色表。
+    pub fn set_theme(&mut self, kind: ThemeKind, tokens: &TokenPalette) {
         self.kind = kind;
         self.colors = PanelColors::from_kind(kind);
+        self.tokens = TokenColors::from_palette(tokens);
+    }
+
+    /// 设置语法高亮器（不传或没有匹配语言时用 [`NullHighlighter`] = 纯文本）。
+    ///
+    /// 由应用层在创建/切换文档时按扩展注册表注入，编辑器不认识具体语言。
+    pub fn set_highlighter(&mut self, highlighter: Box<dyn LanguageHighlighter>) {
+        self.highlighter = highlighter;
+        self.highlighter.reset();
+        self.refresh_highlights();
     }
 
     /// 开关 minimap。
@@ -323,11 +344,20 @@ impl Editor {
     /// 模态窗口打开时禁用编辑器快捷键（避免与面板抢键）。
     pub fn set_keys_enabled(&mut self, on: bool) {
         self.keys_enabled = on;
+        if !on {
+            // 模态窗口打开 = 编辑器不再接收输入：把临时拼音串撤掉，
+            // 否则它会「变成」正文里的一段乱码。
+            self.clear_ime_preedit();
+        }
     }
 
     /// 其它文本框持有键盘焦点时，仅保留全局快捷键（见 `is_global_shortcut`）。
     pub fn set_text_focus(&mut self, on: bool) {
         self.text_focus = on;
+        if on {
+            // 输入法要交给那个文本框：临时拼音串先撤掉。
+            self.clear_ime_preedit();
+        }
     }
 
     // ---- 阶段 5：编辑命令（命令面板 / 快捷键共用） ----
@@ -571,8 +601,13 @@ impl Editor {
     }
 
     /// 文本变更后调用：重建 raw_text / 行字节表 / 高亮。
+    ///
+    /// 高亮走"编辑描述 + 增量解析"：先算出新旧文本的最小差异交给语言扩展，
+    /// tree-sitter 才能复用旧语法树（大文件打字延迟从数十毫秒降到亚毫秒级）。
     fn refresh_highlights(&mut self) {
-        self.raw_text = self.buffer.text();
+        let new_text = self.buffer.text();
+        let edit = TextEdit::between(&self.raw_text, &new_text);
+        self.raw_text = new_text;
         self.line_byte_starts.clear();
         self.line_byte_starts.push(0);
         for (i, b) in self.raw_text.bytes().enumerate() {
@@ -580,24 +615,23 @@ impl Editor {
                 self.line_byte_starts.push(i + 1);
             }
         }
-        // 统计最长行显示列数（含多字节字符；tab 记为 INDENT_STEP 列）——水平滚动上限用。
+        // 统计最长行显示宽度（tab = INDENT_STEP 格、CJK 按 2 格粗估）——水平滚动上限用。
+        // 这里只求量级正确（精确像素宽度要问字体，成本太高），偏大一点只是能多滚一点点。
         self.max_cols = self
             .raw_text
             .split('\n')
-            .map(|l| {
-                l.chars()
-                    .map(|c| if c == '\t' { INDENT_STEP } else { 1 })
-                    .sum::<usize>()
-            })
+            .map(|l| l.chars().map(char_cells).sum::<usize>())
             .max()
             .unwrap_or(0);
-        self.highlights = self.highlighter.highlight(&self.raw_text);
+        self.highlights = self.highlighter.highlight(&self.raw_text, edit);
         // 按起点排序：渲染与 minimap 都用"推进游标"扫描高亮，依赖此有序性。
         self.highlights.sort_by_key(|h| h.start);
         self.dirty = false;
     }
 
     fn set_cursor(&mut self, char_idx: usize) {
+        // 鼠标点到别处 = 打断输入法组合：先把临时拼音串撤掉，否则光标落点会算进组合串里。
+        self.clear_ime_preedit();
         let idx = char_idx.min(self.buffer.len_chars());
         self.cursor = idx;
         self.selection = None;
@@ -625,6 +659,62 @@ impl Editor {
         self.buffer.insert(self.cursor, &ch.to_string());
         self.cursor += 1;
         self.mark_edited();
+    }
+
+    /// 撤销组合期间临时插进缓冲区的预编辑串（提交前 / 取消 / 被打断时都先走这里）。
+    fn clear_ime_preedit(&mut self) {
+        if self.ime_preedit.is_empty() {
+            return;
+        }
+        let pre = std::mem::take(&mut self.ime_preedit);
+        let start = self.ime_preedit_start.min(self.buffer.len_chars());
+        let n = pre.chars().count();
+        // 组合串不含换行（插入时过滤了控制字符）→ 只可能落在同一行里。
+        // 先确认它还在（撤销 / 替换全部等外部改动会挪走它）：不在了就只丢跟踪，绝不误删。
+        let (line, col) = self.buffer.char_to_line_col(start);
+        let still_there = self
+            .buffer
+            .line(line)
+            .chars()
+            .skip(col)
+            .take(n)
+            .eq(pre.chars());
+        if !still_there {
+            return;
+        }
+        self.buffer.delete(start..start + n);
+        self.cursor = start;
+        self.selection = None;
+        self.mark_edited();
+    }
+
+    /// 输入法预编辑（拼音串）：先撤掉上一版组合串，再插到光标处。
+    fn ime_preedit(&mut self, text: &str) {
+        self.clear_ime_preedit();
+        let start = self.cursor;
+        let mut composed = String::new();
+        for ch in text.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            self.insert_char(ch);
+            composed.push(ch);
+        }
+        if !composed.is_empty() {
+            self.ime_preedit = composed;
+            self.ime_preedit_start = start;
+        }
+    }
+
+    /// 输入法提交：丢掉预编辑串，把最终文本按一次正常编辑插入（可撤销）。
+    fn ime_commit(&mut self, text: &str) {
+        self.clear_ime_preedit();
+        for ch in text.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            self.insert_char(ch);
+        }
     }
 
     fn backspace(&mut self) {
@@ -727,17 +817,37 @@ impl Editor {
     }
 
     /// 鼠标位置 → 字符索引（`rect_min` = 编辑器左上角屏幕坐标）。
-    fn pos_to_char(&self, pos: egui::Pos2, rect_min: egui::Pos2, char_width: f32) -> usize {
+    ///
+    /// 按真实字形宽度反查（与 `text_advance` 同一套宽度），否则中文行上点击会偏。
+    fn pos_to_char(
+        &self,
+        ui: &egui::Ui,
+        font_id: &egui::FontId,
+        pos: egui::Pos2,
+        rect_min: egui::Pos2,
+        space_w: f32,
+    ) -> usize {
         let line_idx = self
             .line_at_y(pos.y, rect_min.y)
             .unwrap_or(self.buffer.line_count().saturating_sub(1));
         let line_start_char = self.buffer.line_col_to_char(line_idx, 0);
         let text_x0 = rect_min.x + GUTTER_WIDTH + TEXT_PAD_LEFT - self.h_scroll;
-        let x_rel = pos.x - text_x0;
-        let col = (x_rel / char_width).floor().max(0.0) as usize;
-        let line_len = self.buffer.line(line_idx).chars().count();
-        let col = col.min(line_len.saturating_sub(1));
-        line_start_char + col
+        let x_rel = (pos.x - text_x0).max(0.0);
+        let line = self.buffer.line(line_idx);
+        let tab_w = space_w * INDENT_STEP as f32;
+        // 走一遍真实字形宽度（与绘制时同一套宽度），否则中文行上点击会偏。
+        let col = ui.fonts(|f| {
+            col_at_x(&line, x_rel, |c| {
+                if c == '\t' {
+                    tab_w
+                } else {
+                    f.glyph_width(font_id, c)
+                }
+            })
+        });
+        // 点到行尾之后：光标落到行末（行尾换行符之前），而不是跑到下一行行首。
+        let max_col = line.chars().count() - usize::from(line.ends_with('\n'));
+        line_start_char + col.min(max_col)
     }
 
     /// 光标附近若为括号，返回配对括号的 (行,列)（0-based）。
@@ -792,7 +902,7 @@ impl Editor {
         // 鼠标悬停跟踪（hover 用）
         self.mouse_char = response
             .hover_pos()
-            .map(|pos| self.pos_to_char(pos, rect.min, char_width));
+            .map(|pos| self.pos_to_char(ui, &font_id, pos, rect.min, char_width));
         self.mouse_pos = response.hover_pos();
 
         // 滚轮滚动：方向对齐 VSCode（向下滚 → 看后面的行）。
@@ -843,7 +953,7 @@ impl Editor {
                         action = Some(EditorAction::DebugToggleBreakpointAtLine(line));
                     }
                 } else if pos.x >= text_left {
-                    let idx = self.pos_to_char(pos, rect.min, char_width);
+                    let idx = self.pos_to_char(ui, &font_id, pos, rect.min, char_width);
                     if response.clicked() {
                         self.set_cursor(idx);
                     } else {
@@ -945,8 +1055,8 @@ impl Editor {
                 if sel.start < line_end_char && sel.end > line_start_char {
                     let s_col = sel.start.saturating_sub(line_start_char);
                     let e_col = sel.end.min(line_end_char) - line_start_char;
-                    let x0 = text_x0 + s_col as f32 * char_width;
-                    let x1 = text_x0 + e_col as f32 * char_width;
+                    let x0 = text_x0 + text_advance(ui, &font_id, &line_str, s_col, char_width);
+                    let x1 = text_x0 + text_advance(ui, &font_id, &line_str, e_col, char_width);
                     text_painter.rect_filled(
                         egui::Rect::from_min_max(
                             egui::pos2(x0, y),
@@ -998,7 +1108,7 @@ impl Editor {
                         job.append(
                             chunk,
                             0.0,
-                            egui::TextFormat::simple(font_id.clone(), token_color(*g, self.kind)),
+                            egui::TextFormat::simple(font_id.clone(), self.tokens.get(*g)),
                         );
                         cursor_byte = *e;
                         seg_iter.next();
@@ -1020,6 +1130,29 @@ impl Editor {
             // 在行高条带里垂直居中，保证代码与选中高亮/光标对齐。
             let ty = y + ((self.line_height - galley.size().y) * 0.5).max(0.0);
             text_painter.galley(egui::pos2(text_x0, ty), galley, self.colors.fg_plain);
+
+            // 输入法组合串加下划线（提示「这段还没落定」，和 VS Code 一致）。
+            if !self.ime_preedit.is_empty() {
+                let start = self.ime_preedit_start;
+                let end = start + self.ime_preedit.chars().count();
+                let line_start_char = self.buffer.line_col_to_char(li, 0);
+                let line_end_char = line_start_char + line_str.chars().count();
+                if start < line_end_char && end > line_start_char {
+                    let c0 = start.saturating_sub(line_start_char);
+                    let c1 = end.min(line_end_char) - line_start_char;
+                    let x0 = text_x0 + text_advance(ui, &font_id, &line_str, c0, char_width);
+                    let x1 = text_x0
+                        + text_advance(ui, &font_id, &line_str, c1.max(c0 + 1), char_width);
+                    text_painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x0, y + self.line_height - 2.0),
+                            egui::pos2(x1.min(text_right), y + self.line_height - 0.5),
+                        ),
+                        0.0,
+                        self.colors.fg_plain,
+                    );
+                }
+            }
         }
 
         // 括号匹配高亮（描边框，不遮字）
@@ -1029,12 +1162,15 @@ impl Editor {
                 if l < first_line || l >= last_line {
                     continue;
                 }
-                let x = text_x0 + c as f32 * char_width;
+                let line_txt = self.buffer.line(l);
+                let x = text_x0 + text_advance(ui, &font_id, &line_txt, c, char_width);
+                let ch = line_txt.chars().nth(c).unwrap_or(' ');
+                let bw = ui.fonts(|f| f.glyph_width(&font_id, ch));
                 let y = rect.min.y + l as f32 * self.line_height - self.scroll;
                 text_painter.rect_stroke(
                     egui::Rect::from_min_size(
                         egui::pos2(x, y),
-                        egui::vec2(char_width.max(6.0), self.line_height),
+                        egui::vec2(bw.max(6.0), self.line_height),
                     ),
                     1.0,
                     egui::Stroke::new(1.0_f32, box_color),
@@ -1081,7 +1217,7 @@ impl Editor {
                     hi += 1;
                 }
                 let color = match self.highlights.get(hi) {
-                    Some(h) if h.start < le => token_color(h.group, self.kind),
+                    Some(h) if h.start < le => self.tokens.get(h.group),
                     _ => self.colors.fg_plain,
                 };
                 let y = mm_rect.top() + li as f32 * per;
@@ -1108,7 +1244,7 @@ impl Editor {
                         _ => break,
                     }
                 }
-                let len = lead_cols + line.chars().skip(lead_chars).count();
+                let len = lead_cols + line.chars().skip(lead_chars).map(char_cells).sum::<usize>();
                 let x0 = mm_rect.left() + pad + (lead_cols as f32 / cols) * usable_w;
                 let x1 = mm_rect.left() + pad + (len as f32 / cols) * usable_w;
                 mm_painter.rect_filled(
@@ -1137,15 +1273,20 @@ impl Editor {
         }
 
         // 光标竖线（含水平滚动/保持可见）
+        //
+        // 列 → 像素必须走 `text_advance`（真实字形宽度）：中文一个字约 1.65 个等宽格，
+        // 按「列数 × 格宽」算会让光标停在汉字中间，打字时光标跟不上字。
         let (cur_line, cur_col) = self.buffer.char_to_line_col(self.cursor);
-        let mut cursor_x = text_left + TEXT_PAD_LEFT + cur_col as f32 * char_width - self.h_scroll;
+        let cur_line_text = self.buffer.line(cur_line);
+        let caret_dx = text_advance(ui, &font_id, &cur_line_text, cur_col, char_width);
+        let mut cursor_x = text_left + TEXT_PAD_LEFT + caret_dx - self.h_scroll;
         if cursor_x < text_left {
             self.h_scroll -= text_left - cursor_x;
         } else if cursor_x + char_width > text_right {
             self.h_scroll += cursor_x + char_width - text_right;
         }
         self.h_scroll = self.h_scroll.clamp(0.0, max_h);
-        cursor_x = (text_left + TEXT_PAD_LEFT + cur_col as f32 * char_width - self.h_scroll)
+        cursor_x = (text_left + TEXT_PAD_LEFT + caret_dx - self.h_scroll)
             .clamp(text_left, text_right - 1.0);
         let cursor_y = rect.min.y + cur_line as f32 * self.line_height - self.scroll;
         painter.rect_filled(
@@ -1157,6 +1298,27 @@ impl Editor {
             self.colors.cursor,
         );
 
+        // 输入法（IME）通道：编辑器是自绘文本通道，egui 只会替内置 `TextEdit` 上报
+        // 候选窗位置；这里必须自己上报 —— egui-winit 看到 `output.ime == Some(..)` 才会
+        // `set_ime_allowed(true)` 并把候选窗锚到光标处。不上报 = 窗口的输入法一直是关的，
+        // 表现就是「切换输入法没反应、中文一个字也进不来」。
+        //
+        // 只上报**光标处的一小块**（而不是整个编辑区）：egui-winit 会把它当作
+        // `CFS_EXCLUDE` 区交给输入法，区域一大候选窗就被挤到屏幕边缘去了。
+        // 焦点在别的文本框 / 模态窗口打开时不抢（交给那边上报）。
+        if self.keys_enabled && !self.text_focus {
+            let caret = egui::Rect::from_min_size(
+                egui::pos2(cursor_x, cursor_y),
+                egui::vec2(char_width.max(2.0), self.line_height),
+            );
+            ui.ctx().output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    rect: caret,
+                    cursor_rect: caret,
+                });
+            });
+        }
+
         // 键盘输入（模态窗口打开时不处理，避免快捷键冲突）
         let events = ui.input(|i| i.events.clone());
         if self.keys_enabled {
@@ -1165,6 +1327,12 @@ impl Editor {
                 // 交给那个文本框，别同时改到正文。
                 if self.text_focus && !is_global_shortcut(ev) {
                     continue;
+                }
+                // 组合中被会改动正文/光标的按键或字符事件打断时，先撤掉临时拼音串，
+                // 免得它被留在正文里或把光标算错（字母键不打断 —— 输入法只吞掉「字符消息」，
+                // `WM_KEYDOWN` 仍会送进来，若因此打断，拼音串就永远显示不出来）。
+                if !self.ime_preedit.is_empty() && breaks_ime_composition(ev) {
+                    self.clear_ime_preedit();
                 }
                 match ev {
                     egui::Event::Text(text) => {
@@ -1175,6 +1343,15 @@ impl Editor {
                             self.insert_char(ch);
                         }
                     }
+                    // Windows IME（微软拼音等）在组合中**不会**产生 `Event::Text`：
+                    // 拼音串走 Preedit、选中的汉字走 Commit。自绘编辑器必须自己处理，
+                    // 否则「输入法切了也没反应」。
+                    egui::Event::Ime(ime) => match ime {
+                        egui::ImeEvent::Commit(text) => self.ime_commit(text),
+                        egui::ImeEvent::Preedit(text) => self.ime_preedit(text),
+                        egui::ImeEvent::Disabled => self.clear_ime_preedit(),
+                        egui::ImeEvent::Enabled => {}
+                    },
                     egui::Event::Paste(text) => {
                         self.paste_text(text);
                     }
@@ -1306,6 +1483,89 @@ fn indent_columns(line: &str) -> usize {
     col
 }
 
+/// 一行前 `n_chars` 个字符的显示宽度：宽度由 `glyph_w` 提供（便于注入假字体度量做单测）。
+///
+/// 关键：不能按「字符数 × 等宽格」估算。正文用的等宽字体（Hack）一格约 8.28px，
+/// 而中文回退字体（微软雅黑）一个汉字约 13.64px ≈ 1.65 格 —— 于是中文行上
+/// 「第 n 列 = n 个格子」会把光标画到汉字中间去。
+fn advance_with(line: &str, n_chars: usize, glyph_w: impl Fn(char) -> f32) -> f32 {
+    line.chars().take(n_chars).map(glyph_w).sum()
+}
+
+/// [`advance_with`] 的反函数：横向偏移 `x` 落在第几个字符上（落在字符前半段即算该字符）。
+fn col_at_x(line: &str, x: f32, glyph_w: impl Fn(char) -> f32) -> usize {
+    let mut acc = 0.0f32;
+    let mut col = 0usize;
+    for c in line.chars() {
+        let w = glyph_w(c);
+        if x < acc + w * 0.5 {
+            break;
+        }
+        acc += w;
+        col += 1;
+    }
+    col
+}
+
+/// 一行前 `n_chars` 个字符在屏幕上占的**像素**宽度（真实字形宽度）。
+///
+/// 光标 / 选区 / 组合串下划线 / 点击定位全部走这条路径，中文与 ASCII 都对得上。
+/// tab 记作 `space_w * INDENT_STEP`：与 epaint 的 `TAB_SIZE`（也是 4）和 `indent_columns` 一致。
+fn text_advance(
+    ui: &egui::Ui,
+    font_id: &egui::FontId,
+    line: &str,
+    n_chars: usize,
+    space_w: f32,
+) -> f32 {
+    let tab_w = space_w * INDENT_STEP as f32;
+    ui.fonts(|f| {
+        advance_with(line, n_chars, |c| {
+            if c == '\t' {
+                tab_w
+            } else {
+                f.glyph_width(font_id, c)
+            }
+        })
+    })
+}
+
+/// 字符大约占几个等宽格子（tab = [`INDENT_STEP`]；东亚宽字符按 2 格粗算）。
+///
+/// 只用于**整文档级别的粗估**（水平滚动上限、minimap 缩略宽度）——那里拿不到字体，
+/// 也不可能为每行都去问字形宽度。需要精确像素的地方一律用 [`text_advance`]。
+fn char_cells(c: char) -> usize {
+    if c == '\t' {
+        INDENT_STEP
+    } else if is_wide_char(c) {
+        2
+    } else {
+        1
+    }
+}
+
+/// 粗略的「东亚宽 / 全角字符」判定（汉字、假名、谚文、全角标点、常见 emoji 区）。
+fn is_wide_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x115F      // Hangul Jamo
+        | 0x2E80..=0x303E    // CJK 部首 / 标点
+        | 0x3041..=0x33FF    // 假名、注音、CJK 兼容
+        | 0x3400..=0x4DBF    // CJK 扩展 A
+        | 0x4E00..=0x9FFF    // CJK 基本区
+        | 0xA000..=0xA4CF    // 彝文
+        | 0xAC00..=0xD7A3    // 谚文音节
+        | 0xF900..=0xFAFF    // CJK 兼容表意
+        | 0xFE30..=0xFE6F    // CJK 兼容形式
+        | 0xFF00..=0xFF60    // 全角 ASCII
+        | 0xFFE0..=0xFFE6    // 全角符号
+        | 0x1F300..=0x1F64F  // 常见 emoji
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x2FFFD  // CJK 扩展 B+
+        | 0x30000..=0x3FFFD
+    )
+}
+
 /// 行内字节区间，去掉行尾 `\r`/`\n`。
 ///
 /// `Buffer::line()` / `line_byte_starts` 给出的行区间含行尾换行；若把换行交给
@@ -1365,6 +1625,47 @@ fn is_global_shortcut(ev: &egui::Event) -> bool {
                 )
         }
         _ => false,
+    }
+}
+
+/// 会改动正文或光标的按键，会打断输入法组合。
+///
+/// 字母/数字/符号键**不算**：输入法只吞掉字符消息（`WM_CHAR`），`WM_KEYDOWN` 照样送进来，
+/// 若把它们也算作打断，组合串会每帧被清掉、永远显示不出来。
+fn breaks_ime_composition(ev: &egui::Event) -> bool {
+    use egui::Key;
+    match ev {
+        egui::Event::Ime(_) => false,
+        egui::Event::Key {
+            key,
+            pressed,
+            modifiers,
+            ..
+        } => {
+            *pressed
+                && (modifiers.command
+                    || modifiers.alt
+                    || matches!(
+                        key,
+                        Key::Backspace
+                            | Key::Delete
+                            | Key::Enter
+                            | Key::ArrowLeft
+                            | Key::ArrowRight
+                            | Key::ArrowUp
+                            | Key::ArrowDown
+                            | Key::Home
+                            | Key::End
+                            | Key::Tab
+                            | Key::F5
+                            | Key::F9
+                            | Key::F10
+                            | Key::F11
+                            | Key::F12
+                    ))
+        }
+        // 字符 / 粘贴等直接改正文的事件
+        _ => true,
     }
 }
 
@@ -1500,12 +1801,357 @@ mod tests {
 
     #[test]
     fn theme_switches_palette() {
+        // 编辑器默认外观 = 用户 VS Code 的 "Dark (Visual Studio - C/C++)"。
         let mut ed = Editor::new("x");
+        assert_eq!(ed.kind, ThemeKind::CppDark);
+        assert_eq!(ed.tokens.get(HighlightGroup::Comment), hex("#57a64a"));
+        assert_eq!(ed.colors.bg_editor, hex("#1E1E1E"));
+        ed.set_theme(ThemeKind::DarkPlus, &ext_theme_vscode::DARK_PLUS);
         assert_eq!(ed.kind, ThemeKind::DarkPlus);
-        ed.set_theme(ThemeKind::LightPlus);
+        assert_eq!(ed.tokens.get(HighlightGroup::Comment), hex("#6a9955"));
+        assert_eq!(ed.colors.bg_editor, hex("#1e1e1e"));
+        ed.set_theme(ThemeKind::LightPlus, &ext_theme_vscode::LIGHT_PLUS);
         assert_eq!(ed.kind, ThemeKind::LightPlus);
         assert_eq!(ed.colors.bg_editor, hex("#FFFFFF"));
         assert_eq!(ed.colors.selection, hex("#ADD6FF"));
+        assert_eq!(ed.tokens.get(HighlightGroup::Comment), hex("#008000"));
+        // C/C++ Themes：注释 #57A64A / 控制流 #D8A0DF / 形参 #9A9A9A
+        ed.set_theme(ThemeKind::CppDark, &ext_theme_vscode::CPPTOOLS_DARK);
+        assert_eq!(ed.tokens.get(HighlightGroup::Comment), hex("#57a64a"));
+        assert_eq!(ed.tokens.get(HighlightGroup::KeywordControl), hex("#d8a0df"));
+        assert_eq!(ed.tokens.get(HighlightGroup::Parameter), hex("#9a9a9a"));
+        assert_eq!(ed.tokens.get(HighlightGroup::Plain), hex("#dadada"));
+        assert_eq!(ed.colors.bg_editor, hex("#1E1E1E"));
+    }
+
+    #[test]
+    fn injected_highlighter_drives_syntax_colors() {
+        // 编辑器只持有 `dyn LanguageHighlighter`：换成语言扩展即可高亮。
+        let mut ed = Editor::new("int main() { return 0; }");
+        assert!(ed.highlights.is_empty(), "默认应是空实现（纯文本）");
+        ed.set_highlighter(Box::new(ext_cpp_highlight::CppHighlighter::new()));
+        assert!(!ed.highlights.is_empty(), "注入 C++ 扩展后应有高亮");
+        assert!(ed
+            .highlights
+            .iter()
+            .any(|h| h.group == HighlightGroup::Keyword));
+    }
+
+    #[test]
+    fn null_highlighter_leaves_text_plain() {
+        let mut ed = Editor::new("int main() {}");
+        ed.set_highlighter(Box::new(ide_ext::NullHighlighter));
+        assert!(ed.highlights.is_empty());
+    }
+
+    #[test]
+    fn incremental_typing_matches_full_parse() {
+        // 编辑 → `TextEdit::between` → 语言扩展增量解析；结果必须与全量解析逐字节一致。
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new("int main() {\n    int x = 1;\n    return x;\n}\n");
+        ed.set_highlighter(Box::new(ext_cpp_highlight::CppHighlighter::new()));
+        for (i, ch) in "// 注释".chars().enumerate() {
+            let n = ed.text().chars().count();
+            ed.replace_range(n, n, &ch.to_string());
+            // 高亮按帧懒刷新（同一帧内多次编辑只重算一次），这里手动跑一帧。
+            render_once(&ctx, &mut ed);
+            let full = ext_cpp_highlight::CppHighlighter::new().highlight(&ed.text(), None);
+            assert_eq!(ed.highlights, full, "第 {i} 次输入 {ch:?} 后增量结果与全量不一致");
+        }
+        assert!(ed
+            .highlights
+            .iter()
+            .any(|h| h.group == HighlightGroup::Comment));
+    }
+
+    /// 跑一帧渲染（只为触发懒刷新）。
+    fn render_once(ctx: &egui::Context, ed: &mut Editor) {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ed.show(ui);
+            });
+        });
+    }
+
+    // ---- 输入法（IME）----
+    //
+    // Windows 输入法组合时**不产生** `Event::Text`：拼音串走 `ImeEvent::Preedit`、
+    // 上屏结果走 `ImeEvent::Commit`。自绘编辑器必须自己处理，否则切了输入法也打不出中文。
+
+    fn ime_preedit_ev(text: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Preedit(text.to_string()))
+    }
+
+    fn ime_commit_ev(text: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Commit(text.to_string()))
+    }
+
+    /// 跑一帧并注入原始事件（模拟 winit → egui 的输入通道）。
+    fn render_with_events(
+        ctx: &egui::Context,
+        ed: &mut Editor,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = ed.show(ui);
+                });
+            },
+        )
+    }
+
+    #[test]
+    fn ime_commit_writes_chinese_into_document() {
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new("// \n");
+        ed.goto_char(3);
+        render_with_events(&ctx, &mut ed, vec![ime_commit_ev("中文注释")]);
+        assert_eq!(ed.text(), "// 中文注释\n");
+        assert_eq!(ed.cursor_line_col(), (0, 7));
+    }
+
+    #[test]
+    fn ime_preedit_is_visible_and_commit_replaces_it() {
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new("abc");
+        ed.goto_char(3);
+        render_with_events(&ctx, &mut ed, vec![ime_preedit_ev("ni")]);
+        assert_eq!(ed.text(), "abcni", "组合串应立刻可见（不能等上屏才显示）");
+        render_with_events(&ctx, &mut ed, vec![ime_preedit_ev("nihao")]);
+        assert_eq!(ed.text(), "abcnihao", "新的组合串要替换旧串，不能叠加");
+        render_with_events(&ctx, &mut ed, vec![ime_commit_ev("你好")]);
+        assert_eq!(ed.text(), "abc你好", "上屏后不能残留拼音");
+    }
+
+    #[test]
+    fn ime_commit_inside_comment_keeps_surrounding_text() {
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new("// \nint x = 1;\n");
+        ed.goto_char(3);
+        render_with_events(&ctx, &mut ed, vec![ime_commit_ev("你好")]);
+        assert_eq!(ed.text(), "// 你好\nint x = 1;\n");
+    }
+
+    #[test]
+    fn ime_cancel_and_interrupt_drop_preedit() {
+        // ① Esc / 失焦：输入法取消组合 → 拼音串必须消失，正文回到原样。
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new("abc");
+        ed.goto_char(3);
+        render_with_events(&ctx, &mut ed, vec![ime_preedit_ev("ni")]);
+        render_with_events(
+            &ctx,
+            &mut ed,
+            vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
+        );
+        assert_eq!(ed.text(), "abc");
+
+        // ② 组合中被别的按键打断：先撤掉拼音串，再处理按键（不能把拼音留在正文里）。
+        let mut ed = Editor::new("abc");
+        ed.goto_char(3);
+        render_with_events(&ctx, &mut ed, vec![ime_preedit_ev("ni")]);
+        render_with_events(&ctx, &mut ed, vec![key_ev(egui::Key::Backspace, false, false)]);
+        assert_eq!(ed.text(), "ab", "打断后应按真实正文退格");
+    }
+
+    #[test]
+    fn ime_preedit_dropped_when_modal_takes_input() {
+        // 组合进行中模态窗口抢走输入：拼音串不能留成正文。
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new("abc");
+        ed.goto_char(3);
+        render_with_events(&ctx, &mut ed, vec![ime_preedit_ev("ni")]);
+        assert_eq!(ed.text(), "abcni");
+        ed.set_keys_enabled(false);
+        assert_eq!(ed.text(), "abc");
+        ed.set_keys_enabled(true);
+        ed.set_text_focus(true);
+        assert_eq!(ed.text(), "abc");
+    }
+
+    #[test]
+    fn stale_ime_preedit_never_deletes_other_text() {
+        // 组合串的跟踪位置失效后（外部撤销 / 替换全部…），撤销跟踪必须只丢跟踪、不误删正文。
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new("abc");
+        ed.goto_char(3);
+        render_with_events(&ctx, &mut ed, vec![ime_preedit_ev("ni")]);
+        assert_eq!(ed.text(), "abcni");
+        ed.replace_range(3, 5, ""); // 外部改动（菜单里的「替换全部」）动了组合串所在位置 → 跟踪失效
+        assert_eq!(ed.text(), "abc");
+        render_with_events(&ctx, &mut ed, vec![ime_preedit_ev("nihao")]);
+        assert!(ed.text().starts_with("abc"), "正文被误删：{}", ed.text());
+        render_with_events(&ctx, &mut ed, vec![ime_commit_ev("你好")]);
+        assert!(ed.text().starts_with("abc"), "提交后正文被破坏：{}", ed.text());
+    }
+
+    #[test]
+    fn ime_composition_survives_letter_keys_but_not_edit_keys() {
+        // 组合期间字母键也会到达（输入法只吞字符消息）：不能因此打断组合，
+        // 否则拼音串会被每帧清掉、永远显示不出来。
+        assert!(!breaks_ime_composition(&key_ev(egui::Key::N, false, false)));
+        assert!(!breaks_ime_composition(&ime_preedit_ev("ni")));
+        assert!(!breaks_ime_composition(&ime_commit_ev("你")));
+        assert!(!breaks_ime_composition(&egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: false, // 输入法吞掉 keydown 时只剩 keyup，不能据此打断
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }));
+        // 会改动正文 / 光标的输入必须打断（否则临时拼音串会被留在正文里）。
+        assert!(breaks_ime_composition(&key_ev(egui::Key::Backspace, false, false)));
+        assert!(breaks_ime_composition(&key_ev(egui::Key::Enter, false, false)));
+        assert!(breaks_ime_composition(&key_ev(egui::Key::ArrowLeft, false, false)));
+        assert!(breaks_ime_composition(&key_ev(egui::Key::Z, true, false)));
+        assert!(breaks_ime_composition(&egui::Event::Text("中".to_string())));
+        assert!(breaks_ime_composition(&egui::Event::Paste("中".to_string())));
+    }
+
+    #[test]
+    fn ime_ignored_while_other_text_box_has_focus() {
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new("abc");
+        ed.goto_char(3);
+        ed.set_text_focus(true);
+        render_with_events(&ctx, &mut ed, vec![ime_commit_ev("你好")]);
+        assert_eq!(ed.text(), "abc", "焦点在别的文本框时编辑器不得抢输入法事件");
+    }
+
+    #[test]
+    fn editor_opens_ime_channel_with_caret_area() {
+        let ctx = egui::Context::default();
+        let mut ed = Editor::new("abc");
+        let out = render_with_events(&ctx, &mut ed, Vec::new());
+        let ime = out
+            .platform_output
+            .ime
+            .expect("编辑器接管输入时必须上报 IME（否则窗口输入法通道是关的）");
+        assert!(ime.cursor_rect.height() > 0.0, "候选窗要锚在光标上");
+        assert!(ime.rect.width() > 0.0);
+
+        // 焦点让给别的文本框 / 模态窗口打开：不再抢（交给那边上报）。
+        ed.set_text_focus(true);
+        let out = render_with_events(&ctx, &mut ed, Vec::new());
+        assert!(out.platform_output.ime.is_none());
+    }
+
+    // 列 → 像素换算：中文不是等宽格（实测 Hack 一格 8.28px、微软雅黑汉字 13.64px ≈ 1.65 格），
+    // 按「列数 × 格宽」定位会让光标 / 选区停在汉字中间。下面用假字体度量把这条契约钉死。
+
+    /// 假字体：ASCII 一格 `10.0`，汉字 `16.5`（≈ 真实字体里的 1.65 倍）。
+    fn fake_glyph_w(c: char) -> f32 {
+        if is_wide_char(c) {
+            16.5
+        } else {
+            10.0
+        }
+    }
+
+    #[test]
+    fn advance_uses_real_glyph_widths_not_char_cells() {
+        let line = "ab中中";
+        assert_eq!(advance_with(line, 0, fake_glyph_w), 0.0);
+        assert_eq!(advance_with(line, 2, fake_glyph_w), 20.0);
+        assert_eq!(advance_with(line, 3, fake_glyph_w), 36.5);
+        // 关键：中文行尾的光标位置是真实宽度之和，而不是「4 个字 × 一格」。
+        assert_eq!(advance_with(line, 4, fake_glyph_w), 53.0);
+        assert_ne!(advance_with(line, 4, fake_glyph_w), 40.0);
+    }
+
+    #[test]
+    fn click_column_is_inverse_of_advance() {
+        let line = "中ab";
+        // 汉字中点（8.25）之前算汉字前，之后算汉字后。
+        assert_eq!(col_at_x(line, 0.0, fake_glyph_w), 0);
+        assert_eq!(col_at_x(line, 8.0, fake_glyph_w), 0);
+        assert_eq!(col_at_x(line, 9.0, fake_glyph_w), 1);
+        assert_eq!(col_at_x(line, 26.4, fake_glyph_w), 2);
+        assert_eq!(col_at_x(line, 26.5, fake_glyph_w), 2);
+        assert_eq!(col_at_x(line, 31.5, fake_glyph_w), 3);
+        // 点到行尾之后：光标落在最后一个字符后面（与 VSCode 一致），而不是钉在倒数第二个字符上。
+        assert_eq!(col_at_x(line, 9999.0, fake_glyph_w), 3);
+    }
+
+    #[test]
+    fn col_at_x_round_trips_advance_on_cjk_line() {
+        let line = "// 中文abc";
+        for n in 0..=line.chars().count() {
+            let x = advance_with(line, n, fake_glyph_w);
+            // 每个字符的前半段都归属自己 → 从该字符的起点稍偏右点回去，仍回到同一个字符。
+            let probe = x + 1.0;
+            let col = col_at_x(line, probe, fake_glyph_w);
+            assert_eq!(col, n, "偏移 {x} 应落在第 {n} 个字符上，实际 {col}");
+        }
+    }
+
+    #[test]
+    fn tab_and_wide_chars_count_as_multiple_cells() {
+        assert_eq!(char_cells('a'), 1);
+        assert_eq!(char_cells('\t'), INDENT_STEP);
+        assert_eq!(char_cells('中'), 2);
+        assert_eq!(char_cells('，'), 2); // 全角标点
+        assert_eq!(char_cells('ｱ'), 1); // 半角片假名是窄字符
+    }
+
+    #[test]
+    fn max_cols_accounts_for_wide_chars() {
+        // 横向滚动上限按显示宽度算：3 个汉字 = 6 格（否则中文长行滚不到行尾）。
+        let mut ed = Editor::new("中中中\n");
+        ed.refresh_highlights();
+        assert_eq!(ed.max_cols, 6);
+    }
+
+    #[test]
+    fn ime_caret_area_follows_real_text_width_on_cjk_line() {
+        // 端到端：光标处的 IME 锚点（= 光标位置）必须按真实字形宽度走。
+        // 装了系统中文字体才量得出差异，没装就跳过（否则汉字被渲染成替换字符，宽度≈一格）。
+        let ctx = egui::Context::default();
+        crate::apply_fonts(&ctx, "Default");
+        let font_id = egui::FontId::monospace(14.0);
+        let mut widths = (0.0f32, 0.0f32);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            widths = (
+                ctx.fonts(|f| f.glyph_width(&font_id, ' ')),
+                ctx.fonts(|f| f.glyph_width(&font_id, '中')),
+            );
+        });
+        let (space, cjk) = widths;
+        assert!(space > 0.0, "量不到空格宽度");
+        if (cjk - space).abs() < 0.5 {
+            return; // 系统里没有中文字体：测不出「汉字比一格宽」，跳过。
+        }
+
+        let mut ed = Editor::new("abc中文\n");
+        let caret_x = |ed: &mut Editor| -> f32 {
+            let out = render_with_events(&ctx, ed, Vec::new());
+            out.platform_output
+                .ime
+                .expect("编辑器接管输入时必须上报 IME 锚点")
+                .cursor_rect
+                .min
+                .x
+        };
+        ed.goto_char(3); // "abc|中文"
+        let x_ascii = caret_x(&mut ed);
+        ed.goto_char(5); // "abc中文|"
+        let x_cjk = caret_x(&mut ed);
+        let delta = x_cjk - x_ascii;
+        // 两个汉字 = 2 × 真实汉字宽（不是 2 × 等宽格）。
+        assert!(
+            (delta - 2.0 * cjk).abs() < 0.5,
+            "汉字宽度没被算进去：位移 {delta}，期望 {}",
+            2.0 * cjk
+        );
+        assert!(
+            (delta - 2.0 * space).abs() > 0.5,
+            "位移 {delta} 说明还是按「列数 × 等宽格」在算"
+        );
     }
 
     #[test]

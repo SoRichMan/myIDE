@@ -21,7 +21,7 @@ explorer "$env:APPDATA\LiteIDE"
 |---|---|---|---|---|
 | `font_size` | number | `14` | 10 – 24 | 编辑器字号（行高 = 字号 × 1.5） |
 | `font_family` | string | `"Default"` | `"Default"` / `"Consolas"` / `"Cascadia Code"` | 字体族 |
-| `theme` | string | `"Dark+"` | `"Dark+"` / `"Light+"` | 配色主题 |
+| `theme` | string | `"C/C++ Dark"` | `"C/C++ Dark"` / `"Dark+"` / `"Light+"` | 配色主题（外壳色板 + token 配色） |
 | `show_sidebar` | bool | `true` | true/false | 显示左侧边栏 |
 | `show_minimap` | bool | `true` | true/false | 显示右侧 minimap |
 | `show_breadcrumbs` | bool | `true` | true/false | 显示面包屑路径 |
@@ -32,12 +32,16 @@ explorer "$env:APPDATA\LiteIDE"
 {
   "font_size": 14.0,
   "font_family": "Consolas",
-  "theme": "Dark+",
+  "theme": "C/C++ Dark",
   "show_sidebar": true,
   "show_minimap": true,
   "show_breadcrumbs": true
 }
 ```
+
+主题名也可以写扩展里的官方标签：`"Dark (Visual Studio - C/C++)"` 等价于 `"C/C++ Dark"`。
+主题的**外壳色**（侧栏/状态栏/行号）来自 IDE 内置色板，**token 色**由主题扩展贡献
+（见 `docs/extensions.md`）。
 
 ## 容错规则
 

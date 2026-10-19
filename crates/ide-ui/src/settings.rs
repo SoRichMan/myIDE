@@ -15,7 +15,7 @@ pub struct AppSettings {
     pub font_size: f32,
     /// 字体族："Default" | "Consolas" | "Cascadia Code"。
     pub font_family: String,
-    /// 主题："Dark+" | "Light+"。
+    /// 主题：`ThemeKind::ALL` 之一的名字（"C/C++ Dark" | "Dark+" | "Light+"）。
     pub theme: String,
     /// 显示侧边栏。
     pub show_sidebar: bool,
@@ -30,7 +30,7 @@ impl Default for AppSettings {
         Self {
             font_size: 14.0,
             font_family: "Default".to_string(),
-            theme: "Dark+".to_string(),
+            theme: "C/C++ Dark".to_string(),
             show_sidebar: true,
             show_minimap: true,
             show_breadcrumbs: true,
@@ -109,6 +109,7 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ide_core::theme::ThemeKind;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -126,7 +127,12 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         assert_eq!(AppSettings::default().font_size, 14.0);
-        assert_eq!(AppSettings::default().theme, "Dark+");
+        // 默认主题 = 用户 VS Code 用的 "Dark (Visual Studio - C/C++)"
+        assert_eq!(AppSettings::default().theme, "C/C++ Dark");
+        assert_eq!(
+            ThemeKind::from_name(&AppSettings::default().theme),
+            ThemeKind::CppDark
+        );
     }
 
     #[test]
@@ -181,7 +187,7 @@ mod tests {
         std::fs::write(&path, r#"{"font_size": 16, "future_field": 1}"#).unwrap();
         let (s, _) = AppSettings::load();
         assert_eq!(s.font_size, 16.0);
-        assert_eq!(s.theme, "Dark+"); // 缺失字段回退默认
+        assert_eq!(s.theme, "C/C++ Dark"); // 缺失字段回退默认
         let _ = std::fs::remove_dir_all(&dir);
     }
 

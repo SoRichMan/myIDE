@@ -1,0 +1,9 @@
+[package]
+name = "ide-ext"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+thiserror.workspace = true
+tracing.workspace = true

@@ -25,19 +25,39 @@ pub const L_BG_CURRENTLINE: &str = "#E8E8E8";
 pub const L_SELECTION: &str = "#ADD6FF";
 pub const L_CURSOR:    &str = "#000000";
 
-/// 主题种类。
+// ---- C/C++ Themes 扩展的 "Dark (Visual Studio - C/C++)" ----
+// 色值来源：ms-vscode.cpptools-themes 的 `themes/cpptools_dark_vs_new.json`
+// （该主题的 workbench 色只定义了部分，未定义处沿用 VSCode 内置深色默认值）。
+pub const C_BG_EDITOR:      &str = "#1E1E1E";
+pub const C_FG_EDITOR:      &str = "#DADADA";
+pub const C_BG_SIDEBAR:     &str = "#252526";
+pub const C_BG_ACTIVITYBAR: &str = "#333333";
+pub const C_BG_STATUSBAR:   &str = "#007ACC";
+pub const C_FG_LINENUMBER:  &str = "#2B91AF";
+pub const C_BG_CURRENTLINE: &str = "#2A2D2E";
+pub const C_SELECTION:      &str = "#264F78";
+pub const C_CURSOR:         &str = "#AEAFAD";
+
+/// 主题种类（决定"窗口外壳"色板；token 配色由主题扩展单独贡献）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeKind {
     DarkPlus,
     LightPlus,
+    /// C/C++ Themes 扩展的 Dark (Visual Studio - C/C++)。
+    CppDark,
 }
 
 impl ThemeKind {
+    /// 全部主题（设置面板按此顺序列出）。
+    pub const ALL: [ThemeKind; 3] =
+        [ThemeKind::DarkPlus, ThemeKind::LightPlus, ThemeKind::CppDark];
+
     /// 显示名（设置面板/状态栏用）。
     pub fn name(self) -> &'static str {
         match self {
             ThemeKind::DarkPlus => "Dark+",
             ThemeKind::LightPlus => "Light+",
+            ThemeKind::CppDark => "C/C++ Dark",
         }
     }
 
@@ -45,6 +65,8 @@ impl ThemeKind {
     pub fn from_name(s: &str) -> ThemeKind {
         match s {
             "Light+" => ThemeKind::LightPlus,
+            // 兼容扩展里的官方 label 写法
+            "C/C++ Dark" | "Dark (Visual Studio - C/C++)" => ThemeKind::CppDark,
             _ => ThemeKind::DarkPlus,
         }
     }
@@ -89,6 +111,17 @@ pub fn palette(kind: ThemeKind) -> PaletteHex {
             selection: L_SELECTION,
             cursor: L_CURSOR,
         },
+        ThemeKind::CppDark => PaletteHex {
+            bg_editor: C_BG_EDITOR,
+            fg_editor: C_FG_EDITOR,
+            bg_sidebar: C_BG_SIDEBAR,
+            bg_activitybar: C_BG_ACTIVITYBAR,
+            bg_statusbar: C_BG_STATUSBAR,
+            fg_linenumber: C_FG_LINENUMBER,
+            bg_currentline: C_BG_CURRENTLINE,
+            selection: C_SELECTION,
+            cursor: C_CURSOR,
+        },
     }
 }
 
@@ -124,9 +157,35 @@ mod tests {
     fn theme_kind_name_roundtrip() {
         assert_eq!(ThemeKind::from_name("Dark+"), ThemeKind::DarkPlus);
         assert_eq!(ThemeKind::from_name("Light+"), ThemeKind::LightPlus);
+        assert_eq!(ThemeKind::from_name("C/C++ Dark"), ThemeKind::CppDark);
+        assert_eq!(
+            ThemeKind::from_name("Dark (Visual Studio - C/C++)"),
+            ThemeKind::CppDark
+        );
         assert_eq!(ThemeKind::from_name("???") , ThemeKind::DarkPlus);
         assert_eq!(ThemeKind::DarkPlus.name(), "Dark+");
         assert_eq!(ThemeKind::LightPlus.name(), "Light+");
+        assert_eq!(ThemeKind::CppDark.name(), "C/C++ Dark");
+        for k in ThemeKind::ALL {
+            assert_eq!(ThemeKind::from_name(k.name()), k, "主题名回环失败：{k:?}");
+        }
+    }
+
+    #[test]
+    fn cpp_dark_colors_match_cpptools_theme() {
+        // cpptools_dark_vs_new.json（Dark (Visual Studio - C/C++)）
+        assert_eq!(C_BG_EDITOR, "#1E1E1E");
+        assert_eq!(C_FG_EDITOR, "#DADADA");
+        assert_eq!(C_FG_LINENUMBER, "#2B91AF");
+        let p = palette(ThemeKind::CppDark);
+        assert_eq!(p.bg_editor, C_BG_EDITOR);
+        assert_eq!(p.fg_editor, C_FG_EDITOR);
+        assert_eq!(p.fg_linenumber, C_FG_LINENUMBER);
+        assert_eq!(p.bg_currentline, C_BG_CURRENTLINE);
+        assert_eq!(p.selection, C_SELECTION);
+        // 与 Dark+ 的差异点：编辑器前景/行号色不同
+        assert_ne!(p.fg_editor, FG_EDITOR);
+        assert_ne!(p.fg_linenumber, FG_LINENUMBER);
     }
 
     #[test]
