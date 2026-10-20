@@ -13,15 +13,27 @@ fn distro() -> String {
     std::env::var("LITEIDE_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu2404".to_string())
 }
 
-/// Windows 路径 → WSL 挂载路径。
+/// Windows 路径 → WSL 视角路径。
+///
+/// - 盘符路径：`E:\\proj` → `/mnt/e/proj`
+/// - WSL UNC（远程工作区）：`\\\\wsl.localhost\\Ubuntu2404\\home\\x` → `/home/x`
+/// - 已是 POSIX：原样（只把反斜杠换成斜杠）
 pub fn win_to_wsl_path(p: &str) -> String {
+    let slashed = p.replace('\\', "/");
+    for prefix in ["//wsl.localhost/", "//wsl$/"] {
+        if let Some(rest) = slashed.strip_prefix(prefix) {
+            if let Some((_distro, tail)) = rest.split_once('/') {
+                return format!("/{tail}");
+            }
+        }
+    }
     let bytes = p.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
         let drive = (bytes[0] as char).to_ascii_lowercase();
         let rest = p[2..].trim_start_matches(['\\', '/']);
         format!("/mnt/{drive}/{}", rest.replace('\\', "/"))
     } else {
-        p.replace('\\', "/")
+        slashed
     }
 }
 
@@ -85,6 +97,15 @@ mod tests {
     #[test]
     fn win_to_wsl_drive() {
         assert_eq!(win_to_wsl_path(r"E:\repo"), "/mnt/e/repo");
+    }
+
+    #[test]
+    fn win_to_wsl_maps_wsl_unc() {
+        // 远程工作区（WSL 发行版内的目录）：git 在 WSL 里跑，路径要走 POSIX。
+        assert_eq!(
+            win_to_wsl_path(r"\\wsl.localhost\Ubuntu2404\home\work\proj"),
+            "/home/work/proj"
+        );
     }
 
     #[test]

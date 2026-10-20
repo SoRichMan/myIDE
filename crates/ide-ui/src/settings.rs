@@ -23,6 +23,10 @@ pub struct AppSettings {
     pub show_minimap: bool,
     /// 显示面包屑。
     pub show_breadcrumbs: bool,
+    /// 远程连接的 WSL 发行版（`None` = 本地工作区）。重启后恢复上次的连接。
+    pub remote_distro: Option<String>,
+    /// 远程工作区的 POSIX 路径（如 `/home/work/proj`）；与 `remote_distro` 成对出现。
+    pub remote_path: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -34,6 +38,8 @@ impl Default for AppSettings {
             show_sidebar: true,
             show_minimap: true,
             show_breadcrumbs: true,
+            remote_distro: None,
+            remote_path: None,
         }
     }
 }
@@ -145,6 +151,8 @@ mod tests {
             font_family: "Cascadia Code".to_string(),
             theme: "Light+".to_string(),
             show_minimap: false,
+            remote_distro: Some("Ubuntu2404".to_string()),
+            remote_path: Some("/home/work/NewLithoTune/candanza".to_string()),
             ..Default::default()
         };
         s.save().unwrap();

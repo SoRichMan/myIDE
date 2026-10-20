@@ -59,10 +59,91 @@ pub fn uri_to_wsl(uri: &str) -> Option<String> {
     }
 }
 
-/// `file://` URI → Windows 路径。
+/// `file://` URI → Windows 路径（含远程工作区的 UNC 路径）。
+///
+/// 远程工作区里 clangd 返回的是 `file://wsl.localhost/<distro>/...`，
+/// 对应 Windows 侧的 `\\wsl.localhost\<distro>\...`（9P 挂载可直接读写）。
 pub fn uri_to_win(uri: &str) -> Option<String> {
+    if let Some(rest) = uri.strip_prefix("file://wsl.localhost/") {
+        let rest = percent_decode(rest);
+        let (distro, tail) = rest.split_once('/').unwrap_or((rest.as_str(), ""));
+        let unc = wsl_dir_to_unc(distro, &format!("/{tail}"));
+        return Some(unc.trim_end_matches('\\').to_string());
+    }
+    if let Some(rest) = uri.strip_prefix("file://wsl$/") {
+        let rest = percent_decode(rest);
+        let (distro, tail) = rest.split_once('/').unwrap_or((rest.as_str(), ""));
+        let unc = wsl_dir_to_unc(distro, &format!("/{tail}"));
+        return Some(unc.trim_end_matches('\\').to_string());
+    }
     let wsl = uri_to_wsl(uri)?;
     wsl_to_win(&wsl)
+}
+
+// ---------------------------------------------------------------------------
+// 远程（WSL 发行版内的）路径
+// ---------------------------------------------------------------------------
+
+/// WSL 发行版里的目录 → Windows 可访问的 UNC 路径。
+///
+/// IDE 进程跑在 Windows 上，读目录/读文件只要路径能被 Win32 打开就行；
+/// WSL 发行版内的 `/home/work/proj` 在 Windows 侧就是
+/// `\\wsl.localhost\Ubuntu2404\home\work\proj`（9P 挂载，读写等同）。
+/// 这样「远程打开」不需要为每个文件都套一层 `wsl.exe cat`。
+pub fn wsl_dir_to_unc(distro: &str, posix: &str) -> String {
+    let posix = posix.trim();
+    let posix = posix.replace('\\', "/");
+    let rest = posix.trim_start_matches('/');
+    if rest.is_empty() {
+        format!(r"\\wsl.localhost\{distro}\")
+    } else {
+        format!(r"\\wsl.localhost\{distro}\{}", rest.replace('/', r"\"))
+    }
+}
+
+/// UNC 路径是否是 WSL 发行版挂载（`\\wsl.localhost\<distro>\...` 或旧式
+/// `\\wsl$\<distro>\...`）。返回发行版名。
+pub fn unc_wsl_distro(path: &str) -> Option<String> {
+    let p = path.replace('/', r"\");
+    let rest = p
+        .strip_prefix(r"\\wsl.localhost\")
+        .or_else(|| p.strip_prefix(r"\\wsl$\"))?;
+    let (distro, _) = rest.split_once('\\').unwrap_or((rest, ""));
+    if distro.is_empty() {
+        None
+    } else {
+        Some(distro.to_string())
+    }
+}
+
+/// UNC 路径 → 发行版内的 POSIX 路径；非 WSL UNC 返回 None。
+pub fn unc_to_wsl_posix(path: &str) -> Option<String> {
+    let p = path.replace('/', r"\");
+    let rest = p
+        .strip_prefix(r"\\wsl.localhost\")
+        .or_else(|| p.strip_prefix(r"\\wsl$\"))?;
+    let (_distro, tail) = rest.split_once('\\')?;
+    Some(format!("/{}", tail.replace('\\', "/")))
+}
+
+/// 「远程根」→ 根下的 URI：UNC 路径走 9P 形态（`file://wsl.localhost/<distro>/...`，
+/// clangd 正好认这种写法），盘符路径走 `/mnt/<drive>` 形态。
+pub fn path_to_uri_any(path: &str) -> Option<String> {
+    let p = path.replace('/', r"\");
+    if let Some(rest) = p
+        .strip_prefix(r"\\wsl.localhost\")
+        .or_else(|| p.strip_prefix(r"\\wsl$\"))
+    {
+        let (distro, tail) = rest.split_once('\\').unwrap_or((rest, ""));
+        let tail = tail.replace('\\', "/");
+        let body = if tail.is_empty() {
+            format!("wsl.localhost/{distro}/")
+        } else {
+            format!("wsl.localhost/{distro}/{tail}")
+        };
+        return Some(format!("file://{}", percent_encode(&body)));
+    }
+    win_to_uri(path)
 }
 
 /// 百分号编码：只编码保留字符之外的部分，`/` 保留（路径语义）。
@@ -165,5 +246,60 @@ mod tests {
         assert_eq!(uri_to_win("file:///home/user/a.cpp"), None);
         assert_eq!(uri_to_win("https://x/y"), None);
         assert_eq!(uri_to_win("not a uri"), None);
+    }
+
+    #[test]
+    fn wsl_dir_to_unc_and_back() {
+        assert_eq!(
+            wsl_dir_to_unc("Ubuntu2404", "/home/work/NewLithoTune/candanza"),
+            r"\\wsl.localhost\Ubuntu2404\home\work\NewLithoTune\candanza"
+        );
+        assert_eq!(
+            wsl_dir_to_unc("Ubuntu2404", "/"),
+            r"\\wsl.localhost\Ubuntu2404\"
+        );
+        // UNC → POSIX 回环（正反斜杠都接受）。
+        let unc = wsl_dir_to_unc("Ubuntu2404", "/home/work/x y");
+        assert_eq!(unc_to_wsl_posix(&unc).as_deref(), Some("/home/work/x y"));
+        assert_eq!(unc_wsl_distro(&unc).as_deref(), Some("Ubuntu2404"));
+        assert_eq!(
+            unc_to_wsl_posix(r"\\wsl$\Debian\srv\a").as_deref(),
+            Some("/srv/a")
+        );
+        // 普通盘符路径不是 WSL UNC。
+        assert_eq!(unc_wsl_distro(r"E:\proj"), None);
+        assert_eq!(unc_to_wsl_posix(r"\\server\share\x"), None);
+    }
+
+    #[test]
+    fn uri_to_win_handles_wsl_remote() {
+        assert_eq!(
+            uri_to_win("file://wsl.localhost/Ubuntu2404/home/work/proj/main.cpp").as_deref(),
+            Some(r"\\wsl.localhost\Ubuntu2404\home\work\proj\main.cpp")
+        );
+        // 带空格（URI 里是 %20）。
+        assert_eq!(
+            uri_to_win("file://wsl.localhost/Ubuntu2404/home/my%20proj/a.b").as_deref(),
+            Some(r"\\wsl.localhost\Ubuntu2404\home\my proj\a.b")
+        );
+    }
+
+    #[test]
+    fn path_to_uri_any_handles_unc_and_drive() {
+        let unc = wsl_dir_to_unc("Ubuntu2404", "/home/work/proj");
+        assert_eq!(
+            path_to_uri_any(&unc).as_deref(),
+            Some("file://wsl.localhost/Ubuntu2404/home/work/proj")
+        );
+        // 带空格要百分号编码。
+        let spaced = wsl_dir_to_unc("Ubuntu2404", "/home/work/my proj");
+        assert_eq!(
+            path_to_uri_any(&spaced).as_deref(),
+            Some("file://wsl.localhost/Ubuntu2404/home/work/my%20proj")
+        );
+        assert_eq!(
+            path_to_uri_any(r"E:\proj\a.cpp").as_deref(),
+            Some("file:///mnt/e/proj/a.cpp")
+        );
     }
 }

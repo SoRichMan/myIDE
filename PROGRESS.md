@@ -947,6 +947,66 @@ C/C++ Themes 主题没有覆盖 `statusBar.*`，因此也沿用 Dark 2026 那套
 
 ---
 
+## 第十三轮：连接项可点 → WSL 远程工作区（真连接）
+
+把上一轮「只显示」的连接项做成真功能：点它弹 VS Code 风格的远程菜单，其中 **WSL 是真实现**，
+其余项按「选项都在、但禁用」列出（与 VS Code 菜单同序）。
+
+### 路径层（`crates/ide-lsp/src/path_map.rs`）
+
+- 新增 `wsl_dir_to_unc(distro, posix)`：`/home/x` → `\\wsl.localhost\<distro>\home\x`。
+  Windows 侧读写走 9P 挂载，**不需要为每个文件套 `wsl.exe cat`**；
+- 新增 `unc_wsl_distro` / `unc_to_wsl_posix` / `path_to_uri_any`：
+   UNC → POSIX、UNC → `file://wsl.localhost/<distro>/...`（clangd 认这种形态），盘符仍走 `file:///mnt/<drive>/...`；
+- `uri_to_win` 认得 `file://wsl.localhost/...` 与 `file://wsl$/...` 两种写法（跳转定义回到远程文件）。
+
+`ide-search` / `ide-git` 的 `win_to_wsl_path` 也补上 UNC 分支：远程根在 wsl.exe 里就是 `/home/x`，
+不再是 `//wsl.localhost/...` 这种 wsl 不认的路径。
+
+### LSP 换根（`crates/ide-lsp/src/manager.rs`）
+
+clangd 的根只在 `initialize` 时确定，所以新增 `Command::Reopen { root_uri }` + `LspManager::reopen_root()`
+（同根不重启），`ready_loop` 收到后 shutdown 并带新根重连。**修掉一个死锁式 bug**：`ReadyOutcome::Restart`
+原本回到「等新命令」的循环，只发一条 `Reopen` 的调用方会永远停在 `LspStatus::Off`；现在用 `restart_now`
+直接用当前根重连。新增独立测试二进制 `tests/mock_reopen.rs`（`LITEIDE_LSP_CMD` 是进程级变量，
+不与 `mock_integration.rs` 同进程并行）。
+
+### IDE 侧（`crates/ide-ui/src/main.rs`）
+
+- 状态/持久化：`AppSettings::remote_distro` / `remote_path`，重启自动恢复上次连接；
+- `workspace_root()` / `workspace_uri()` 统一接管**资源管理器 / rg（含 Ctrl+P 文件浏览）/ git / LSP / 另存为**的根；
+- 连接项：`Sense::click`，点击弹出 `draw_remote_menu`（`Connect to WSL…`、`Connect to Host…(SSH)`、
+  `Connect to Tunnel…`、`Clone Repository in WSL…`、`Open Folder on Remote…`；已连接时顶部多一行
+  `WSL: <distro>` + `Close Remote Connection`）。非 WSL 项 `add_enabled(false)`，悬停给「暂未实现」提示；
+- 连接对话框 `draw_remote_dialog`：发行版下拉（`wsl.exe -l -q`，同步版带 10s 超时）+ 目录输入 +
+  子目录浏览（UNC 直读，不需要子进程）+ Up/Connect/Cancel；路径统一走 `normalize_posix`；
+- 连接成功后 `apply_workspace_switch()`：资源管理器重扫、git 换根、LSP 换根重启，并 `flash` 结果；
+- 远程工作区里**根外的文件不发给 clangd**（不在索引范围内，发过去只会白发 didChange）；
+- 对话框打开期间计入 `modal_open`，避免在路径输入框里按 Ctrl+A 同时全选编辑器正文。
+
+### 验收（真机交互，Ubuntu2404）
+
+| 指标 | 结果 |
+|---|---|
+| `cargo test --workspace` | ✅ 全绿（ide-ui 100；ide-lsp 新增 `mock_reopen`） |
+| `cargo clippy --workspace --all-targets -D warnings` | ✅ 0 warning |
+| 点击连接项 → 菜单 | ✅ 选项与 VS Code 同序；只有 ` Connect to WSL…` 高亮可点，其余变灰 |
+| 连接 `Ubuntu2404:/home/work/NewLithoTune/candanza` | ✅ 资源管理器换成该目录（23643 files）；`branch: master`；状态栏蓝底 `WSL: Ubuntu2404` |
+| LSP 换根 | ✅ 日志 `LSP root → file://wsl.localhost/Ubuntu2404/...`，`Off → Detecting → Connecting → Ready` |
+| File Open（Ctrl+P） | ✅ 对话框起点就是远程根，打开其中文件正常显示 |
+| 编辑 + Ctrl+S | ✅ 改完保存，WSL 侧 `cat` 读回一致（随后删掉该探针文件） |
+| 重启恢复 | ✅ 带 `remote_distro/remote_path` 启动后直接进远程工作区 |
+| 断开 | ✅ `Close Remote Connection` 回到本地根，状态栏恢复图标态，LSP 重启到本地根 |
+
+### 已知边界
+
+- 只实现了 WSL；SSH / Tunnel / Dev Container 仍是禁用的占位项；
+- 「克隆仓库到 WSL」「在远程打开文件夹」也未实现（同样占位）；
+- 远程根下的分支/状态来自 WSL 里的 git（UNC 根已在 `win_to_wsl_path` 里映射成 POSIX）；
+- 没有远程的文件监视，外部改动仍需手动刷新。
+
+---
+
 ## 下一步任务：项目主体已完成
 
 myIDE.md 阶段 0-6 全部交付。后续仅按需处理技术债清单，不主动开工。

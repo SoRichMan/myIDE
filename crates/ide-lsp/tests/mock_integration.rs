@@ -288,3 +288,4 @@ fn manager_mock_crash_then_restart() {
     mgr.shutdown();
     unsafe { std::env::remove_var("LITEIDE_LSP_CMD") };
 }
+

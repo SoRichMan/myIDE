@@ -17,7 +17,7 @@ use ide_dap::manager::{BreakpointSpec, DapManager, DapStatus, Event as DapEvent,
 use ide_git::{Event as GitEvent, GitManager, GitStatus};
 use ide_lsp::manager::{Event as LspEvent, LspManager, LspStatus};
 use ide_lsp::message::{Position, SymbolInfo};
-use ide_lsp::path_map::{uri_to_win, win_to_uri};
+use ide_lsp::path_map::{path_to_uri_any, uri_to_win, wsl_dir_to_unc};
 use ide_search::{Event as SearchEvent, SearchManager, SearchMatch, SearchOptions};
 use settings::AppSettings;
 use tabs::{CloseResult, Tab, TabList};
@@ -55,6 +55,72 @@ fn hex(s: &str) -> egui::Color32 {
         return egui::Color32::from_rgba_unmultiplied(r, g, b, a);
     }
     egui::Color32::from_rgb(r, g, b)
+}
+
+/// 连接项菜单的动作（布局对齐 VS Code 的 Remote 菜单）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteAction {
+    ConnectWsl,
+    /// SSH / Dev Container / Tunnel 暂无实现，只占位列出。
+    ConnectSsh,
+    ConnectTunnel,
+    CloneRepository,
+    OpenOnRemote,
+    Disconnect,
+}
+
+impl RemoteAction {
+    /// 是否已实现（只有 WSL 是真实现，其余只展示）。
+    fn is_supported(self) -> bool {
+        matches!(self, RemoteAction::ConnectWsl | RemoteAction::Disconnect)
+    }
+}
+
+/// 连接菜单的条目（顺序与 VS Code 一致：WSL → SSH → Tunnel → 克隆 → 打开远程）。
+fn remote_menu_entries() -> [(&'static str, &'static str, RemoteAction); 5] {
+    [
+        (
+            "Connect to WSL…",
+            "连接到 WSL 发行版里的目录（已实现）",
+            RemoteAction::ConnectWsl,
+        ),
+        (
+            "Connect to Host… (SSH)",
+            "暂未实现：SSH 远程开发",
+            RemoteAction::ConnectSsh,
+        ),
+        (
+            "Connect to Tunnel…",
+            "暂未实现：Remote Tunnels",
+            RemoteAction::ConnectTunnel,
+        ),
+        (
+            "Clone Repository in WSL…",
+            "暂未实现：在 WSL 里克隆仓库",
+            RemoteAction::CloneRepository,
+        ),
+        (
+            "Open Folder on Remote…",
+            "暂未实现：在远程打开文件夹",
+            RemoteAction::OpenOnRemote,
+        ),
+    ]
+}
+
+/// 规范化对话框里的 POSIX 目录：补前导 `/`、去掉多余尾部 `/`，空串视为 `/`。
+///
+/// 用户手输的可能是 `home/work`、`/home/work/` 或空串；统一成一一种形态，
+/// 否则「浏览子目录」拼出来的路径会变成 `/work` 这种相对根。
+fn normalize_posix(p: &str) -> String {
+    let t = p.trim().replace('\\', "/");
+    let t = t.trim_end_matches('/');
+    if t.is_empty() {
+        "/".to_string()
+    } else if t.starts_with('/') {
+        t.to_string()
+    } else {
+        format!("/{t}")
+    }
 }
 
 /// 启动时装配的内置扩展（顺序 = 注册顺序，先注册者优先认领后缀）。
@@ -350,6 +416,20 @@ struct LiteIdeApp {
     tab_last_click: Option<(usize, f64)>,
     /// 标题栏左上角的应用图标纹理（首帧懒加载，之后每帧复用）。
     app_icon: Option<egui::TextureHandle>,
+    // ---- 远程（WSL）连接 ----
+    /// 左下角「远程连接」菜单是否展开。
+    remote_menu_open: bool,
+    /// 「连接到 WSL」对话框是否展开（选发行版 + 选目录）。
+    remote_dialog_open: bool,
+    /// 对话框里选中的发行版（打开对话框时从 `wsl -l -q` 枚举）。
+    remote_dialog_distros: Vec<String>,
+    remote_dialog_distro: String,
+    /// 对话框里的目录路径（POSIX，如 `/home/work/NewLithoTune`）。
+    remote_dialog_path: String,
+    /// 对话框当前目录下的子目录列表。
+    remote_dialog_dirs: Vec<String>,
+    /// 「连接」项这一帧的屏幕矩形（菜单锚定用）。
+    remote_item_rect: Option<egui::Rect>,
 }
 
 impl LiteIdeApp {
@@ -382,7 +462,7 @@ impl LiteIdeApp {
         let current_file = path.clone();
         let current_uri = current_file
             .as_ref()
-            .and_then(|p| win_to_uri(&p.to_string_lossy()));
+            .and_then(|p| path_to_uri_any(&p.to_string_lossy()));
         let mut tabs = TabList::new();
         if let Some(p) = path.clone() {
             tabs.open(p, text);
@@ -506,7 +586,89 @@ impl LiteIdeApp {
             explorer_last_click: None,
             tab_last_click: None,
             app_icon: None,
+            remote_menu_open: false,
+            remote_dialog_open: false,
+            remote_dialog_distros: Vec::new(),
+            remote_dialog_distro: String::new(),
+            remote_dialog_path: String::new(),
+            remote_dialog_dirs: Vec::new(),
+            remote_item_rect: None,
         }
+    }
+
+    /// 远程工作区的 Windows 侧根目录（WSL UNC）；未连接时为 `None`。
+    fn remote_root(&self) -> Option<String> {
+        let distro = self.settings.remote_distro.as_deref()?;
+        let path = self.settings.remote_path.as_deref()?;
+        Some(wsl_dir_to_unc(distro, path))
+    }
+
+    /// 当前工作区根（远程优先）。资源管理器 / rg / git / LSP 都以它为根。
+    fn workspace_root(&self) -> String {
+        self.remote_root().unwrap_or_else(|| self.project_root())
+    }
+
+    /// 当前工作区根的 `file://` URI（远程走 `file://wsl.localhost/...`）。
+    fn workspace_uri(&self) -> String {
+        let root = self.workspace_root();
+        path_to_uri_any(&root).unwrap_or_else(|| "file:///".to_string())
+    }
+
+    fn is_remote(&self) -> bool {
+        self.remote_root().is_some()
+    }
+
+    /// 切换到远程工作区（WSL 发行版 + 目录）。
+    ///
+    /// 顺序很重要：先校验目录能被 Win32 打开（9P 挂载），再写入设置、重置资源管理器
+    /// 并让 LSP 以新根重起、Git 换根——避免切到打不开的路径后整个侧栏空白。
+    fn connect_remote(&mut self, distro: &str, path: &str) {
+        let posix = normalize_posix(path);
+        let unc = wsl_dir_to_unc(distro, &posix);
+        let unc_path = std::path::Path::new(&unc);
+        if !unc_path.is_dir() {
+            self.flash(format!(
+                "无法打开远程目录 {distro}:{posix}（WSL 未运行或路径不存在）"
+            ));
+            return;
+        }
+        self.settings.remote_distro = Some(distro.to_string());
+        self.settings.remote_path = Some(posix.clone());
+        self.save_settings();
+        self.apply_workspace_switch();
+        self.flash(format!("已连接到 WSL: {distro} · {posix}"));
+        tracing::info!("remote workspace: {distro}:{posix} -> {unc}");
+    }
+
+    /// 断开远程连接，回到本地工作区。
+    fn disconnect_remote(&mut self) {
+        if !self.is_remote() {
+            self.flash("当前没有远程连接".to_string());
+            return;
+        }
+        self.settings.remote_distro = None;
+        self.settings.remote_path = None;
+        self.save_settings();
+        self.apply_workspace_switch();
+        self.flash("已断开远程连接，回到本地工作区".to_string());
+    }
+
+    /// 工作区根变化后的统一善后：资源管理器重扫、Git 换根、LSP 以新根重启。
+    fn apply_workspace_switch(&mut self) {
+        self.explorer_loaded = false;
+        self.explorer_files.clear();
+        self.explorer_tree = tree::FileTree::default();
+        self.explorer_rows.clear();
+        self.explorer_expanded.clear();
+        self.content_results.clear();
+        let root = self.workspace_root();
+        self.search.load_files(&root);
+        self.rebuild_explorer();
+        self.git.switch_root(&root);
+        // clangd 的根只在 initialize 时确定：根变了就重连。
+        let uri = self.workspace_uri();
+        self.root_uri = uri.clone();
+        self.lsp.reopen_root(uri);
     }
 
     fn pick_root(&self) -> String {
@@ -560,10 +722,15 @@ impl LiteIdeApp {
             ed.set_cursor_line_col(tab.cursor.0, tab.cursor.1);
         }
         self.current_file = tab.path.clone();
-        self.current_uri = tab
-            .path
-            .as_ref()
-            .and_then(|p| win_to_uri(&p.to_string_lossy()));
+        self.current_uri = tab.path.as_ref().and_then(|p| {
+            let path = p.to_string_lossy();
+            // 远程工作区只把「根下的文件」交给 clangd：根外的文件不在 clangd 的
+            // 索引范围内，发过去它也无从解析，反而会浪费一次 didChange。
+            if self.is_remote() && !path.starts_with(self.workspace_root().as_str()) {
+                return None;
+            }
+            path_to_uri_any(&path)
+        });
         self.doc_version = 1;
         self.last_sync_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
         self.lsp_ready_synced = false;
@@ -870,8 +1037,13 @@ impl LiteIdeApp {
             return;
         }
         self.lsp_started = true;
-        let root = self.pick_root();
-        self.root_uri = win_to_uri(&root).unwrap_or_else(|| "file:///".to_string());
+        // 远程工作区优先：clangd 在 WSL 里直接看 `/home/...`，URI 走 wsl.localhost 形态。
+        let root = if self.is_remote() {
+            self.workspace_root()
+        } else {
+            self.pick_root()
+        };
+        self.root_uri = path_to_uri_any(&root).unwrap_or_else(|| "file:///".to_string());
         tracing::info!("LSP root: {root} -> {}", self.root_uri);
         self.lsp.start(self.root_uri.clone());
     }
@@ -1591,11 +1763,15 @@ impl LiteIdeApp {
         self.file_picker_focus = true;
         self.file_picker_query.clear();
         if self.file_picker_dir.as_os_str().is_empty() {
-            let start = self
-                .active_tab_path()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .filter(|d| d.is_dir())
-                .unwrap_or_else(|| PathBuf::from(self.project_root()));
+            // 远程工作区：从工作区根开始浏览（用户在 WSL 里工作，不是本地目录）。
+            let start = if self.is_remote() {
+                Some(PathBuf::from(self.workspace_root()))
+            } else {
+                self.active_tab_path()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            }
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| PathBuf::from(self.workspace_root()));
             self.set_file_picker_dir(start);
         }
     }
@@ -1742,7 +1918,7 @@ impl LiteIdeApp {
         if q.is_empty() {
             return;
         }
-        let root = self.project_root();
+        let root = self.workspace_root();
         let opts = SearchOptions {
             case_sensitive: self.search_case,
             regex: self.search_regex,
@@ -2257,7 +2433,7 @@ impl LiteIdeApp {
         }
 
         for (file, line) in jump.into_iter() {
-            let root = self.project_root();
+            let root = self.workspace_root();
             let full = std::path::Path::new(&root).join(&file);
             let win = full.to_string_lossy().into_owned();
             self.jump_to(&win, line.saturating_sub(1) as usize, 0);
@@ -2464,23 +2640,23 @@ impl LiteIdeApp {
             self.refresh_git_now();
         }
         if let Some(path) = want_diff {
-            let root = self.project_root();
+            let root = self.workspace_root();
             self.git.diff(&root, &path, false);
         }
         if let Some(path) = want_stage {
-            let root = self.project_root();
+            let root = self.workspace_root();
             self.git.add(&root, &path);
         }
         if let Some(path) = want_unstage {
-            let root = self.project_root();
+            let root = self.workspace_root();
             self.git.unstage(&root, &path);
         }
         if let Some(path) = want_discard {
-            let root = self.project_root();
+            let root = self.workspace_root();
             self.git.restore(&root, &path);
         }
         if let Some(msg) = want_commit {
-            let root = self.project_root();
+            let root = self.workspace_root();
             self.git.commit(&root, &msg);
             self.git_commit_input.clear();
         }
@@ -2518,7 +2694,7 @@ impl LiteIdeApp {
                 GitEvent::Done { ok, msg } => {
                     if ok {
                         self.flash(msg);
-                        let root = self.project_root();
+                        let root = self.workspace_root();
                         self.git.refresh(&root);
                         self.git.load_log(&root);
                     } else {
@@ -2530,7 +2706,7 @@ impl LiteIdeApp {
     }
 
     fn refresh_git_now(&self) {
-        let root = self.project_root();
+        let root = self.workspace_root();
         self.git.refresh(&root);
         self.git.load_log(&root);
     }
@@ -2862,7 +3038,7 @@ impl LiteIdeApp {
             .map(|t| t.title.clone())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| "untitled.cpp".to_string());
-        let root = self.project_root();
+        let root = self.workspace_root();
         self.save_as_input = format!("{root}\\{name}");
         self.save_as_open = true;
     }
@@ -2905,7 +3081,7 @@ impl LiteIdeApp {
             t.text = text;
         }
         self.current_file = Some(path.clone());
-        self.current_uri = win_to_uri(&path.to_string_lossy());
+        self.current_uri = path_to_uri_any(&path.to_string_lossy());
         self.editor_clean_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
         self.save_as_open = false;
         self.flash(format!("已保存 {}", path.display()));
@@ -3058,7 +3234,7 @@ impl LiteIdeApp {
                 self.symbol_filter.clear();
             }
             "search.refreshFiles" => {
-                let root = self.project_root();
+                let root = self.workspace_root();
                 self.search.load_files(&root);
                 self.flash("正在刷新文件清单".to_string());
             }
@@ -3079,14 +3255,14 @@ impl LiteIdeApp {
                 if msg.trim().is_empty() {
                     self.flash("请先输入提交信息".to_string());
                 } else {
-                    let root = self.project_root();
+                    let root = self.workspace_root();
                     self.git.commit(&root, msg.trim());
                     self.git_commit_input.clear();
                 }
             }
             "git.diffActive" => {
                 if let Some(p) = self.active_tab_path() {
-                    let root = self.project_root();
+                    let root = self.workspace_root();
                     self.git.diff(&root, &p.to_string_lossy(), false);
                     self.git_panel_open = true;
                 } else {
@@ -4047,7 +4223,7 @@ impl LiteIdeApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
                 if icon_button(ui, Codicon::Refresh, "重新扫描（rg --files）").clicked() {
-                    let root = self.project_root();
+                    let root = self.workspace_root();
                     self.search.load_files(&root);
                 }
             });
@@ -4056,7 +4232,7 @@ impl LiteIdeApp {
 
         if !self.explorer_loaded {
             self.explorer_loaded = true;
-            let root = self.project_root();
+            let root = self.workspace_root();
             self.search.load_files(&root);
         }
 
@@ -4161,7 +4337,7 @@ impl LiteIdeApp {
                 }
                 self.explorer_rows = self.explorer_tree.rows(&self.explorer_expanded);
             } else {
-                let root = self.project_root();
+                let root = self.workspace_root();
                 let full = std::path::Path::new(&root).join(&path);
                 if let Ok(text) = std::fs::read_to_string(&full) {
                     self.open_file(full, text, !pin);
@@ -4209,7 +4385,9 @@ impl LiteIdeApp {
         let dap_color = dap_status_color(&self.dap_status);
         let indent = self.indent_hint.clone();
         let theme_name = self.settings.theme.clone();
-        let remote = self.lsp.remote_name();
+        // 连接项跟随「远程工作区」状态（不是 clangd 是否跑在 WSL 里）：
+        // 本地工作区时它只是个图标，点了才进连接菜单。
+        let remote = self.settings.remote_distro.clone();
         let p = palette(self.applied_theme);
         let fg = hex(p.fg_statusbar);
         let hover = hex(p.bg_statusbar_hover);
@@ -4227,7 +4405,11 @@ impl LiteIdeApp {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.horizontal_centered(|ui| {
                     // ---- 最左：远程连接项（VS Code 位置）----
-                    statusbar_remote(ui, &p, remote.as_deref());
+                    let remote_resp = statusbar_remote(ui, &p, remote.as_deref());
+                    self.remote_item_rect = Some(remote_resp.rect);
+                    if remote_resp.clicked() {
+                        self.remote_menu_open = !self.remote_menu_open;
+                    }
 
                     // ---- 左：分支 / LSP / DBG ----
                     if let Some(branch) = &self.git_status.branch {
@@ -4339,6 +4521,245 @@ impl LiteIdeApp {
                     );
                 });
             });
+    }
+
+    /// 连接项的下拉菜单：选项与 VS Code 的「Remote」菜单同构，只有 WSL 已实现。
+    fn draw_remote_menu(&mut self, ctx: &egui::Context) {
+        if !self.remote_menu_open {
+            return;
+        }
+        let Some(anchor) = self.remote_item_rect else {
+            self.remote_menu_open = false;
+            return;
+        };
+        let p = palette(self.applied_theme);
+        let connected = self.settings.remote_distro.clone();
+        let mut keep_open = true;
+        let mut want: Option<RemoteAction> = None;
+        egui::Area::new(egui::Id::new("remote_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(anchor.left(), anchor.top() - 4.0))
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(hex(p.bg_menu))
+                    .stroke(egui::Stroke::new(1.0_f32, hex(p.border_menu)))
+                    .inner_margin(egui::Margin::symmetric(4.0, 4.0))
+                    .show(ui, |ui| {
+                        menu_items_style(ui, p);
+                        ui.set_min_width(300.0);
+                        if let Some(d) = &connected {
+                            ui.label(
+                                RichText::new(format!("WSL: {d}"))
+                                    .size(11.0)
+                                    .color(hex("#8c8c8c")),
+                            );
+                            if ui.button("Close Remote Connection").clicked() {
+                                want = Some(RemoteAction::Disconnect);
+                                keep_open = false;
+                            }
+                            ui.separator();
+                        }
+                        for (label, tip, action) in remote_menu_entries() {
+                            let enabled = action.is_supported();
+                            let resp = ui.add_enabled(enabled, egui::Button::new(label));
+                            let resp = resp.on_hover_text(tip);
+                            if resp.clicked() {
+                                want = Some(action);
+                                keep_open = false;
+                            }
+                        }
+                        ui.separator();
+                        ui.label(
+                            RichText::new("目前只实现了 WSL；其余选项暂为占位")
+                                .size(10.5)
+                                .color(hex("#7a7a7a")),
+                        );
+                    });
+            });
+        // 点菜单外面关闭（egui 的 Area 不自动做这件事，这里用「菜单外点击」判定）。
+        if keep_open
+            && ctx.input(|i| i.pointer.any_click())
+            && ctx.input(|i| i.pointer.interact_pos())
+                .map(|pos| !self.remote_menu_rect_contains(&self.remote_item_rect, pos))
+                .unwrap_or(false)
+        {
+            keep_open = false;
+        }
+        if let Some(action) = want {
+            match action {
+                RemoteAction::ConnectWsl => self.open_remote_dialog(),
+                RemoteAction::Disconnect => self.disconnect_remote(),
+                // 占位项：菜单里是禁用的，这里只是兜底（不做事）。
+                RemoteAction::ConnectSsh
+                | RemoteAction::ConnectTunnel
+                | RemoteAction::CloneRepository
+                | RemoteAction::OpenOnRemote => {}
+            }
+        }
+        self.remote_menu_open = keep_open;
+    }
+
+    /// 菜单里的「点外面关闭」只需要排除连接项本身，但求稳再给菜单区域留一层。
+    fn remote_menu_rect_contains(&self, item: &Option<egui::Rect>, pos: egui::Pos2) -> bool {
+        if let Some(r) = item {
+            let expanded = egui::Rect::from_min_max(
+                egui::pos2(r.left(), r.top() - 400.0),
+                egui::pos2(r.left() + 320.0, r.bottom()),
+            );
+            return expanded.contains(pos);
+        }
+        false
+    }
+
+    /// 「连接到 WSL」对话框：发行版列表 + 目录输入 + 子目录浏览。
+    fn open_remote_dialog(&mut self) {
+        let distros = ide_lsp::process::list_wsl_distros_blocking();
+        if distros.is_empty() {
+            self.flash("未检测到 WSL 发行版（先运行 wsl --install）".to_string());
+            return;
+        }
+        let current = self.settings.remote_distro.clone();
+        let distro = current
+            .filter(|d| distros.iter().any(|x| x == d))
+            .unwrap_or_else(|| distros[0].clone());
+        self.remote_dialog_distros = distros;
+        self.remote_dialog_distro = distro;
+        self.remote_dialog_path = normalize_posix(
+            &self.settings.remote_path.clone().unwrap_or_else(|| "/home".to_string()),
+        );
+        self.refresh_remote_dialog_dirs();
+        self.remote_dialog_open = true;
+    }
+
+    /// 重新枚举对话框里当前目录的子目录（UNC 直读，无需子进程）。
+    fn refresh_remote_dialog_dirs(&mut self) {
+        let posix = normalize_posix(&self.remote_dialog_path);
+        let unc = wsl_dir_to_unc(&self.remote_dialog_distro, &posix);
+        let mut dirs: Vec<String> = std::fs::read_dir(&unc)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        dirs.sort_by_key(|d| d.to_lowercase());
+        self.remote_dialog_dirs = dirs;
+    }
+
+    fn draw_remote_dialog(&mut self, ctx: &egui::Context) {
+        if !self.remote_dialog_open {
+            return;
+        }
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        let mut browse: Option<String> = None;
+        let mut up = false;
+        let distros = self.remote_dialog_distros.clone();
+        let mut distro = self.remote_dialog_distro.clone();
+        let mut path = self.remote_dialog_path.clone();
+        let dirs = self.remote_dialog_dirs.clone();
+        egui::Window::new("Connect to WSL")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Distro:").size(13.0));
+                    egui::ComboBox::from_id_source("remote_distro_pick")
+                        .selected_text(distro.clone())
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for d in &distros {
+                                ui.selectable_value(&mut distro, d.clone(), d);
+                            }
+                        });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Folder:").size(13.0));
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut path)
+                            .hint_text("/home/work/NewLithoTune/candanza")
+                            .desired_width(370.0),
+                    );
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        go = true;
+                    }
+                    if ui.button("Browse").clicked() {
+                        browse = Some(String::new());
+                    }
+                    if ui.button("Up").clicked() {
+                        up = true;
+                    }
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        if dirs.is_empty() {
+                            ui.label(
+                                RichText::new("（无子目录 / 路径不可读）")
+                                    .size(12.0)
+                                    .color(hex("#8c8c8c")),
+                            );
+                        }
+                        for d in &dirs {
+                            if ui
+                                .add(egui::Button::new(format!("▸ {d}")).frame(false))
+                                .on_hover_text("进入该子目录")
+                                .clicked()
+                            {
+                                browse = Some(d.clone());
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Connect").clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        self.remote_dialog_distro = distro;
+        self.remote_dialog_path = path;
+        if up {
+            // 上一级：`/home/work` → `/home`，`/` 仍是 `/`。
+            let cur = normalize_posix(&self.remote_dialog_path);
+            self.remote_dialog_path = match cur.rsplit_once('/') {
+                Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+                _ => "/".to_string(),
+            };
+            self.refresh_remote_dialog_dirs();
+        } else if let Some(d) = browse {
+            // 浏览：点空串 = 重新读当前目录；点子目录 = 拼在规范化的当前目录后面。
+            let base = normalize_posix(&self.remote_dialog_path);
+            self.remote_dialog_path = if d.is_empty() {
+                base
+            } else if base == "/" {
+                format!("/{d}")
+            } else {
+                format!("{base}/{d}")
+            };
+            self.refresh_remote_dialog_dirs();
+        }
+        if go {
+            let distro = self.remote_dialog_distro.clone();
+            let path = normalize_posix(&self.remote_dialog_path);
+            self.connect_remote(&distro, &path);
+            self.remote_dialog_open = false;
+        } else if cancel {
+            self.remote_dialog_open = false;
+        } else {
+            self.remote_dialog_open = open;
+        }
     }
 
     fn draw_symbol_search(&mut self, ctx: &egui::Context) {
@@ -4510,9 +4931,20 @@ impl LiteIdeApp {
             + if icon.is_some() { ICON_W } else { 0.0 }
             + if icon.is_some() && text.is_some() { GAP } else { 0.0 }
             + text_w;
+        // 一律可点：状态栏项在 VS Code 里都是可交互的（我们至少用它做悬停高亮与连接菜单）。
         let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::hover());
-        let bg = if response.hovered() { hover } else { bg };
+            ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
+        let bg = if response.hovered() {
+            hover
+        } else if response.is_pointer_button_down_on() {
+            hex("#4b4c4d")
+        } else {
+            bg
+        };
+        if response.clicked() {
+            // 点下去不要同时把焦点送到编辑器。
+            ui.ctx().memory_mut(|m| m.request_focus(ui.id()));
+        }
         if bg != egui::Color32::TRANSPARENT {
             ui.painter().rect_filled(rect, 0.0, bg);
         }
@@ -4546,7 +4978,12 @@ impl LiteIdeApp {
     }
 
     /// 左下角「远程连接」项：未连接只显示 remote 图标；连上 WSL 后变蓝并显示 `WSL: <distro>`。
-    fn statusbar_remote(ui: &mut egui::Ui, p: &PaletteHex, remote: Option<&str>) {
+    /// 返回点中的区域（用于弹出连接菜单）。
+    fn statusbar_remote(
+        ui: &mut egui::Ui,
+        p: &PaletteHex,
+        remote: Option<&str>,
+    ) -> egui::Response {
         let connected = remote.is_some();
         let text = remote.map(|d| format!("WSL: {d}"));
         let (fg, bg, hover) = if connected {
@@ -4574,7 +5011,7 @@ impl LiteIdeApp {
             bg,
             hover,
             Some(&tip),
-        );
+        )
     }
 
 impl eframe::App for LiteIdeApp {
@@ -4664,6 +5101,8 @@ impl eframe::App for LiteIdeApp {
         let text_focus_before = ctx.wants_keyboard_input();
 
         self.draw_status_bar(ctx);
+        self.draw_remote_menu(ctx);
+        self.draw_remote_dialog(ctx);
         self.draw_title_bar(ctx);
         self.draw_activity_bar(ctx);
         self.draw_sidebar(ctx);
@@ -4681,6 +5120,7 @@ impl eframe::App for LiteIdeApp {
             || self.keys_open
             || self.find_open
             || self.save_as_open
+            || self.remote_dialog_open
             || self.confirm_close.is_some();
         // 非模态的文本框（侧栏搜索框 / Git 提交框 / 调试监视框）持有键盘焦点时：
         // 编辑器忽略字符输入与无修饰键的编辑操作，但保留 Ctrl+… 全局快捷键与 F 功能键，
@@ -5955,6 +6395,77 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 远程工作区：设置里的 distro/路径 → UNC 工作区根 → LSP 根 URI。
+    #[test]
+    fn remote_workspace_maps_to_unc_and_uri() {
+        let mut app = LiteIdeApp::new();
+        app.settings.remote_distro = Some("Ubuntu2404".to_string());
+        app.settings.remote_path = Some("/home/work/NewLithoTune/candanza".to_string());
+        assert!(app.is_remote());
+        assert_eq!(
+            app.workspace_root(),
+            r"\\wsl.localhost\Ubuntu2404\home\work\NewLithoTune\candanza"
+        );
+        assert_eq!(
+            app.workspace_uri(),
+            "file://wsl.localhost/Ubuntu2404/home/work/NewLithoTune/candanza"
+        );
+
+        // 断开后回到本地根。
+        app.settings.remote_distro = None;
+        app.settings.remote_path = None;
+        assert!(!app.is_remote());
+        assert_eq!(app.workspace_root(), app.project_root());
+    }
+
+    /// 连接菜单：选项与 VS Code 同构，但只有 WSL/断开是可点生效的。
+    #[test]
+    fn remote_menu_lists_vscode_options_but_only_wsl_is_live() {
+        let entries = remote_menu_entries();
+        let labels: Vec<&str> = entries.iter().map(|(l, _, _)| *l).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Connect to WSL…",
+                "Connect to Host… (SSH)",
+                "Connect to Tunnel…",
+                "Clone Repository in WSL…",
+                "Open Folder on Remote…",
+            ]
+        );
+        let live: Vec<RemoteAction> = entries
+            .iter()
+            .map(|(_, _, a)| *a)
+            .filter(|a| a.is_supported())
+            .collect();
+        assert_eq!(live, vec![RemoteAction::ConnectWsl]);
+        assert!(RemoteAction::Disconnect.is_supported());
+        assert!(!RemoteAction::ConnectSsh.is_supported());
+    }
+
+    /// 远程根切换会让 LSP 换根（clangd 重启到新根），而不是继续用旧根。
+    #[test]
+    fn remote_root_uri_differs_from_local_root_uri() {
+        let mut app = LiteIdeApp::new();
+        let local = app.project_root();
+        let local_uri = path_to_uri_any(&local).expect("本地根应能转 URI");
+        app.settings.remote_distro = Some("Ubuntu2404".to_string());
+        app.settings.remote_path = Some("/home/work/NewLithoTune/candanza".to_string());
+        let remote_uri = app.workspace_uri();
+        assert_ne!(local_uri, remote_uri);
+        assert!(remote_uri.starts_with("file://wsl.localhost/Ubuntu2404/"));
+    }
+
+    /// 对话框里的目录输入：补前导 `/`、去尾部 `/`，空串 → `/`。
+    #[test]
+    fn normalize_posix_paths() {
+        assert_eq!(normalize_posix(""), "/");
+        assert_eq!(normalize_posix("/"), "/");
+        assert_eq!(normalize_posix("/home/work/"), "/home/work");
+        assert_eq!(normalize_posix("home\\work"), "/home/work");
+        assert_eq!(normalize_posix("  /home/work/NewLithoTune/candanza "), "/home/work/NewLithoTune/candanza");
+    }
 
     #[test]
     fn hex_parses_channels() {

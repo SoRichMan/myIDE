@@ -58,6 +58,8 @@ pub enum Command {
     Hover { uri: String, pos: Position, seq: u64 },
     Symbols { uri: String, seq: u64 },
     Restart,
+    /// 换根（远程目录切换）：重启 clangd 并 `initialize` 到新根。
+    Reopen { root_uri: String },
     Shutdown,
 }
 
@@ -79,6 +81,8 @@ pub struct LspManager {
     status: Arc<Mutex<LspStatus>>,
     /// 当前连接的 WSL 发行版（无远程连接时为 None）。状态栏「连接」项读取。
     remote: Arc<Mutex<Option<String>>>,
+    /// 当前 clangd 会话的根目录 URI（切换远程根后要判断是否需要重启）。
+    root: Arc<Mutex<Option<String>>>,
     rt: Option<tokio::runtime::Runtime>,
     seq: u64,
 }
@@ -95,6 +99,7 @@ impl LspManager {
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Event>();
         let status = Arc::new(Mutex::new(LspStatus::Off));
         let remote = Arc::new(Mutex::new(None));
+        let root = Arc::new(Mutex::new(None));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("lsp-worker")
@@ -103,9 +108,10 @@ impl LspManager {
             .expect("tokio runtime 启动失败");
         let status_c = status.clone();
         let remote_c = remote.clone();
+        let root_c = root.clone();
         let ev_tx_c = ev_tx.clone();
         rt.spawn(async move {
-            session_loop(cmd_rx, ev_tx_c, status_c, remote_c).await;
+            session_loop(cmd_rx, ev_tx_c, status_c, remote_c, root_c).await;
         });
         let _ = ev_tx;
         Self {
@@ -113,6 +119,7 @@ impl LspManager {
             ev_rx,
             status,
             remote,
+            root,
             rt: Some(rt),
             seq: 0,
         }
@@ -126,6 +133,22 @@ impl LspManager {
     /// 已连接的 WSL 发行版名（未连接时为 None）。
     pub fn remote_name(&self) -> Option<String> {
         self.remote.lock().unwrap().clone()
+    }
+
+    /// 当前 clangd 会话的根 URI（尚未启动时为 None）。
+    pub fn root_uri(&self) -> Option<String> {
+        self.root.lock().unwrap().clone()
+    }
+
+    /// 在当前会话上换根（远程目录切换）：根变了就重启 clangd。
+    ///
+    /// clangd 的根只在 `initialize` 时确定，无法运行时更改，所以走一条 `Reopen`
+    /// 命令让会话任务自己重启并换根——不能发 `Shutdown`，那会结束整个会话任务。
+    pub fn reopen_root(&mut self, root_uri: String) {
+        if self.root_uri().as_deref() == Some(root_uri.as_str()) {
+            return;
+        }
+        let _ = self.cmd_tx.send(Command::Reopen { root_uri });
     }
 
     /// 拉取一个事件（每帧调用一次，非阻塞）。
@@ -208,6 +231,7 @@ struct SessionState {
     ui_tx: std::sync::mpsc::Sender<Event>,
     status: Arc<Mutex<LspStatus>>,
     remote: Arc<Mutex<Option<String>>>,
+    root: Arc<Mutex<Option<String>>>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     root_uri: Option<String>,
 }
@@ -227,33 +251,41 @@ async fn session_loop(
     ui_tx: std::sync::mpsc::Sender<Event>,
     status: Arc<Mutex<LspStatus>>,
     remote: Arc<Mutex<Option<String>>>,
+    root: Arc<Mutex<Option<String>>>,
 ) {
     let mut st = SessionState {
         ui_tx,
         status,
         remote,
+        root,
         cmd_rx,
         root_uri: None,
     };
     // 崩溃后保留 Crashed 状态显示；新会话才显示 Off。
     let mut just_crashed = false;
+    // 主动重启（Restart / Reopen）后直接用当前根重连，不再等新命令。
+    let mut restart_now = false;
 
     loop {
         if !just_crashed {
             set_status(&st, LspStatus::Off);
         }
-        // ---- 等待启动/重启命令 ----
-        loop {
-            match st.cmd_rx.recv().await {
-                Some(Command::Start { root_uri }) => {
-                    st.root_uri = Some(root_uri);
-                    break;
+        // ---- 等待启动/重启命令（主动重启除外）----
+        if !restart_now {
+            loop {
+                match st.cmd_rx.recv().await {
+                    Some(Command::Start { root_uri }) | Some(Command::Reopen { root_uri }) => {
+                        st.root_uri = Some(root_uri.clone());
+                        *st.root.lock().unwrap() = Some(root_uri);
+                        break;
+                    }
+                    Some(Command::Restart) => break,
+                    Some(Command::Shutdown) | None => return,
+                    _ => { /* 未就绪时忽略文档命令 */ }
                 }
-                Some(Command::Restart) => break,
-                Some(Command::Shutdown) | None => return,
-                _ => { /* 未就绪时忽略文档命令 */ }
             }
         }
+        restart_now = false;
         just_crashed = false;
 
         // ---- 探测环境（LITEIDE_LSP_CMD 覆盖时跳过，测试用） ----
@@ -344,8 +376,11 @@ async fn session_loop(
                 continue; // 保留 Crashed 状态，等用户 Restart
             }
             ReadyOutcome::Restart => {
+                // 重新用（可能已换过的）根重连；这里不能回到「等命令」的循环，
+                // 否则只发了一条 Reopen 的调用方会永远等到 LspStatus::Off。
                 just_crashed = false;
-                continue; // 立即重连
+                restart_now = true;
+                continue;
             }
             ReadyOutcome::Exit => return,
         }
@@ -364,6 +399,12 @@ async fn ready_loop(
                 match cmd {
                     Command::Restart => {
                         client.shutdown().await;
+                        return ReadyOutcome::Restart;
+                    }
+                    Command::Reopen { root_uri } => {
+                        client.shutdown().await;
+                        st.root_uri = Some(root_uri.clone());
+                        *st.root.lock().unwrap() = Some(root_uri);
                         return ReadyOutcome::Restart;
                     }
                     Command::Shutdown => {
@@ -408,7 +449,7 @@ async fn ready_loop(
 
 async fn handle_command(st: &mut SessionState, client: &mut LspClient, cmd: Command) {
     match cmd {
-        Command::Start { .. } => { /* 已在运行 */ }
+        Command::Start { .. } | Command::Reopen { .. } => { /* 在 ready_loop 处理 */ }
         Command::Restart | Command::Shutdown => { /* 在 ready_loop 处理 */ }
         Command::Open { uri, text, version } => {
             if let Err(e) = client.did_open(&uri, "cpp", &text, version).await {

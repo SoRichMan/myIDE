@@ -96,6 +96,50 @@ pub async fn list_wsl_distros() -> Vec<String> {
     }
 }
 
+/// 同步枚举 WSL 发行版（UI 线程里点「连接到 WSL」时用，带超时兜底）。
+///
+/// 与 [`list_wsl_distros`] 共用解析逻辑；UI 帧里不能 await 协作式运行时，
+/// 所以这里是独立的阻塞调用（`wsl.exe -l -q` 通常几毫秒，最坏 10s 放弃）。
+pub fn list_wsl_distros_blocking() -> Vec<String> {
+    use std::io::Read;
+    use std::process::{Command as StdCommand, Stdio as StdStdio};
+
+    let mut cmd = StdCommand::new(WSL_EXE);
+    cmd.args(["-l", "-q"])
+        .stdin(StdStdio::null())
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("wsl -l -q 启动失败: {e}");
+            return Vec::new();
+        }
+    };
+    // 输出很小（几行），读完再等退出；用通道兜一层超时，防止残留 wsl 进程拖死 UI。
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        if let Some(mut s) = child.stdout.take() {
+            let _ = s.read_to_end(&mut out);
+        }
+        let _ = child.wait();
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(DETECT_TIMEOUT) {
+        Ok(raw) => decode_wsl_list(&raw),
+        Err(_) => {
+            tracing::warn!("wsl -l -q 超时（可能有残留 wsl 进程占用互斥锁）");
+            Vec::new()
+        }
+    }
+}
+
 /// 选择一个 WSL 发行版：环境变量 `LITEIDE_WSL_DISTRO` > 优先名 > 含 "ubuntu" 的 > 第一个。
 pub async fn pick_wsl_distro() -> Option<String> {
     if let Ok(env) = std::env::var("LITEIDE_WSL_DISTRO") {

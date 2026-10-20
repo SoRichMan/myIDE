@@ -196,6 +196,11 @@ impl GitManager {
         let _ = self.cmd_tx.send(Command::Add { root: root.to_string(), path: path.to_string() });
     }
 
+    pub fn switch_root(&self, root: &str) {
+        self.refresh(root);
+        self.load_log(root);
+    }
+
     pub fn restore(&self, root: &str, path: &str) {
         let _ = self.cmd_tx.send(Command::Restore { root: root.to_string(), path: path.to_string() });
     }

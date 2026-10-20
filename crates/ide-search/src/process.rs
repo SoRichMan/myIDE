@@ -11,9 +11,20 @@ pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Windows 路径 → WSL 挂载路径：`E:\foo\bar` → `/mnt/e/foo/bar`。
-/// 非盘符路径原样返回（POSIX 路径原样透传，便于 mock/原生 Linux）。
+/// Windows 路径 → WSL 视角路径。
+///
+/// - 盘符：`E:\foo\bar` → `/mnt/e/foo/bar`
+/// - WSL UNC（远程工作区）：`\\wsl.localhost\Ubuntu2404\home\x` → `/home/x`
+/// - 非盘符路径原样返回（POSIX 路径透传，便于 mock/原生 Linux）。
 pub fn win_to_wsl_path(p: &str) -> String {
+    let slashed = p.replace('\\', "/");
+    for prefix in ["//wsl.localhost/", "//wsl$/"] {
+        if let Some(rest) = slashed.strip_prefix(prefix) {
+            if let Some((_distro, tail)) = rest.split_once('/') {
+                return format!("/{tail}");
+            }
+        }
+    }
     let bytes = p.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' && (bytes[0].is_ascii_alphabetic()) {
         let drive = (bytes[0] as char).to_ascii_lowercase();
@@ -21,7 +32,7 @@ pub fn win_to_wsl_path(p: &str) -> String {
         let rest = rest.trim_start_matches(['\\', '/']);
         format!("/mnt/{drive}/{}", rest.replace('\\', "/"))
     } else {
-        p.replace('\\', "/")
+        slashed
     }
 }
 
@@ -258,8 +269,19 @@ mod tests {
 
     #[test]
     fn path_non_drive_left_alone() {
-        // 相对路径或 UNC 不强制转换。
+        // 相对路径不强制转换。
         assert_eq!(win_to_wsl_path("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn win_to_wsl_maps_wsl_unc() {
+        // 远程工作区（WSL 发行版内的目录）在 Windows 侧是 UNC 路径：
+        // wsl.exe 里必须换成发行版内的 POSIX 路径。
+        assert_eq!(
+            win_to_wsl_path(r"\\wsl.localhost\Ubuntu2404\home\work\proj"),
+            "/home/work/proj"
+        );
+        assert_eq!(win_to_wsl_path(r"\\wsl$\Debian\srv\a"), "/srv/a");
     }
 
     #[test]
