@@ -59,6 +59,31 @@ pub fn uri_to_wsl(uri: &str) -> Option<String> {
     }
 }
 
+/// POSIX 路径 → `file://` URI（WSL 内部视角：`/home/x` → `file:///home/x`）。
+///
+/// 远程工作区里 clangd 也在 WSL 内部，根和文档都用这种形态，
+/// 不再把 Linux 文件伪装成 `file://wsl.localhost/...`。
+pub fn posix_to_uri(path: &str) -> Option<String> {
+    let p = path.trim().replace('\\', "/");
+    if !p.starts_with('/') {
+        return None;
+    }
+    Some(format!("file://{}", percent_encode(&p)))
+}
+
+/// `file://` URI → POSIX 路径（`file:///home/x` → `/home/x`）。
+///
+/// `/mnt/<drive>` 这类 WSL 挂载点也原样返回（那就是发行版里的真实路径）。
+pub fn uri_to_posix(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let decoded = percent_decode(rest);
+    if decoded.starts_with('/') {
+        Some(decoded)
+    } else {
+        None
+    }
+}
+
 /// `file://` URI → Windows 路径（含远程工作区的 UNC 路径）。
 ///
 /// 远程工作区里 clangd 返回的是 `file://wsl.localhost/<distro>/...`，
@@ -282,6 +307,24 @@ mod tests {
             uri_to_win("file://wsl.localhost/Ubuntu2404/home/my%20proj/a.b").as_deref(),
             Some(r"\\wsl.localhost\Ubuntu2404\home\my proj\a.b")
         );
+    }
+
+    #[test]
+    fn posix_uri_roundtrip() {
+        assert_eq!(
+            posix_to_uri("/home/work/NewLithoTune/candanza/src/a.cpp").as_deref(),
+            Some("file:///home/work/NewLithoTune/candanza/src/a.cpp")
+        );
+        assert_eq!(
+            posix_to_uri("/home/my proj/a.cpp").as_deref(),
+            Some("file:///home/my%20proj/a.cpp")
+        );
+        assert_eq!(
+            uri_to_posix("file:///home/my%20proj/a.cpp").as_deref(),
+            Some("/home/my proj/a.cpp")
+        );
+        assert_eq!(posix_to_uri("relative/x"), None);
+        assert_eq!(uri_to_posix("https://x/y"), None);
     }
 
     #[test]

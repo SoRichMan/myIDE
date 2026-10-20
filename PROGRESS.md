@@ -28,7 +28,7 @@ Rust 写的轻量 IDE，Windows + WSL2(Ubuntu2404) 下做 C++ 开发，对标 VS
 
 ```
 E:\TestDeepSeek\
-├── Cargo.toml              workspace, 9 members
+├── Cargo.toml              workspace, 10 members
 ├── Cargo.lock
 ├── rust-toolchain.toml
 ├── .cargo\config.toml      rsproxy 源
@@ -57,7 +57,8 @@ E:\TestDeepSeek\
 │   ├── ide-dap\             (阶段3 完成) mi/command/path/process/client/manager
 │   │   └── tests\mock_gdb.rs + gdb_real.rs
 │   ├── ide-search\          (阶段4 完成) process/ripgrep/fuzzy/manager，13 单测
-│   └── ide-git\             (阶段4 完成) process/porcelain/log/diff/manager，11 单测 + 2 集成
+│   ├── ide-git\             (阶段4 完成) process/porcelain/log/diff/manager，11 单测 + 2 集成
+│   └── ide-remote\          第十四轮：WSL 内部文件会话（WslFs）+ ConPTY 终端（WslTerminal）
 ├── scripts\
 │   ├── init_workspace.ps1
 │   ├── verify_stage0.ps1
@@ -77,7 +78,7 @@ E:\TestDeepSeek\
 └── target\release\liteide.exe  9.68 MB
 ```
 
-## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十一轮自绘标题栏：Logo + 菜单 + 窗口按钮合到最上一行，对齐 VS Code）
+## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十四轮 WSL 内部文件访问 + 编辑器下方集成终端）
 
 ### 已交付
 
@@ -144,7 +145,8 @@ $env:RUSTUP_OFFLINE=1          # 跑 cargo 前必须设，否则 rustup sync 超
 cargo build --release
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p ide-ui -- --nocapture      # 39 单测
+cargo test -p ide-ui -- --nocapture      # 121 单测
+cargo test -p ide-remote -- --ignored    # 2 个真实 WSL 测试（文件会话 + PTY）
 cargo test -p ide-git -- --nocapture     # 11 单测 + 2 集成（Windows git）
 .\target\release\liteide.exe             # 启动（Ctrl+P / Ctrl+Shift+F / Ctrl+Shift+G / Ctrl+, / Ctrl+Shift+P）
 ```
@@ -1004,6 +1006,176 @@ clangd 的根只在 `initialize` 时确定，所以新增 `Command::Reopen { roo
 - 「克隆仓库到 WSL」「在远程打开文件夹」也未实现（同样占位）；
 - 远程根下的分支/状态来自 WSL 里的 git（UNC 根已在 `win_to_wsl_path` 里映射成 POSIX）；
 - 没有远程的文件监视，外部改动仍需手动刷新。
+
+---
+
+## 第十四轮：WSL 内部文件访问 + 编辑器下方集成终端（2026-10-20）
+
+用户要求：**终端要跑在 WSL 里，而且像 VS Code 一样是编辑器下方的分屏面板**（不是独立窗口）；
+同时要有「新建终端」菜单与命令面板项，并保留上一轮的 WSL 远程连接 / 编辑 / 断开行为。
+
+### 一、远程文件从 UNC 改成 WSL 内部访问（新 crate `ide-remote`）
+
+上一轮连上 WSL 后靠 `\\wsl.localhost\<distro>\...`（Windows 侧 9P 挂载）读写。这一轮改成在
+发行版内部常驻一个 `bash -l`：
+
+- **协议**：行式 TSV（`id / op / arg1 / arg2`），参数和返回内容都走 base64；只认 id 对得上的
+  响应行，所以 `bash -l` 的 profile 输出不会混进结果；路径里的空格/引号/换行也不会破帧。
+- **操作**：`read` / `write` / `list` / `stat` / `mkdir` / `ping`；单次请求 15s 超时
+  （`REQUEST_TIMEOUT`），WSL 会话被 kill 时 UI 不会无限等。
+- 常驻会话省掉每次 `wsl.exe` 冷启动（实测单次约 120ms → 会话内往返约 1ms）。
+- `normalize_posix` / `is_posix_path` / `PathKind`：路径统一成 POSIX 形式（反斜杠、尾斜杠、
+  相对路径都收敛），并能区分「远程 POSIX 路径」和 Windows 盘符路径。
+- Windows 侧用 `CREATE_NO_WINDOW` 起 `wsl.exe`，不闪控制台窗。
+
+IDE 侧（`main.rs`）按路径分流：远程根下的读 / 写 / 建目录 / 列目录 / 探测类型走 `WslFs`
+（`read_text_file` / `write_text_file` / `create_dir_all_path` / `list_dir_path` / `is_dir_path`），
+本地仍走 `std::fs`。资源管理器、另存为、文件树展开、打开 / 保存全部走这一层。
+
+LSP 路径（`ide-lsp/src/path_map.rs`）新增 `posix_to_uri` / `uri_to_posix`：远程工作区的
+`root_uri` 和文档 URI 都是 WSL 内部视角的 `file:///home/...`，clangd 返回的 POSIX URI 也能
+映射回编辑器；上一轮的 `file://wsl.localhost/...` 形态保留兼容。
+
+### 二、集成终端（编辑器下方 Split 面板）
+
+- `ide-remote/src/terminal.rs`：用 `portable-pty` 0.9 起真 PTY（Windows 侧 ConPTY），命令是
+  `wsl.exe -d <distro> --cd <posix>`，落点就是当前远程工作区；提供
+  `spawn` / `spawn_with_args` / `drain` / `write` / `resize` / `kill`。`spawn_with_args` 留给测试
+  用干净 shell（`--exec bash --noprofile --norc -i`），不让用户 rc 脚本影响结果。
+- `ide-ui/src/terminal.rs`：`vt100` 0.18 维护屏幕状态，egui 手绘网格（不依赖外部终端控件）；
+  5000 行回滚、滚轮、选区与复制（Ctrl+Shift+C）、粘贴（含 bracketed paste）、面板尺寸变化时
+  `resize` 到 PTY。
+- **键盘编码**：回车 / 退格 / Tab / Shift+Tab、方向键（普通与应用模式）、
+  Home/End/PgUp/PgDn/Insert/Delete、F1-F12、Ctrl+字母（含 Ctrl+C / Ctrl+D）、Alt+键；
+  IDE 自己的 Ctrl+P/S/... 在终端里不会漏进 shell（`is_app_shortcut` + 单测守护）。
+- **终端应答**：`ESC[6n`（光标位置）、`ESC[5n`（状态）、`ESC[c` / `ESC[>c`（设备属性），
+  支持跨 chunk。WSL 的 bash 启动时会先问光标位置再出提示符，不应答会一直卡着。
+- **配色**：VSCode Dark+ / Light+ 终端 16 色 + xterm 256 色映射，切主题即时生效。
+- **UI**：`TopBottomPanel::bottom("terminal_panel")`，默认 240px、最小 96px，标题栏 30px；
+  多会话标签页、`+` 新建、清空、结束、隐藏按钮；空态按「远程 / 本地」分别提示；
+  `View` 菜单加 `Terminal Panel` 勾选；`Terminal` 菜单（New / Toggle / Clear / Kill / Open in WSL）；
+  命令面板新增 5 条命令；快捷键 ``Ctrl+` `` 开合、``Ctrl+Shift+` `` 新建。
+- **焦点**：点面板接管键盘，点面板外归还编辑器；终端聚焦时编辑器 `keys_enabled=false`，
+  IDE 快捷键由 `main.rs` 显式处理；点终端会先让出任何 `TextEdit` 焦点（避免输入落进搜索框）。
+- **生命周期**：断开 / 切换工作区时 `terminal.shutdown()` 结束所有 PTY，避免进程留在旧发行版
+  或旧目录。
+
+### 三、验收（真机 Ubuntu2404）
+
+| 指标 | 结果 |
+|---|---|
+| `cargo test --workspace` | ✅ **328 passed 0 failed**（10 个 `#[ignore]` = 基准 + 真实 clangd/gdb + 真实 WSL；终端相关 22 项 + 1 个真机 WSL 回归） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 warning |
+| `cargo build --release` | ✅ 10,711,552 B ≈ **10.21 MB**（含 `portable-pty` / `vt100`，仍 < 15 MB） |
+| 真机：远程工作区 `/tmp` | ✅ 面板内起 WSL PTY，输入 `echo LITEIDE_TERM_OK` 输出正常、提示符返回 |
+| 面板形态 | ✅ 编辑器下方 240px 分屏，标签 / 新建 / 清空 / 结束 / 隐藏可点，编辑器仍在其上方 |
+| 关闭 | ✅ 关终端 / 断开工作区后 PTY 进程结束 |
+| 文件读写 | ✅ 连接 `/tmp` 后资源管理器、打开、保存走 WSL 内部（保存后 WSL 侧读回一致） |
+
+顺带修掉一处测试串扰：新增 `LiteIdeApp::with_settings`，主程序的测试统一用默认设置装配
+（`test_app()`），不再受用户 `settings.json` 或并行 settings 测试临时改写的 `LITEIDE_CONFIG_DIR`
+影响（标题栏配色测试曾因此在并行运行时偶发失败）。
+
+### 四、追加修复（用户实测反馈，2026-10-20）
+
+**1) 顶部提示（flash）只占一行，超宽时中间省略**
+
+- 连接成功后的提示原来用普通 `ui.label`，路径一长就换行。现在先按真实字形宽度
+  （`layout_no_wrap`）测量，超过「窗口宽 − 80px」（上限 900px）时保留首尾、中间插 `…`，
+  再用 `Label::wrap_mode(TextWrapMode::Extend)` 强制不换行；
+- 新增 `middle_ellipsis`（纯函数，二分保留字符数）与两个守护测试：
+  截断后首尾都在、无换行；真实渲染一帧断言提示 galley 只有 1 行且不超出窗口。
+
+**2) 终端光标不在行末（长行累积漂移）**
+
+- 根因：网格步进用的是 `Fonts::glyph_width('M')` = **7.758px**，而 epaint 排版每写一个
+  字符都会把 `cursor_x` 四舍五入到物理像素，实际步进是 **8.0px**。每字符差 0.242px，
+  截图里 60 字符的提示符累计漂移 ~14.5px（约两个格）——光标就落进文字中间；
+- 改成 `cell_metrics()`：用 64 个 `M` 实际排版一次，取 `galley.width / 64` 作为格宽
+  （DPI/字体变化时自动跟着变），格高仍用 `row_height`；
+- 守护测试：`cell_width_matches_real_layout_steps`（1/5/60/120 字符的排版宽度都必须等于
+  `cw × n`，含截图里的提示符）+ `cursor_block_tracks_the_last_painted_glyph`
+  （真实绘制一帧，断言光标块左沿贴住最后一个字形的右边，误差 < 1px）；
+- 真机复验（debug exe + `PrintWindow`）：远程 WSL 终端里输入 76 字符长行，光标块紧贴
+  最后一个字符（文字右沿与光标左沿重合）。
+
+**3) 拖动窗口大小后终端变成竖排（每行 2 个字符，留在滚回区）**
+
+- 根因：拖动窗口边缘时 egui 每帧都会给出新的 `available_size`，中间会出现极窄的正文。
+  旧代码立刻把算出的 `cols`（本次是 2，旧下限也是 2）通过 `SIGWINCH` 发给 bash；
+  readline 按 2 列重绘提示符并写进滚回区，窗口恢复后这些行仍是竖排，看起来像终端坏了；
+- 修复：`stable_resize()` 做 120ms 防抖——尺寸连续变化时只记录 pending，稳定后才同时
+  `shell.resize` + `parser.set_size`；拖动中间帧完全不碰 PTY。网格下限改为 8 列 / 2 行，
+  窗口最小化（0×0）时直接跳过，避免把 8×2 发下去；
+- 第一次布局仍然立即生效（`first_layout`），避免终端刚建好就多收一次 SIGWINCH；
+- 测试：`resize_storm_only_applies_the_final_size`（2→10→118 列的抖动中只有最终尺寸 Apply）、
+  `first_layout_applies_immediately`、`same_size_clears_pending_resize`；
+- 真机复验：在提示符后输入 80+ 字符长行，用 `SetWindowPos` 以 15ms 间隔把窗口宽度在
+  1280→260→1280 之间抖动，终端未出现竖排垃圾，长行只在最终宽度正常折行。
+
+**4) 启动慢时给出解释，Ctrl+C 现在真的能中断**
+
+- 启动慢的根因不在终端：本机 `wsl.exe` 冷启动实测 ~100ms，但 `~/.bashrc` 最后一行
+  `~/candanza-tunnel.sh start` 是同步执行的，里面的 `ssh -f -N -o BatchMode=yes candanza`
+  在主机不可达时会卡很久；每个新终端都会先等它；
+- Shell 启动阶段（屏幕上还没有任何可见文字）超过 2 秒时，正文里会显示提示：
+  检查 `~/.bashrc` 里的同步命令，或按 Ctrl+C 中断。提示只在启动阶段出现一次，
+  之后执行 `clear` 不会重新弹出（`seen_text`）；
+- 顺带修掉一个真 bug：egui-winit 把 Ctrl+C 翻译成 `Event::Copy`，根本不会再产生
+  `Key::C`，原来的 `Key::C` 分支是死代码——所以以前在终端里按 Ctrl+C 发不出 SIGINT，
+  卡住的 `ssh` 也停不下来。新增 `terminal_input()` 处理 `Event::Copy`：
+  有选区就复制，没有选区就发 `0x03`；真机验证按 Ctrl+C 能立刻打断卡住的 ssh 回到提示符；
+- 测试：`copy_event_copies_selection_or_sends_sigint`、
+  `screen_has_text_ignores_control_sequences_and_blanks`、
+  `startup_hint_waits_for_two_seconds_and_stops_on_visible_text`。
+
+**5) 快速上下拖动面板时丢失中间输出（`301~348` 一段）— 根因彻底修掉**
+
+- 之前两轮「过滤 ConPTY 重绘 / 重放历史」都是止血，根因是**我们的屏幕模型和 ConPTY
+  的屏幕不是一回事**：
+  - ConPTY 在 PTY resize 后**不重排内容**，只把旧屏幕原样画在新屏幕顶部、光标停在原处；
+  - vt100 的 `set_size` 变高时反过来：把滚回区历史拉到顶部、内容推到底部、光标落到最后一行。
+  - 两边坐标系不一致 → ConPTY 之后发来的**绝对光标定位**（`ESC[13;28H`）落到我们屏幕中间，
+    中间那段内容被覆盖 → 用户看到「301 后面直接跳到 348」；
+  - 之前那版过滤器还有个硬伤：ConPTY 的重绘头**不固定**（实测是
+    `ESC[?25l ESC[8;40;100t ESC[H …`，中间还夹着制表位序列），只认 `ESC[?25l ESC[H`
+    就永远匹配不上 → 整段重绘被当成真实输出写进历史，越拖越乱。
+- 现在的做法（`crates/ide-ui/src/terminal.rs`）：
+  - **模型严格镜像 ConPTY**：ConPTY 画什么我们就画什么（不再重放历史、不再过滤重绘）；
+  - 变高用 `grow_screen()`：先 `set_size`，再把 vt100 拉到顶部的历史行 `ESC[nS` 推回滚回区、
+    光标 `ESC[nA` 移回原位 → 内容留在顶部、光标不动、下方补空行，与 ConPTY 完全一致；
+  - 变矮直接 `set_size`（vt100 与 ConPTY 行为一致：保留最后若干行、光标在底部）；
+  - **视图自己拼**：面板显示「输出流的最后 N 行」= 滚回区尾部 + 当前屏幕内容，
+    于是「拉高面板 = 看到更多历史」（和 VS Code / Windows Terminal 一致），且一行都不少；
+  - 滚轮上翻改用自己记的 `scroll_offset`（不再直接动 vt100 的偏移）。
+- 回归测试：
+  - `grow_keeps_conpty_layout`：变高后光标行不变、内容仍在顶部、下方补空行、滚回区不丢；
+  - `conpty_repaint_after_resize_keeps_content_and_coordinates`：喂真机抓到的重绘字节，
+    内容不丢、光标落在 ConPTY 给的行、之后 `ESC[13;1H` 写内容也写到同一行；
+  - `real_wsl_resize_keeps_content`（`#[ignore]`，需本机 WSL）：真 PTY 上跑 `seq 1 300`，
+    反复 `apply_size(40/13/30/13/50/13/25/13)`，屏幕上的数字必须连续 —— 修复前失败、修复后通过。
+- 真机复验：`seq 1 300` 后面板在 28 行 / 13 行之间快速来回拖 6 次，
+  屏幕始终是连续的 `276..300` + 提示符；`top`（全屏程序）正常；resize 后继续输入命令正常。
+
+### 五、已知边界 / 环境坑
+
+- **本机 `~/.bashrc` 末尾有 `~/candanza-tunnel.sh start > /dev/null 2>&1`**：脚本里是阻塞式
+  `ssh -f -N -o BatchMode=yes candanza`。默认登录 shell 会先执行它，所以这台机器新建终端会
+  停在启动阶段（现在 2 秒后会有提示，按 Ctrl+C 可打断并立即得到提示符；PTY 本身与
+  `--noprofile --norc` 干净 shell 测试均正常）。
+- **本机环境已修**（2026-10-20）：`~/.bashrc` 那一行改成后台执行
+  `( ~/candanza-tunnel.sh start > /dev/null 2>&1 & )`，`candanza-tunnel.sh` 里的 ssh 加
+  `-o ConnectTimeout=30`。原文件备份为 `~/.bashrc.bak-liteide-20261020-134714` 和
+  `~/candanza-tunnel.sh.bak-liteide-20261020-134714`。改后 `bash -ic` 从 >90s 降到 ~200ms，
+  真机终端提示符立即出现，隧道在后台继续尝试（最长 30s 连接超时），不再阻塞 shell。
+- 终端只在 **WSL 远程工作区**可用（按需求）；本地工作区给「先连接 WSL」的提示，不偷偷开
+  Windows shell。
+- 只有单层标签，没有 split pane、链接识别、终端内搜索、shell integration（cwd / 命令状态）。
+- 远程文件整文件 base64 过管道：常规源码没问题，超大文件会比本地慢；rg / git 仍按每次调用
+  起 `wsl.exe`。
+- 远程工作区仍无文件监视，外部改动要手动刷新。
+- 跑 `cargo test --workspace` 的 mock 集成测试需要 `python` 在 PATH；本机只有 `py` 启动器，
+  临时把 Store 的 Python 别名目录加进 PATH 即可（不影响项目代码）。
 
 ---
 

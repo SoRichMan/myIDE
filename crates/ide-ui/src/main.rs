@@ -6,6 +6,7 @@ mod commands;
 mod editor;
 mod settings;
 mod tabs;
+mod terminal;
 mod tree;
 
 use eframe::egui;
@@ -17,10 +18,12 @@ use ide_dap::manager::{BreakpointSpec, DapManager, DapStatus, Event as DapEvent,
 use ide_git::{Event as GitEvent, GitManager, GitStatus};
 use ide_lsp::manager::{Event as LspEvent, LspManager, LspStatus};
 use ide_lsp::message::{Position, SymbolInfo};
-use ide_lsp::path_map::{path_to_uri_any, uri_to_win, wsl_dir_to_unc};
+use ide_lsp::path_map::{path_to_uri_any, posix_to_uri, uri_to_posix, uri_to_win};
+use ide_remote::{is_posix_path, normalize_posix, PathKind, WslFs};
 use ide_search::{Event as SearchEvent, SearchManager, SearchMatch, SearchOptions};
 use settings::AppSettings;
 use tabs::{CloseResult, Tab, TabList};
+use terminal::{TerminalSet, TerminalStyle};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,6 +58,42 @@ fn hex(s: &str) -> egui::Color32 {
         return egui::Color32::from_rgba_unmultiplied(r, g, b, a);
     }
     egui::Color32::from_rgb(r, g, b)
+}
+
+/// 单行文本截断：超宽时保留首尾、中间用 `…`，按实际字形宽度测量。
+///
+/// 顶部 flash 提示必须只占一行：远程路径很长时不能换行，也不能整条被截掉尾巴
+/// （用户需要看到连接到了哪个发行版 / 哪个目录）。
+fn middle_ellipsis(text: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String {
+    if measure(text) <= max_width {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let build = |keep: usize| -> String {
+        let head = keep.div_ceil(2);
+        let tail = keep / 2;
+        let mut s: String = chars[..head].iter().collect();
+        s.push('…');
+        s.extend(chars[chars.len() - tail..].iter());
+        s
+    };
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    let mut best = String::from("…");
+    while lo <= hi {
+        let keep = (lo + hi) / 2;
+        if keep == 0 {
+            break;
+        }
+        let candidate = build(keep);
+        if measure(&candidate) <= max_width {
+            best = candidate;
+            lo = keep + 1;
+        } else {
+            hi = keep - 1;
+        }
+    }
+    best
 }
 
 /// 连接项菜单的动作（布局对齐 VS Code 的 Remote 菜单）。
@@ -105,22 +144,6 @@ fn remote_menu_entries() -> [(&'static str, &'static str, RemoteAction); 5] {
             RemoteAction::OpenOnRemote,
         ),
     ]
-}
-
-/// 规范化对话框里的 POSIX 目录：补前导 `/`、去掉多余尾部 `/`，空串视为 `/`。
-///
-/// 用户手输的可能是 `home/work`、`/home/work/` 或空串；统一成一一种形态，
-/// 否则「浏览子目录」拼出来的路径会变成 `/work` 这种相对根。
-fn normalize_posix(p: &str) -> String {
-    let t = p.trim().replace('\\', "/");
-    let t = t.trim_end_matches('/');
-    if t.is_empty() {
-        "/".to_string()
-    } else if t.starts_with('/') {
-        t.to_string()
-    } else {
-        format!("/{t}")
-    }
 }
 
 /// 启动时装配的内置扩展（顺序 = 注册顺序，先注册者优先认领后缀）。
@@ -430,11 +453,23 @@ struct LiteIdeApp {
     remote_dialog_dirs: Vec<String>,
     /// 「连接」项这一帧的屏幕矩形（菜单锚定用）。
     remote_item_rect: Option<egui::Rect>,
+    /// 远程文件会话（常驻 `wsl.exe --exec bash -l`，所有读写都在 WSL 内部）。
+    remote: WslFs,
+    /// 集成终端（WSL PTY，编辑器下方 Split 面板）。
+    terminal: TerminalSet,
 }
 
 impl LiteIdeApp {
     fn new() -> Self {
         let (settings, config_mtime) = AppSettings::load();
+        Self::with_settings(settings, config_mtime)
+    }
+
+    /// 用给定设置装配应用。
+    ///
+    /// `new()` 从磁盘读取；测试传默认值，避免断言颜色/布局时被用户配置或并行测试
+    /// 临时改写的 `LITEIDE_CONFIG_DIR` 影响。
+    fn with_settings(settings: AppSettings, config_mtime: Option<SystemTime>) -> Self {
         // 扩展机制：先激活内置扩展，再按注册表装配编辑器。
         // 激活只做注册（无 IO / 无重计算），耗时在微秒级——性能契约见 docs/extensions.md。
         let host = ExtensionHost::activate(builtin_extensions());
@@ -593,14 +628,19 @@ impl LiteIdeApp {
             remote_dialog_path: String::new(),
             remote_dialog_dirs: Vec::new(),
             remote_item_rect: None,
+            remote: WslFs::new(),
+            terminal: TerminalSet::new(),
         }
     }
 
-    /// 远程工作区的 Windows 侧根目录（WSL UNC）；未连接时为 `None`。
+    /// 远程工作区的根（WSL 发行版内的 POSIX 路径）；未连接时为 `None`。
+    ///
+    /// 这里刻意不用 `\\wsl.localhost\...`：连上 WSL 后，文件、rg、git、clangd、终端
+    /// 全部以发行版内部视角工作，路径就是 `/home/...`。
     fn remote_root(&self) -> Option<String> {
-        let distro = self.settings.remote_distro.as_deref()?;
+        self.settings.remote_distro.as_deref()?;
         let path = self.settings.remote_path.as_deref()?;
-        Some(wsl_dir_to_unc(distro, path))
+        Some(normalize_posix(path))
     }
 
     /// 当前工作区根（远程优先）。资源管理器 / rg / git / LSP 都以它为根。
@@ -608,25 +648,123 @@ impl LiteIdeApp {
         self.remote_root().unwrap_or_else(|| self.project_root())
     }
 
-    /// 当前工作区根的 `file://` URI（远程走 `file://wsl.localhost/...`）。
+    /// 当前工作区根的 `file://` URI。远程是 WSL 内部视角：`file:///home/...`。
     fn workspace_uri(&self) -> String {
-        let root = self.workspace_root();
-        path_to_uri_any(&root).unwrap_or_else(|| "file:///".to_string())
+        if self.is_remote() {
+            return posix_to_uri(&self.workspace_root())
+                .unwrap_or_else(|| "file:///".to_string());
+        }
+        path_to_uri_any(&self.workspace_root()).unwrap_or_else(|| "file:///".to_string())
     }
 
     fn is_remote(&self) -> bool {
         self.remote_root().is_some()
     }
 
+    /// 这个路径是不是远程工作区里的（POSIX 路径）文件。
+    fn is_remote_path(&self, path: &std::path::Path) -> bool {
+        self.is_remote() && is_posix_path(&path.to_string_lossy())
+    }
+
+    /// 界面里展示路径：远程一律用 POSIX 分隔符（`Path::join` 会拼出 `\`）。
+    fn display_path(&self, path: &std::path::Path) -> String {
+        let s = path.to_string_lossy();
+        if self.is_remote() && is_posix_path(&s) {
+            s.replace('\\', "/")
+        } else {
+            s.into_owned()
+        }
+    }
+
+    /// 工作区根的 URI 形态：远程走 `file:///...`，本地走 `file:///mnt/<drive>`。
+    fn uri_of_path(&self, path: &std::path::Path) -> Option<String> {
+        let s = path.to_string_lossy();
+        if self.is_remote() && is_posix_path(&s) {
+            posix_to_uri(&s)
+        } else {
+            path_to_uri_any(&s)
+        }
+    }
+
+    /// 读文本：远程走 WSL 内部（POSIX 路径），本地走 `std::fs`。
+    fn read_text_file(&mut self, path: &std::path::Path) -> Result<String, String> {
+        if self.is_remote_path(path) {
+            let distro = self.settings.remote_distro.clone().unwrap_or_default();
+            return self.remote.read_text(&distro, &path.to_string_lossy());
+        }
+        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    }
+
+    /// 写文本：远程写进 WSL 里的真实文件（不是 9P 视图），本地直接写盘。
+    fn write_text_file(&mut self, path: &std::path::Path, text: &str) -> Result<(), String> {
+        if self.is_remote_path(path) {
+            let distro = self.settings.remote_distro.clone().unwrap_or_default();
+            return self
+                .remote
+                .write_text(&distro, &path.to_string_lossy(), text);
+        }
+        std::fs::write(path, text).map_err(|e| e.to_string())
+    }
+
+    /// 建目录（远程 `mkdir -p`，本地 `create_dir_all`）。
+    fn create_dir_all_path(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        if self.is_remote_path(dir) {
+            let distro = self.settings.remote_distro.clone().unwrap_or_default();
+            return self.remote.create_dir_all(&distro, &dir.to_string_lossy());
+        }
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())
+    }
+
+    /// 路径类型（远程 `stat`，本地 `metadata`）。
+    fn path_kind(&mut self, path: &std::path::Path) -> PathKind {
+        if self.is_remote_path(path) {
+            let distro = self.settings.remote_distro.clone().unwrap_or_default();
+            return self
+                .remote
+                .path_kind(&distro, &path.to_string_lossy())
+                .unwrap_or(PathKind::Missing);
+        }
+        let p = path.to_path_buf();
+        match std::fs::metadata(&p) {
+            Ok(m) if m.is_dir() => PathKind::Dir,
+            Ok(m) if m.is_file() => PathKind::File,
+            Ok(_) => PathKind::Other,
+            Err(_) => PathKind::Missing,
+        }
+    }
+
+    fn path_is_dir(&mut self, path: &std::path::Path) -> bool {
+        self.path_kind(path) == PathKind::Dir
+    }
+
+    fn path_is_file(&mut self, path: &std::path::Path) -> bool {
+        self.path_kind(path) == PathKind::File
+    }
+
+    /// 列一层目录项 `(名字, 是否目录)`，已按「目录在前、名字不区分大小写」排序。
+    fn list_dir_entries(&mut self, dir: &std::path::Path) -> Vec<(String, bool)> {
+        if self.is_remote_path(dir) {
+            let distro = self.settings.remote_distro.clone().unwrap_or_default();
+            let Ok(entries) = self.remote.list_dir(&distro, &dir.to_string_lossy()) else {
+                return Vec::new();
+            };
+            let mut out: Vec<(String, bool)> = entries
+                .into_iter()
+                .map(|e| (e.name, e.is_dir))
+                .collect();
+            sort_dir_entries(&mut out);
+            return out;
+        }
+        load_dir_entries(dir)
+    }
+
     /// 切换到远程工作区（WSL 发行版 + 目录）。
     ///
-    /// 顺序很重要：先校验目录能被 Win32 打开（9P 挂载），再写入设置、重置资源管理器
-    /// 并让 LSP 以新根重起、Git 换根——避免切到打不开的路径后整个侧栏空白。
+    /// 顺序很重要：先在 WSL 里确认目录存在（否则整个侧栏会空白），再写入设置、
+    /// 重置资源管理器并让 LSP 以新根重起、Git 换根。
     fn connect_remote(&mut self, distro: &str, path: &str) {
         let posix = normalize_posix(path);
-        let unc = wsl_dir_to_unc(distro, &posix);
-        let unc_path = std::path::Path::new(&unc);
-        if !unc_path.is_dir() {
+        if !self.remote.is_dir(distro, &posix) {
             self.flash(format!(
                 "无法打开远程目录 {distro}:{posix}（WSL 未运行或路径不存在）"
             ));
@@ -637,7 +775,7 @@ impl LiteIdeApp {
         self.save_settings();
         self.apply_workspace_switch();
         self.flash(format!("已连接到 WSL: {distro} · {posix}"));
-        tracing::info!("remote workspace: {distro}:{posix} -> {unc}");
+        tracing::info!("remote workspace: {distro}:{posix}（WSL 内部 POSIX 根）");
     }
 
     /// 断开远程连接，回到本地工作区。
@@ -649,12 +787,19 @@ impl LiteIdeApp {
         self.settings.remote_distro = None;
         self.settings.remote_path = None;
         self.save_settings();
+        // 断开后不再需要 WSL 文件会话（下次连接会重新拉起）。
+        self.remote.shutdown();
         self.apply_workspace_switch();
         self.flash("已断开远程连接，回到本地工作区".to_string());
     }
 
     /// 工作区根变化后的统一善后：资源管理器重扫、Git 换根、LSP 以新根重启。
     fn apply_workspace_switch(&mut self) {
+        // 终端进程绑定在旧发行版/旧目录上，换工作区必须一并结束。
+        if !self.terminal.is_empty() {
+            self.terminal.shutdown();
+            self.flash("工作区已切换，旧终端会话已结束".to_string());
+        }
         self.explorer_loaded = false;
         self.explorer_files.clear();
         self.explorer_tree = tree::FileTree::default();
@@ -729,7 +874,7 @@ impl LiteIdeApp {
             if self.is_remote() && !path.starts_with(self.workspace_root().as_str()) {
                 return None;
             }
-            path_to_uri_any(&path)
+            self.uri_of_path(p)
         });
         self.doc_version = 1;
         self.last_sync_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
@@ -898,14 +1043,14 @@ impl LiteIdeApp {
             self.flash("未命名文件无法从磁盘重载".to_string());
             return;
         };
-        match std::fs::read_to_string(&path) {
+        match self.read_text_file(&path) {
             Ok(text) => {
                 if let Some(ed) = &mut self.editor {
                     ed.load_text(&text);
                 }
                 self.tabs.replace_active_text(text);
                 self.editor_clean_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
-                self.flash(format!("已从磁盘重载 {}", path.display()));
+                self.flash(format!("已从磁盘重载 {}", self.display_path(&path)));
             }
             Err(e) => self.flash(format!("重载失败: {e}")),
         }
@@ -916,13 +1061,14 @@ impl LiteIdeApp {
             self.flash("未命名文件请用「另存为」(Ctrl+Shift+S)".to_string());
             return;
         };
-        let Some(ed) = &self.editor else { return };
-        if let Err(e) = std::fs::write(&path, ed.text()) {
+        let Some((text, seq)) = self.editor.as_ref().map(|e| (e.text(), e.edit_seq())) else {
+            return;
+        };
+        if let Err(e) = self.write_text_file(&path, &text) {
             self.flash(format!("保存失败: {e}"));
             return;
         }
-        let seq = ed.edit_seq();
-        self.flash(format!("已保存 {}", path.display()));
+        self.flash(format!("已保存 {}", self.display_path(&path)));
         self.tabs.set_active_dirty(false);
         self.editor_clean_seq = seq;
         if self.lsp_status.is_ready() {
@@ -945,8 +1091,8 @@ impl LiteIdeApp {
             };
             match path {
                 Some(p) => {
-                    if let Err(e) = std::fs::write(&p, &text) {
-                        self.flash(format!("保存 {} 失败: {e}", p.display()));
+                    if let Err(e) = self.write_text_file(&p, &text) {
+                        self.flash(format!("保存 {} 失败: {e}", self.display_path(&p)));
                         return;
                     }
                     if let Some(t) = self.tabs.get_mut(i) {
@@ -1019,7 +1165,7 @@ impl LiteIdeApp {
             }
             return;
         }
-        match std::fs::read_to_string(&target) {
+        match self.read_text_file(&target) {
             Ok(text) => {
                 self.open_file(target, text, true);
                 if let Some(ed) = &mut self.editor {
@@ -1037,13 +1183,17 @@ impl LiteIdeApp {
             return;
         }
         self.lsp_started = true;
-        // 远程工作区优先：clangd 在 WSL 里直接看 `/home/...`，URI 走 wsl.localhost 形态。
+        // 远程工作区优先：clangd 自己就在 WSL 里，根也用发行版内部路径 `/home/...`。
         let root = if self.is_remote() {
             self.workspace_root()
         } else {
             self.pick_root()
         };
-        self.root_uri = path_to_uri_any(&root).unwrap_or_else(|| "file:///".to_string());
+        self.root_uri = if self.is_remote() {
+            posix_to_uri(&root).unwrap_or_else(|| "file:///".to_string())
+        } else {
+            path_to_uri_any(&root).unwrap_or_else(|| "file:///".to_string())
+        };
         tracing::info!("LSP root: {root} -> {}", self.root_uri);
         self.lsp.start(self.root_uri.clone());
     }
@@ -1109,7 +1259,13 @@ impl LiteIdeApp {
         match result {
             Ok(locs) if !locs.is_empty() => {
                 let loc = &locs[0];
-                match uri_to_win(&loc.uri) {
+                // 远程工作区：clangd 回的是 `file:///home/...`（WSL 内部路径）。
+                let target = if self.is_remote() {
+                    uri_to_posix(&loc.uri).or_else(|| uri_to_win(&loc.uri))
+                } else {
+                    uri_to_win(&loc.uri)
+                };
+                match target {
                     Some(win) => {
                         let line = loc.range.start.line as usize;
                         let col = loc.range.start.character as usize;
@@ -1748,11 +1904,25 @@ impl LiteIdeApp {
         self.flash = Some((msg, Instant::now()));
     }
 
+    /// 是否有模态窗口占着键盘（命令面板 / 文件浏览器 / 设置…）。
+    fn modal_open(&self) -> bool {
+        self.palette_open
+            || self.file_picker_open
+            || self.settings_open
+            || self.goto_line_open
+            || self.about_open
+            || self.keys_open
+            || self.find_open
+            || self.save_as_open
+            || self.remote_dialog_open
+            || self.confirm_close.is_some()
+    }
+
     // ---- 阶段 4 UI ----
 
     /// 切换文件浏览器的当前目录：重新读取目录项并清空过滤词。
     fn set_file_picker_dir(&mut self, dir: PathBuf) {
-        self.file_picker_entries = load_dir_entries(&dir);
+        self.file_picker_entries = self.list_dir_entries(&dir);
         self.file_picker_query.clear();
         self.file_picker_dir = dir;
     }
@@ -1769,9 +1939,12 @@ impl LiteIdeApp {
             } else {
                 self.active_tab_path()
                     .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            }
-            .filter(|d| d.is_dir())
-            .unwrap_or_else(|| PathBuf::from(self.workspace_root()));
+            };
+            // 远程目录是否存在要问 WSL（POSIX 路径在 Windows 上 `is_dir()` 永远 false）。
+            let start = match start {
+                Some(d) if self.path_is_dir(&d) => d,
+                _ => PathBuf::from(self.workspace_root()),
+            };
             self.set_file_picker_dir(start);
         }
     }
@@ -1790,6 +1963,8 @@ impl LiteIdeApp {
         let mut query = self.file_picker_query.clone();
         let mut go_dir: Option<PathBuf> = None;
         let mut open_path: Option<PathBuf> = None;
+        // 输入框回车想跳的路径：存在性判断要出闭包才能问 WSL。
+        let mut go_dir_guess: Option<PathBuf> = None;
         let mut esc = false;
         let mut want_focus = self.file_picker_focus;
         let dir = self.file_picker_dir.clone();
@@ -1820,12 +1995,8 @@ impl LiteIdeApp {
                     let entered =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if entered && !query.trim().is_empty() {
-                        let p = resolve_picker_path(&dir, &query);
-                        if p.is_dir() {
-                            go_dir = Some(p);
-                        } else if p.is_file() {
-                            open_path = Some(p);
-                        }
+                        // 存在性判断放到渲染闭包外（远程要问 WSL，闭包里拿不到 &mut self）。
+                        go_dir_guess = Some(resolve_picker_path(&dir, &query));
                     }
                     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         esc = true;
@@ -1846,7 +2017,7 @@ impl LiteIdeApp {
                 // ---- 当前目录（可选中复制） ----
                 ui.add(
                     egui::Label::new(
-                        RichText::new(dir.to_string_lossy())
+                        RichText::new(self.display_path(&dir))
                             .monospace()
                             .size(11.0)
                             .color(hex("#9cdcfe")),
@@ -1888,17 +2059,24 @@ impl LiteIdeApp {
         self.file_picker_open = open && !esc;
         self.file_picker_focus = want_focus;
         self.file_picker_query = query;
+        if let Some(p) = go_dir_guess {
+            if self.path_is_dir(&p) {
+                go_dir = Some(p);
+            } else if self.path_is_file(&p) {
+                open_path = Some(p);
+            }
+        }
         if let Some(d) = go_dir {
             self.set_file_picker_dir(d);
             // 换目录后把焦点还给输入框：接着打字就是在新目录里过滤（VS Code 同款手感）。
             self.file_picker_focus = true;
         } else if let Some(p) = open_path {
-            match std::fs::read_to_string(&p) {
+            match self.read_text_file(&p) {
                 Ok(text) => {
                     self.open_file(p, text, true);
                     self.file_picker_open = false;
                 }
-                Err(e) => self.flash(format!("无法打开 {}: {e}", p.display())),
+                Err(e) => self.flash(format!("无法打开 {}: {e}", self.display_path(&p))),
             }
         }
     }
@@ -3038,8 +3216,10 @@ impl LiteIdeApp {
             .map(|t| t.title.clone())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| "untitled.cpp".to_string());
+        // 远程工作区用 POSIX 分隔符，否则拼出来的是 Windows 路径。
         let root = self.workspace_root();
-        self.save_as_input = format!("{root}\\{name}");
+        let sep = if self.is_remote() { '/' } else { '\\' };
+        self.save_as_input = format!("{root}{sep}{name}");
         self.save_as_open = true;
     }
 
@@ -3050,17 +3230,18 @@ impl LiteIdeApp {
             return;
         }
         let path = PathBuf::from(trimmed);
-        let Some(ed) = &self.editor else { return };
-        let text = ed.text();
+        let Some(text) = self.editor.as_ref().map(|e| e.text().to_string()) else {
+            return;
+        };
         if let Some(dir) = path.parent() {
-            if !dir.as_os_str().is_empty() && !dir.is_dir() {
-                if let Err(e) = std::fs::create_dir_all(dir) {
+            if !dir.as_os_str().is_empty() && !self.path_is_dir(dir) {
+                if let Err(e) = self.create_dir_all_path(dir) {
                     self.flash(format!("创建目录失败: {e}"));
                     return;
                 }
             }
         }
-        if let Err(e) = std::fs::write(&path, &text) {
+        if let Err(e) = self.write_text_file(&path, &text) {
             self.flash(format!("另存为失败: {e}"));
             return;
         }
@@ -3081,10 +3262,10 @@ impl LiteIdeApp {
             t.text = text;
         }
         self.current_file = Some(path.clone());
-        self.current_uri = path_to_uri_any(&path.to_string_lossy());
+        self.current_uri = self.uri_of_path(&path);
         self.editor_clean_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
         self.save_as_open = false;
-        self.flash(format!("已保存 {}", path.display()));
+        self.flash(format!("已保存 {}", self.display_path(&path)));
         // 让 clangd 重新 open 新路径。
         self.lsp_ready_synced = false;
         self.last_sync_seq = 0;
@@ -3289,7 +3470,392 @@ impl LiteIdeApp {
             "help.about" => {
                 self.about_open = true;
             }
+            "terminal.new" => self.new_integrated_terminal(),
+            "terminal.toggle" => self.toggle_terminal(),
+            "terminal.clear" => {
+                self.terminal.clear_active();
+                self.terminal.open = true;
+            }
+            "terminal.kill" => self.kill_active_terminal(),
+            "terminal.openWsl" => self.open_wsl_terminal(),
             _ => {}
+        }
+    }
+
+    // ================= 集成终端（编辑器下方 Split 面板） =================
+
+    /// 新建一个 WSL 终端会话（面板内，不走独立窗口）。
+    ///
+    /// 只有连接了 WSL 才能用：终端的进程、工作目录、环境都必须在发行版内部，
+    /// 本地工作区下给明确提示，而不是悄悄开个 Windows shell。
+    fn new_integrated_terminal(&mut self) {
+        let Some(distro) = self.settings.remote_distro.clone() else {
+            self.terminal.open = true;
+            self.terminal.last_error = Some("先连接 WSL 再新建终端".to_string());
+            self.flash("集成终端只在 WSL 远程工作区可用：请先连接 WSL".to_string());
+            return;
+        };
+        let cwd = self.workspace_root();
+        match self.terminal.spawn(&distro, &cwd, 120, 32) {
+            Ok(()) => {
+                self.terminal.open = true;
+                self.flash(format!("终端已启动：{distro} · {cwd}"));
+            }
+            Err(e) => {
+                self.terminal.open = true;
+                self.terminal.last_error = Some(e.clone());
+                self.flash(format!("新建终端失败: {e}"));
+            }
+        }
+    }
+
+    /// Ctrl+` / 「终端」菜单：显示或隐藏面板。
+    fn toggle_terminal(&mut self) {
+        if self.terminal.open {
+            self.terminal.open = false;
+            self.terminal.clear_focus();
+            self.terminal.panel_rect = None;
+        } else {
+            self.terminal.open = true;
+            if self.terminal.is_empty() {
+                self.new_integrated_terminal();
+            } else {
+                self.terminal.focus_next = true;
+            }
+        }
+    }
+
+    /// 结束当前终端（会话与进程一起关掉，面板保留空态）。
+    fn kill_active_terminal(&mut self) {
+        if self.terminal.active().is_none() {
+            self.flash("没有可结束的终端".to_string());
+            return;
+        }
+        self.terminal.close_active();
+        self.flash("已结束活动终端".to_string());
+    }
+
+    fn poll_terminal(&mut self, ctx: &egui::Context) {
+        if self.terminal.poll() {
+            ctx.request_repaint();
+        }
+        // 面板隐藏时也要定期醒来排空输出，避免 PTY 管道被写满后卡住 shell。
+        if self.terminal.any_alive() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    /// 终端相关的快捷键：Ctrl+` 全局有效；终端持有焦点时再接管 IDE 快捷键。
+    ///
+    /// 为什么不能只靠编辑器：终端聚焦时编辑器键盘是关掉的，若不在这里处理，
+    /// Ctrl+P / Ctrl+S 等会被 `terminal::event_to_bytes` 过滤掉后彻底没反应。
+    fn handle_terminal_shortcuts(&mut self, ctx: &egui::Context, modal_open: bool) {
+        if modal_open {
+            return;
+        }
+        let events = ctx.input(|i| i.events.clone());
+        let terminal_focus = self.terminal.focused;
+        let mut toggle = false;
+        let mut new_term = false;
+        for ev in &events {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = ev
+            else {
+                continue;
+            };
+            if !modifiers.command {
+                continue;
+            }
+            if *key == egui::Key::Backtick {
+                if modifiers.shift {
+                    new_term = true;
+                } else {
+                    toggle = true;
+                }
+                continue;
+            }
+            if !terminal_focus {
+                continue;
+            }
+            match (*key, modifiers.shift) {
+                (egui::Key::P, true) => self.open_command_palette(),
+                (egui::Key::P, false) => self.run_command("file.openFile", ctx),
+                (egui::Key::F, false) => self.run_command("edit.find", ctx),
+                (egui::Key::F, true) => self.run_command("search.content", ctx),
+                (egui::Key::H, _) => self.run_command("edit.replace", ctx),
+                (egui::Key::S, false) => self.run_command("file.save", ctx),
+                (egui::Key::S, true) => self.run_command("file.saveAs", ctx),
+                (egui::Key::N, _) => self.run_command("file.newFile", ctx),
+                (egui::Key::W, false) => self.run_command("file.close", ctx),
+                (egui::Key::W, true) => self.run_command("debug.addWatch", ctx),
+                (egui::Key::B, _) => self.run_command("view.toggleSidebar", ctx),
+                (egui::Key::G, false) => self.run_command("go.line", ctx),
+                (egui::Key::G, true) => self.run_command("git.openPanel", ctx),
+                (egui::Key::T, _) => self.run_command("go.symbol", ctx),
+                (egui::Key::Comma, _) => self.run_command("settings.open", ctx),
+                (egui::Key::Equals, _) => self.run_command("view.zoomIn", ctx),
+                (egui::Key::Minus, _) => self.run_command("view.zoomOut", ctx),
+                (egui::Key::Num0, _) => self.run_command("view.resetFontSize", ctx),
+                _ => {}
+            }
+        }
+        if new_term {
+            self.new_integrated_terminal();
+        } else if toggle {
+            self.toggle_terminal();
+        }
+    }
+
+    fn open_command_palette(&mut self) {
+        self.palette_open = !self.palette_open;
+        if self.palette_open {
+            self.palette_query.clear();
+            self.palette_sel = 0;
+            self.palette_focus_req = true;
+            self.palette_frames = 0;
+            self.palette_open_at = Some(Instant::now());
+        }
+    }
+
+    /// 编辑器下方的集成终端面板（VS Code 式 Split）。
+    fn draw_terminal_panel(&mut self, ctx: &egui::Context) {
+        if !self.terminal.open {
+            self.terminal.panel_rect = None;
+            return;
+        }
+        let p = palette(self.applied_theme);
+        let style = TerminalStyle::for_theme(self.applied_theme);
+        let header_bg = hex(p.bg_sidebar);
+        let border = hex(p.border_menu);
+        let fg = hex(p.fg_editor);
+        let dim = fg.gamma_multiply(0.72);
+        let hover_bg = hex(p.bg_menu_selection);
+        let hover_fg = if matches!(self.applied_theme, ThemeKind::LightPlus) {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::WHITE
+        };
+        let accent = hex(p.tab_active_border);
+        let colors = TermHeaderColors {
+            fg,
+            dim,
+            hover_bg,
+            active_bg: style.bg,
+            accent,
+        };
+
+        let mut new_clicked = false;
+        let mut clear_clicked = false;
+        let mut hide_clicked = false;
+        let mut kill_clicked = false;
+        let mut select: Option<usize> = None;
+        let mut close_tab: Option<usize> = None;
+
+        let panel = egui::TopBottomPanel::bottom("terminal_panel")
+            .resizable(true)
+            .default_height(terminal::DEFAULT_PANEL_HEIGHT)
+            .min_height(terminal::MIN_PANEL_HEIGHT)
+            .frame(egui::Frame::none().fill(style.bg))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+                let (header_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), terminal::HEADER_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(header_rect, 0.0, header_bg);
+                painter.hline(
+                    header_rect.x_range(),
+                    header_rect.bottom() - 0.5,
+                    egui::Stroke::new(1.0_f32, border),
+                );
+
+                let mut header = ui.child_ui(
+                    header_rect,
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    None,
+                );
+                header.spacing_mut().item_spacing.x = 2.0;
+                header.add_space(6.0);
+
+                let sessions: Vec<(usize, usize, String, bool, bool)> = self
+                    .terminal
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i, s.id, s.title.clone(), s.exited, s.focused))
+                    .collect();
+                for (idx, id, title, exited, _) in sessions {
+                    let (resp, close) = terminal_tab(
+                        &mut header,
+                        id,
+                        &title,
+                        idx == self.terminal.active,
+                        exited,
+                        colors,
+                    );
+                    if close {
+                        close_tab = Some(idx);
+                    } else if resp.clicked() {
+                        select = Some(idx);
+                    } else if resp.clicked_by(egui::PointerButton::Middle) {
+                        close_tab = Some(idx);
+                    }
+                }
+
+                header.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(6.0);
+                        if terminal_icon_button(
+                            ui,
+                            Codicon::ChromeClose,
+                            "隐藏终端面板 (Ctrl+`)",
+                            dim,
+                            hover_bg,
+                            hover_fg,
+                        )
+                        .clicked()
+                        {
+                            hide_clicked = true;
+                        }
+                        if terminal_icon_button(
+                            ui,
+                            Codicon::ClearAll,
+                            "清空终端",
+                            dim,
+                            hover_bg,
+                            hover_fg,
+                        )
+                        .clicked()
+                        {
+                            clear_clicked = true;
+                        }
+                        if terminal_icon_button(
+                            ui,
+                            Codicon::Trash,
+                            "结束活动终端",
+                            dim,
+                            hover_bg,
+                            hover_fg,
+                        )
+                        .clicked()
+                        {
+                            kill_clicked = true;
+                        }
+                        if terminal_icon_button(
+                            ui,
+                            Codicon::Add,
+                            "新建终端 (Ctrl+Shift+`)",
+                            dim,
+                            hover_bg,
+                            hover_fg,
+                        )
+                        .clicked()
+                        {
+                            new_clicked = true;
+                        }
+                    },
+                );
+
+                // 记住正文区域并让面板始终占满它：egui 的 TopBottomPanel 用「内容高度」
+                // 记住面板高度，若正文只画了网格/一行提示，面板会一帧帧缩到 min_height。
+                let body_rect = ui.available_rect_before_wrap();
+
+                if self.terminal.sessions.is_empty() {
+                    let rect = body_rect;
+                    let mut empty = ui.child_ui(
+                        rect,
+                        egui::Layout::top_down(egui::Align::Center),
+                        None,
+                    );
+                    empty.add_space(28.0);
+                    empty.label(
+                        egui::RichText::new("集成终端")
+                            .size(14.0)
+                            .color(fg),
+                    );
+                    empty.add_space(6.0);
+                    let hint = if self.is_remote() {
+                        "面板已就绪，点右上角 + 新建一个 WSL 终端"
+                    } else {
+                        "先连接 WSL（左下角远程连接），再新建终端"
+                    };
+                    empty.label(egui::RichText::new(hint).size(12.0).color(dim));
+                    if let Some(err) = self.terminal.last_error.as_deref() {
+                        empty.add_space(8.0);
+                        empty.label(
+                            egui::RichText::new(err)
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(0xf4, 0x87, 0x71)),
+                        );
+                    }
+                    if self.is_remote() {
+                        empty.add_space(12.0);
+                        if empty.button("新建终端").clicked() {
+                            new_clicked = true;
+                        }
+                    }
+                } else {
+                    let request_focus = self.terminal.ack_focus();
+                    let active = self.terminal.active;
+                    let mut focused = false;
+                    if let Some(session) = self.terminal.sessions.get_mut(active) {
+                        focused = terminal::draw_body(ui, session, &style, request_focus);
+                    }
+                    if focused {
+                        for (i, other) in self.terminal.sessions.iter_mut().enumerate() {
+                            if i != active {
+                                other.focused = false;
+                            }
+                        }
+                    }
+                    self.terminal.focused = focused;
+                }
+                ui.expand_to_include_rect(body_rect);
+            });
+
+        self.terminal.panel_rect = Some(panel.response.rect);
+        if let Some(idx) = close_tab {
+            self.terminal.close(idx);
+        } else if let Some(idx) = select {
+            self.terminal.active = idx;
+            self.terminal.focus_next = true;
+        }
+        if clear_clicked {
+            self.terminal.clear_active();
+        }
+        if kill_clicked {
+            self.kill_active_terminal();
+        }
+        if new_clicked {
+            self.new_integrated_terminal();
+        }
+        if hide_clicked {
+            self.terminal.open = false;
+            self.terminal.clear_focus();
+            self.terminal.panel_rect = None;
+        }
+    }
+
+    /// 在当前工作区开一个 WSL 内部终端（而不是 Windows 侧 cmd）。
+    ///
+    /// 落点是工作区根，环境变量来自发行版里的登录 shell；本地工作区下会明确提示
+    /// 先连接 WSL，避免默默开个 Windows 终端。
+    fn open_wsl_terminal(&mut self) {
+        let Some(distro) = self.settings.remote_distro.clone() else {
+            self.flash("当前是本地工作区：先连接 WSL 再开终端".to_string());
+            return;
+        };
+        let cwd = self.workspace_root();
+        match ide_remote::open_terminal(&distro, &cwd) {
+            Ok(()) => self.flash(format!("已在 WSL 中打开终端：{distro} · {cwd}")),
+            Err(e) => self.flash(format!("打开终端失败: {e}")),
         }
     }
 
@@ -3942,6 +4508,18 @@ impl LiteIdeApp {
                             if ui.checkbox(&mut dbg, "Debug Panel").changed() {
                                 self.debug_open = dbg;
                             }
+                            let mut term = self.terminal.open;
+                            if ui.checkbox(&mut term, "Terminal Panel").changed() {
+                                if term {
+                                    self.terminal.open = true;
+                                    if self.terminal.is_empty() {
+                                        self.new_integrated_terminal();
+                                    }
+                                } else {
+                                    self.terminal.open = false;
+                                    self.terminal.clear_focus();
+                                }
+                            }
                             ui.separator();
                             if ui.button("Command Palette…").clicked() {
                                 self.palette_open = true;
@@ -3965,6 +4543,31 @@ impl LiteIdeApp {
                             }
                             if ui.button("Stop Debugging").clicked() {
                                 self.on_debug_stop();
+                                ui.close_menu();
+                            }
+                        });
+                        ui.menu_button("Terminal", |ui| {
+                            menu_items_style(ui, p);
+                            if ui.button("New Terminal        Ctrl+Shift+`").clicked() {
+                                self.new_integrated_terminal();
+                                ui.close_menu();
+                            }
+                            if ui.button("Toggle Terminal        Ctrl+`").clicked() {
+                                self.toggle_terminal();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Clear").clicked() {
+                                self.terminal.clear_active();
+                                ui.close_menu();
+                            }
+                            if ui.button("Kill Active Terminal").clicked() {
+                                self.kill_active_terminal();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Open in WSL (external window)").clicked() {
+                                self.open_wsl_terminal();
                                 ui.close_menu();
                             }
                         });
@@ -4339,10 +4942,9 @@ impl LiteIdeApp {
             } else {
                 let root = self.workspace_root();
                 let full = std::path::Path::new(&root).join(&path);
-                if let Ok(text) = std::fs::read_to_string(&full) {
-                    self.open_file(full, text, !pin);
-                } else {
-                    self.flash(format!("无法打开 {path}"));
+                match self.read_text_file(&full) {
+                    Ok(text) => self.open_file(full, text, !pin),
+                    Err(e) => self.flash(format!("无法打开 {path}: {e}")),
                 }
             }
         }
@@ -4632,15 +5234,18 @@ impl LiteIdeApp {
         self.remote_dialog_open = true;
     }
 
-    /// 重新枚举对话框里当前目录的子目录（UNC 直读，无需子进程）。
+    /// 重新枚举对话框里当前目录的子目录（在 WSL 内部 `find`，不走 9P 视图）。
     fn refresh_remote_dialog_dirs(&mut self) {
         let posix = normalize_posix(&self.remote_dialog_path);
-        let unc = wsl_dir_to_unc(&self.remote_dialog_distro, &posix);
-        let mut dirs: Vec<String> = std::fs::read_dir(&unc)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
+        let distro = self.remote_dialog_distro.clone();
+        let mut dirs: Vec<String> = self
+            .remote
+            .list_dir(&distro, &posix)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter(|e| e.is_dir)
+                    .map(|e| e.name)
                     .collect()
             })
             .unwrap_or_default();
@@ -4835,6 +5440,18 @@ impl LiteIdeApp {
                 self.flash = None;
                 return;
             }
+            let color = hex("#d4d4d4");
+            let font = egui::FontId::proportional(13.0);
+            // 一行放不下时保留首尾、中间省略；两侧留 40px 边距。
+            let max_w = (ctx.screen_rect().width() - 80.0).clamp(160.0, 900.0);
+            let measure = |s: &str| {
+                ctx.fonts(|f| {
+                    f.layout_no_wrap(s.to_owned(), font.clone(), color)
+                        .size()
+                        .x
+                })
+            };
+            let shown = middle_ellipsis(msg, max_w, measure);
             egui::Area::new(egui::Id::new("flash_area"))
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 30.0])
                 .order(egui::Order::Foreground)
@@ -4842,10 +5459,11 @@ impl LiteIdeApp {
                     egui::Frame::popup(ui.style())
                         .fill(hex("#3c3c3c"))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(msg.as_str())
-                                    .size(13.0)
-                                    .color(hex("#d4d4d4")),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(shown).size(13.0).color(color),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Extend),
                             );
                         });
                 });
@@ -5094,6 +5712,12 @@ impl eframe::App for LiteIdeApp {
         self.poll_search();
         self.poll_git();
         self.sync_editor_breakpoints();
+        self.poll_terminal(ctx);
+
+        // Ctrl+` / Ctrl+Shift+` 全局有效；终端有焦点时还要接管 IDE 快捷键
+        // （此时编辑器键盘是关的，见下面的 `set_keys_enabled`）。
+        let modal_before = self.modal_open();
+        self.handle_terminal_shortcuts(ctx, modal_before);
 
         // 绘制前先记下「上一帧结束时是否有文本框持有焦点」：
         // 回车那一刻 egui 的 TextEdit 会立刻交出焦点，若只看绘制后的状态，
@@ -5110,24 +5734,21 @@ impl eframe::App for LiteIdeApp {
             self.draw_debug_panel(ctx);
         }
         self.draw_tab_strip(ctx);
+        self.draw_terminal_panel(ctx);
 
         // 模态窗口打开时屏蔽编辑器快捷键，避免冲突。
-        let modal_open = self.palette_open
-            || self.file_picker_open
-            || self.settings_open
-            || self.goto_line_open
-            || self.about_open
-            || self.keys_open
-            || self.find_open
-            || self.save_as_open
-            || self.remote_dialog_open
-            || self.confirm_close.is_some();
+        let modal_open = self.modal_open();
+        if modal_open {
+            // 模态框的输入框优先，终端不再吃键盘。
+            self.terminal.clear_focus();
+        }
         // 非模态的文本框（侧栏搜索框 / Git 提交框 / 调试监视框）持有键盘焦点时：
         // 编辑器忽略字符输入与无修饰键的编辑操作，但保留 Ctrl+… 全局快捷键与 F 功能键，
         // 否则在这些框里打字会同时写进编辑器正文（编辑器直接消费全局 Event::Text）。
         let text_focus = text_focus_before || ctx.wants_keyboard_input();
+        // 终端聚焦时编辑器让出键盘（终端自己编码并写进 PTY）。
         if let Some(ed) = &mut self.editor {
-            ed.set_keys_enabled(!modal_open);
+            ed.set_keys_enabled(!modal_open && !self.terminal.focused);
             ed.set_text_focus(text_focus && !modal_open);
         }
 
@@ -5146,6 +5767,16 @@ impl eframe::App for LiteIdeApp {
                 }
             })
             .inner;
+
+        // 点终端面板以外的地方 = 把键盘交回去（VS Code 的 `terminal.integrated.focus` 语义）。
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            let pos = ctx.input(|i| i.pointer.interact_pos());
+            if let (Some(pos), Some(rect)) = (pos, self.terminal.panel_rect) {
+                if !rect.contains(pos) {
+                    self.terminal.clear_focus();
+                }
+            }
+        }
 
         // 脏标记跟踪（编辑序列号变化 → 激活标签置脏 + 缩进提示刷新）。
         let seq_now = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
@@ -5199,16 +5830,7 @@ impl eframe::App for LiteIdeApp {
             Some(EditorAction::CloseTab) => self.on_close_tab(),
             Some(EditorAction::NextTab) => self.cycle_tab(1),
             Some(EditorAction::PrevTab) => self.cycle_tab(-1),
-            Some(EditorAction::CommandPalette) => {
-                self.palette_open = !self.palette_open;
-                if self.palette_open {
-                    self.palette_query.clear();
-                    self.palette_sel = 0;
-                    self.palette_focus_req = true;
-                    self.palette_frames = 0;
-                    self.palette_open_at = Some(Instant::now());
-                }
-            }
+            Some(EditorAction::CommandPalette) => self.open_command_palette(),
             Some(EditorAction::ToggleSidebar) => {
                 self.settings.show_sidebar = !self.settings.show_sidebar;
                 self.save_settings();
@@ -5320,6 +5942,9 @@ enum Codicon {
     ChromeClose,    // eab8
     // 状态栏左下角的「远程连接」图标（VS Code `remote`）。
     Remote, // eb3a
+    // 终端面板标题栏动作。
+    Add,   // ea60 add
+    Trash, // ea81 trash
 }
 
 impl Codicon {
@@ -5354,6 +5979,8 @@ impl Codicon {
         Codicon::ChromeRestore,
         Codicon::ChromeClose,
         Codicon::Remote,
+        Codicon::Add,
+        Codicon::Trash,
     ];
 
     /// 字体里的码位（U+Exxx）。
@@ -5387,6 +6014,8 @@ impl Codicon {
             Codicon::ChromeRestore => 0xeabb,
             Codicon::ChromeClose => 0xeab8,
             Codicon::Remote => 0xeb3a,
+            Codicon::Add => 0xea60,
+            Codicon::Trash => 0xea81,
         };
         char::from_u32(cp).unwrap_or(' ')
     }
@@ -5422,6 +6051,110 @@ fn draw_twistie(painter: &egui::Painter, center: egui::Pos2, expanded: bool, col
         Codicon::ChevronRight
     };
     draw_codicon(painter, center, 14.0, icon, color);
+}
+
+// ---- 集成终端面板的标题栏 ----
+
+/// 终端标题栏配色（随外壳主题切换）。
+#[derive(Clone, Copy)]
+struct TermHeaderColors {
+    fg: egui::Color32,
+    dim: egui::Color32,
+    hover_bg: egui::Color32,
+    active_bg: egui::Color32,
+    accent: egui::Color32,
+}
+
+/// 一个终端标签：标题 + 关闭按钮。返回 `(整块响应, 是否点了关闭)`。
+fn terminal_tab(
+    ui: &mut egui::Ui,
+    id: usize,
+    title: &str,
+    active: bool,
+    exited: bool,
+    c: TermHeaderColors,
+) -> (egui::Response, bool) {
+    let font = egui::FontId::proportional(12.0);
+    let label = if exited {
+        format!("{title} (已退出)")
+    } else {
+        title.to_string()
+    };
+    let galley = ui.painter().layout_no_wrap(label.clone(), font.clone(), c.fg);
+    let width = (galley.size().x + 40.0).max(112.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(width, terminal::HEADER_HEIGHT),
+        egui::Sense::click(),
+    );
+
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 13.0, rect.center().y),
+        egui::vec2(16.0, 16.0),
+    );
+    let close = ui.interact(
+        close_rect,
+        ui.id().with(("terminal_tab_close", id)),
+        egui::Sense::click(),
+    );
+
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, 0.0, c.active_bg);
+        painter.hline(
+            rect.x_range(),
+            rect.top() + 0.5,
+            egui::Stroke::new(1.0_f32, c.accent),
+        );
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 0.0, c.hover_bg);
+    }
+    let color = if active { c.fg } else { c.dim };
+    painter.text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &label,
+        font,
+        color,
+    );
+    if close.hovered() {
+        painter.rect_filled(close_rect, 3.0, c.hover_bg);
+    }
+    draw_codicon(
+        painter,
+        close_rect.center(),
+        12.0,
+        Codicon::ChromeClose,
+        if close.hovered() { c.fg } else { c.dim },
+    );
+
+    (resp, close.clicked())
+}
+
+/// 终端标题栏右侧的小图标按钮。
+fn terminal_icon_button(
+    ui: &mut egui::Ui,
+    icon: Codicon,
+    tip: &str,
+    color: egui::Color32,
+    hover_bg: egui::Color32,
+    hover_fg: egui::Color32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(24.0, terminal::HEADER_HEIGHT),
+        egui::Sense::click(),
+    );
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter().rect_filled(rect, 3.0, hover_bg);
+    }
+    draw_codicon(
+        ui.painter(),
+        rect.center(),
+        14.0,
+        icon,
+        if hovered { hover_fg } else { color },
+    );
+    resp.on_hover_text(tip)
 }
 
 // ---- 自绘标题栏（VS Code 的窗口标题栏样式） ----
@@ -6396,27 +7129,57 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::*;
 
-    /// 远程工作区：设置里的 distro/路径 → UNC 工作区根 → LSP 根 URI。
+    /// 测试一律用默认设置装配：不受 `%APPDATA%\LiteIDE\settings.json` 与
+    /// 并行 settings 测试临时改写的 `LITEIDE_CONFIG_DIR` 影响。
+    fn test_app() -> LiteIdeApp {
+        LiteIdeApp::with_settings(AppSettings::default(), None)
+    }
+
+    /// 远程工作区：根就是 WSL 内部的 POSIX 路径，URI 也是 `file:///home/...`。
     #[test]
-    fn remote_workspace_maps_to_unc_and_uri() {
-        let mut app = LiteIdeApp::new();
+    fn remote_workspace_is_posix_inside_wsl() {
+        let mut app = test_app();
         app.settings.remote_distro = Some("Ubuntu2404".to_string());
         app.settings.remote_path = Some("/home/work/NewLithoTune/candanza".to_string());
         assert!(app.is_remote());
-        assert_eq!(
-            app.workspace_root(),
-            r"\\wsl.localhost\Ubuntu2404\home\work\NewLithoTune\candanza"
-        );
+        assert_eq!(app.workspace_root(), "/home/work/NewLithoTune/candanza");
         assert_eq!(
             app.workspace_uri(),
-            "file://wsl.localhost/Ubuntu2404/home/work/NewLithoTune/candanza"
+            "file:///home/work/NewLithoTune/candanza"
         );
+        // 远程路径在 UI 里一律按 POSIX 判断，不走 Windows 盘符/UNC。
+        assert!(app.is_remote_path(std::path::Path::new(
+            "/home/work/NewLithoTune/candanza/src/a.cpp"
+        )));
+        assert!(!app.is_remote_path(std::path::Path::new(r"E:\proj\a.cpp")));
 
         // 断开后回到本地根。
         app.settings.remote_distro = None;
         app.settings.remote_path = None;
         assert!(!app.is_remote());
         assert_eq!(app.workspace_root(), app.project_root());
+    }
+
+    /// 远程文件的 URI 必须保持 WSL 视角（`file:///home/...`），不能再出现 9P ／ UNC 形态。
+    #[test]
+    fn remote_file_uris_stay_inside_wsl() {
+        let mut app = test_app();
+        app.settings.remote_distro = Some("Ubuntu2404".to_string());
+        app.settings.remote_path = Some("/home/work/NewLithoTune/candanza".to_string());
+        let uri = app
+            .uri_of_path(std::path::Path::new(
+                "/home/work/NewLithoTune/candanza/src/main.cpp",
+            ))
+            .expect("远程文件应能转 URI");
+        assert_eq!(
+            uri,
+            "file:///home/work/NewLithoTune/candanza/src/main.cpp"
+        );
+        assert!(!uri.contains("wsl.localhost"));
+        assert_eq!(
+            uri_to_posix(&uri).as_deref(),
+            Some("/home/work/NewLithoTune/candanza/src/main.cpp")
+        );
     }
 
     /// 连接菜单：选项与 VS Code 同构，但只有 WSL/断开是可点生效的。
@@ -6447,14 +7210,14 @@ mod tests {
     /// 远程根切换会让 LSP 换根（clangd 重启到新根），而不是继续用旧根。
     #[test]
     fn remote_root_uri_differs_from_local_root_uri() {
-        let mut app = LiteIdeApp::new();
+        let mut app = test_app();
         let local = app.project_root();
         let local_uri = path_to_uri_any(&local).expect("本地根应能转 URI");
         app.settings.remote_distro = Some("Ubuntu2404".to_string());
         app.settings.remote_path = Some("/home/work/NewLithoTune/candanza".to_string());
         let remote_uri = app.workspace_uri();
         assert_ne!(local_uri, remote_uri);
-        assert!(remote_uri.starts_with("file://wsl.localhost/Ubuntu2404/"));
+        assert_eq!(remote_uri, "file:///home/work/NewLithoTune/candanza");
     }
 
     /// 对话框里的目录输入：补前导 `/`、去尾部 `/`，空串 → `/`。
@@ -6555,7 +7318,7 @@ mod tests {
     #[test]
     fn safe_commands_smoke_100_ops() {
         let ctx = drawing_ctx();
-        let mut app = LiteIdeApp::new();
+        let mut app = test_app();
         let safe_ids = [
             "file.newFile", "file.close", "file.closeAll", "file.reopenClosed", "file.copyPath",
             "file.saveAs",
@@ -6582,7 +7345,7 @@ mod tests {
     /// 断点集合切换：同一行两次应互逆；行号 1-based 存储。
     #[test]
     fn toggle_breakpoint_updates_set() {
-        let mut app = LiteIdeApp::new();
+        let mut app = test_app();
         assert!(!app.tabs.is_empty(), "默认应打开一个标签");
         let idx = app.tabs.active();
         if let Some(tab) = app.tabs.get_mut(idx) {
@@ -6599,7 +7362,7 @@ mod tests {
     /// 无文件路径时设置断点应被拒绝（不 panic、不新增）。
     #[test]
     fn toggle_breakpoint_without_path_is_rejected() {
-        let mut app = LiteIdeApp::new();
+        let mut app = test_app();
         let idx = app.tabs.active();
         if let Some(tab) = app.tabs.get_mut(idx) {
             tab.path = None;
@@ -6656,7 +7419,7 @@ mod tests {
     /// Ctrl+Shift+F 应把侧栏切到「搜索」视图（结果占用资源管理器位置）。
     #[test]
     fn content_search_opens_sidebar_view() {
-        let mut app = LiteIdeApp::new();
+        let mut app = test_app();
         app.settings.show_sidebar = false;
         app.open_content_search();
         assert_eq!(app.sidebar_content, SidebarContent::Search);
@@ -6668,7 +7431,7 @@ mod tests {
     /// 用 headless egui 连跑两帧模拟「打字 → 回车」。
     #[test]
     fn file_picker_enter_navigates_to_typed_dir() {
-        let mut app = LiteIdeApp::new();
+        let mut app = test_app();
         app.open_file_picker();
         let before = app.file_picker_dir.clone();
         let Some(parent) = before.parent().map(|p| p.to_path_buf()) else {
@@ -6717,7 +7480,7 @@ mod tests {
     /// 文件浏览器打开后必须有可用目录，且再次打开保留上次目录。
     #[test]
     fn file_picker_opens_with_directory() {
-        let mut app = LiteIdeApp::new();
+        let mut app = test_app();
         app.open_file_picker();
         assert!(app.file_picker_open);
         assert!(app.file_picker_focus, "应请求把焦点交给输入框");
@@ -6759,6 +7522,30 @@ mod tests {
     }
 
     /// 状态栏「连接」项：未连接只有图标；连上 WSL 后蓝底白字并显示发行版名。
+    #[test]
+    fn terminal_panel_empty_state_guides_user_to_connect_wsl() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.settings.remote_distro = None;
+        app.settings.remote_path = None;
+        app.terminal.open = true;
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_terminal_panel(ctx));
+        assert!(app.terminal.panel_rect.is_some(), "面板应占用底部区域");
+        assert!(
+            out.shapes.iter().any(|cs| matches!(
+                &cs.shape,
+                egui::Shape::Text(t) if t.galley.text().contains("先连接 WSL")
+            )),
+            "本地工作区应提示先连接 WSL"
+        );
+
+        // 再按一次 Ctrl+` 收起面板；本地工作区不会拉起任何进程。
+        app.toggle_terminal();
+        assert!(!app.terminal.open);
+        assert!(app.terminal.is_empty());
+    }
+
     #[test]
     fn statusbar_remote_matches_vscode_states() {
         let ctx = drawing_ctx();
@@ -6960,7 +7747,7 @@ mod tests {
 
     /// 搜索视图的测试用 App（侧栏打开、搜索结果固定一条）。
     fn search_probe_app(sidebar_w: f32, replace: bool, details: bool) -> LiteIdeApp {
-        let mut app = LiteIdeApp::new();
+        let mut app = test_app();
         app.settings.show_sidebar = true;
         app.sidebar_width = sidebar_w;
         app.sidebar_content = SidebarContent::Search;
@@ -7022,12 +7809,57 @@ mod tests {
         })
     }
 
+    /// flash 提示只占一行：超宽时保留首尾、中间省略，不换行。
+    #[test]
+    fn flash_message_stays_on_one_line_with_middle_ellipsis() {
+        let measure = |s: &str| s.chars().count() as f32 * 10.0;
+        assert_eq!(middle_ellipsis("short", 200.0, measure), "short");
+
+        let long = "已连接到 WSL: Ubuntu2404 · /home/work/NewLithoTune/candanza/src/deep/dir";
+        let shown = middle_ellipsis(long, 240.0, measure);
+        assert!(shown.contains('…'));
+        assert!(shown.chars().count() <= 24);
+        assert!(shown.starts_with("已连接"));
+        assert!(shown.ends_with("dir"));
+        assert!(!shown.contains('\n'));
+    }
+
+    /// 真渲染一帧：长远程路径的提示只能有一行，且不能超出窗口。
+    #[test]
+    fn flash_renders_a_single_line_for_a_long_remote_path() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.flash = Some((
+            format!(
+                "已连接到 WSL: Ubuntu2404 · {}",
+                "/home/work/NewLithoTune/candanza/very/long/path".repeat(12)
+            ),
+            Instant::now(),
+        ));
+        // Area 的第一帧只做尺寸测量（egui 的 sizing pass，不画内容），第二帧才可见。
+        let _ = ctx.run(probe_raw_input(), |ctx| app.draw_flash(ctx));
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_flash(ctx));
+        let (galley, pos) = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains('…') => {
+                    Some((t.galley.clone(), t.pos))
+                }
+                _ => None,
+            })
+            .expect("应画出省略后的提示");
+        assert_eq!(galley.rows.len(), 1, "提示不应换行");
+        assert!(pos.x + galley.size().x <= 1200.0, "提示超出窗口");
+    }
+
     /// 标题栏：应用图标、菜单、窗口按钮全部合到**最上面同一行**（对齐 VS Code 的自绘标题栏）。
     #[test]
     fn title_bar_keeps_logo_menus_and_window_buttons_on_one_top_row() {
         const W: f32 = 1200.0;
         let ctx = drawing_ctx();
-        let mut app = LiteIdeApp::new();
+        let mut app = test_app();
         // 第一帧让 `set_fonts` 生效（egui 的字体表在帧末才替换）。
         let _ = ctx.run(probe_raw_input(), |_ctx| {});
         let out = ctx.run(probe_raw_input(), |ctx| app.draw_title_bar(ctx));

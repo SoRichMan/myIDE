@@ -75,6 +75,12 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec { id: "debug.stepInto", title: "Step Into", zh: "单步进入", category: "Debug", shortcut: "F11", safe: false },
         CommandSpec { id: "debug.stepOut", title: "Step Out", zh: "单步跳出", category: "Debug", shortcut: "Shift+F11", safe: false },
         CommandSpec { id: "debug.addWatch", title: "Add to Watch", zh: "添加到监视", category: "Debug", shortcut: "Ctrl+Shift+W", safe: true },
+        // ---- Terminal ----
+        CommandSpec { id: "terminal.new", title: "Terminal: New Terminal", zh: "新建终端", category: "Terminal", shortcut: "Ctrl+Shift+`", safe: false },
+        CommandSpec { id: "terminal.toggle", title: "Terminal: Toggle Panel", zh: "切换终端面板", category: "Terminal", shortcut: "Ctrl+`", safe: true },
+        CommandSpec { id: "terminal.clear", title: "Terminal: Clear", zh: "清空终端", category: "Terminal", shortcut: "", safe: true },
+        CommandSpec { id: "terminal.kill", title: "Terminal: Kill Active Terminal", zh: "结束活动终端", category: "Terminal", shortcut: "", safe: false },
+        CommandSpec { id: "terminal.openWsl", title: "Terminal: Open in WSL", zh: "在 WSL 中打开终端", category: "Terminal", shortcut: "", safe: false },
         // ---- Git ----
         CommandSpec { id: "git.openPanel", title: "Git: Open Panel", zh: "打开 Git 面板", category: "Git", shortcut: "Ctrl+Shift+G", safe: false },
         CommandSpec { id: "git.refresh", title: "Git: Refresh Status", zh: "刷新 Git 状态", category: "Git", shortcut: "", safe: false },

@@ -1,0 +1,8 @@
+[package]
+name = "ide-remote"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+portable-pty = "0.9"
+tracing.workspace = true

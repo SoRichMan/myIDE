@@ -13,6 +13,7 @@ ide-lsp = { path = "../ide-lsp" }
 ide-dap = { path = "../ide-dap" }
 ide-search = { path = "../ide-search" }
 ide-git = { path = "../ide-git" }
+ide-remote = { path = "../ide-remote" }
 # 扩展机制：宿主 + 内置扩展（C/C++ 语法高亮、VSCode 配色）
 ide-ext = { path = "../ide-ext" }
 ext-cpp-highlight = { path = "../ext-cpp-highlight" }
@@ -23,3 +24,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+vt100 = "0.18"
