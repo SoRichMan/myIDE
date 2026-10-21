@@ -3375,6 +3375,7 @@ impl LiteIdeApp {
                 | scm::Action::Sync(idx)
                 | scm::Action::SelectCommit { repo: idx, .. }
                 | scm::Action::ShowCommitDiff { repo: idx, .. }
+                | scm::Action::RequestDetail { repo: idx, .. }
                 | scm::Action::FocusMessage(idx) => self.scm.repos.get(*idx).map(|r| r.path.clone()),
                 scm::Action::Stage { repo: idx, .. }
                 | scm::Action::Unstage { repo: idx, .. }
@@ -3385,6 +3386,7 @@ impl LiteIdeApp {
                     self.scm.repos.get(*idx).map(|r| r.path.clone())
                 }
                 scm::Action::CloseDetail => None,
+                scm::Action::CopyHash(_) => None,
             };
             match action {
                 scm::Action::RefreshAll => self.refresh_git_now(),
@@ -3498,6 +3500,15 @@ impl LiteIdeApp {
                     if let Some(r) = self.scm.repos.get(repo).map(|x| x.path.clone()) {
                         self.git.commit_diff(&r, &hash);
                     }
+                }
+                scm::Action::RequestDetail { repo, hash } => {
+                    if let Some(r) = self.scm.repos.get(repo).map(|x| x.path.clone()) {
+                        self.git.commit_detail(&r, &hash);
+                    }
+                }
+                scm::Action::CopyHash(hash) => {
+                    copy_to_clipboard(hash.clone());
+                    self.flash(format!("已复制提交 ID：{hash}"));
                 }
                 scm::Action::OpenDiff { path, cached, .. } => {
                     if let Some(r) = root {
@@ -6215,7 +6226,34 @@ impl LiteIdeApp {
     }
 }
 
-    /// 一个状态栏项：可选图标 + 可选文字，悬停时整块底色变 `hover`
+    /// 复制文本到系统剪贴板（Windows `clip`）。
+///
+/// 放在后台线程里做，避免阻塞 UI 线程。
+fn copy_to_clipboard(text: String) {
+    std::thread::spawn(move || {
+        let mut child = match std::process::Command::new("clip")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("复制到剪贴板失败: {e}");
+                return;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            if let Err(e) = stdin.write_all(text.as_bytes()) {
+                tracing::warn!("写剪贴板失败: {e}");
+            }
+        }
+        let _ = child.wait();
+    });
+}
+
+/// 一个状态栏项：可选图标 + 可选文字，悬停时整块底色变 `hover`
     /// （VS Code `statusBarItem.hoverBackground`）。
     #[allow(clippy::too_many_arguments)]
     fn statusbar_item(
@@ -6660,6 +6698,11 @@ enum Codicon {
     CloudUpload,    // eac3 cloud-upload
     Account,        // eb99 account
     Close,          // ea76 close
+    Repo,           // ea62 repo
+    History,        // ea82 history（时钟）
+    GitCommit,      // eafc git-commit
+    GitPullRequest, // ea64 git-pull-request
+    Clippy,         // eac0 clippy（当「复制」按钮用：形似剪贴板）
 }
 
 impl Codicon {
@@ -6704,6 +6747,11 @@ impl Codicon {
         Codicon::CloudUpload,
         Codicon::Account,
         Codicon::Close,
+        Codicon::Repo,
+        Codicon::History,
+        Codicon::GitCommit,
+        Codicon::GitPullRequest,
+        Codicon::Clippy,
     ];
 
     /// 字体里的码位（U+Exxx）。
@@ -6747,6 +6795,11 @@ impl Codicon {
             Codicon::CloudUpload => 0xeac3,
             Codicon::Account => 0xeb99,
             Codicon::Close => 0xea76,
+            Codicon::Repo => 0xea62,
+            Codicon::History => 0xea82,
+            Codicon::GitCommit => 0xeafc,
+            Codicon::GitPullRequest => 0xea64,
+            Codicon::Clippy => 0xeac0,
         };
         char::from_u32(cp).unwrap_or(' ')
     }
@@ -9107,6 +9160,65 @@ mod tests {
             pos.iter().any(|(s, _)| s.contains("Ctrl+Enter to commit on")),
             "应显示提交信息占位提示"
         );
+    }
+
+    /// 悬停 GRAPH 里的某条提交 → 弹出信息卡片（作者 / 时间 / 标题 / 统计 / SHA + 复制按钮）。
+    #[test]
+    fn hovering_a_commit_shows_info_card() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        let mut repo = scm_repo();
+        repo.commits[0].author = "HOVERCARD".into();
+        app.scm.set_repos(vec![repo]);
+        app.sidebar_content = SidebarContent::SourceControl;
+        app.settings.show_sidebar = true;
+        // 第一帧：找到 GRAPH 里提交标题的位置
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        eprintln!("DBG f1 texts={:?}", frame_texts(&out));
+        eprintln!("DBG f1 width={}", app.sidebar_width);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("fix broken edge API") => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("应画出提交标题");
+
+        // 预置提交详情（相当于 `git show --numstat` 的结果）。
+        app.scm.detail = Some(ide_git::log::CommitDetail {
+            hash: "abc1234def".into(),
+            author: "Alice".into(),
+            subject: "fix broken edge API".into(),
+            ..Default::default()
+        });
+        app.scm.detail.as_mut().unwrap().files = vec![ide_git::log::ChangedFile {
+            path: "src/a.cpp".into(),
+            insertions: 70,
+            deletions: 61,
+        }];
+
+        // 第二帧：把指针放到那一行上 → 记录悬停；卡片是 egui::Area，
+        // 第一帧只做「测量」，所以还要再画一帧卡片才出现。
+        let mut input = probe_raw_input();
+        input.events.push(egui::Event::PointerMoved(pos));
+        let _ = ctx.run(input.clone(), |ctx| app.draw_sidebar(ctx));
+        let out = ctx.run(input, |ctx| app.draw_sidebar(ctx));
+        let texts = frame_texts(&out);
+        let all = texts.join("\n");
+        assert!(all.contains("HOVERCARD"), "卡片应显示作者");
+        assert!(all.contains("ago"), "卡片应显示相对时间，实际：{all}");
+        assert!(
+            all.contains("October 20, 2026 at 2:12 PM"),
+            "卡片应显示绝对时间，实际：{all}"
+        );
+        assert!(all.contains("1 file changed"), "卡片应显示改动统计");
+        assert!(all.contains("70 insertions(+)"), "卡片应显示新增行数");
+        assert!(all.contains("61 deletions(-)"), "卡片应显示删除行数");
+        assert!(all.contains("abc1234"), "卡片应显示提交 ID");
     }
 
     /// 活动栏的源代码管理图标切到 Source Control 视图。

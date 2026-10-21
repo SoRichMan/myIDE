@@ -1477,6 +1477,57 @@ GRAPH
 
 ---
 
+## 第十七轮：SCM 面板细节对齐（message 框高度 / 文件名优先 / 提交悬停信息卡）（2026-10-21）
+
+用户反馈三处（图二 = 真 VS Code 的 SCM 面板，图三 = 提交悬停信息卡）：
+
+### 一、message 框高度不对
+
+- 原因：egui 的 `TextEdit::multiline` 即使 `desired_rows(1)`，也会把文字画到框外
+  （框高按行高算，但行内边距是按多行算的），占位提示和上面的分支行叠在一起；
+- 改法：改成 **单行 `TextEdit` + 上下 5px 内边距**（框高 ≈ 24px），
+  背景用 VS Code 的 `input.background`（#3c3c3c），占位提示垂直居中；
+- 所有仓库分组的 message 框统一走这一个函数。
+
+### 二、文件列表改成「文件名在前、路径在后」（图二）
+
+- 之前是「灰色目录 + 正常色文件名」，现在按用户要求反过来：
+  **文件图标 → 文件名（正常色，突出）→ 目录路径（灰色，超宽截断成 `…/`）→ 状态字母（最右）**，
+  和 VS Code 的 SCM 行完全一致（VS Code 的 M/U 字母就在行尾）。
+- 仓库行的图标组也按图二重排：
+  `分支 chip → ↺(丢弃全部) → +(暂存全部) → ⬆(推送) → ⑂(拉取) → ✓(提交) → ⟳(刷新) → ⋯(更多)`，
+  仓库名前面的图标改成「仓库」图标（`codicon-repo` ea62）。
+
+### 三、GRAPH 悬停弹出提交信息卡（图三）
+
+- 悬停 GRAPH 里的任意一条提交 → 在该行右侧弹出一个信息卡，元素与图三一一对应：
+  1. `(👤 账号图标) 作者`（蓝色加粗）+ `(🕘 历史图标) 23 hours ago (October 20, 2026 at 4:15 PM)`
+     —— 相对时间用英文 humanize，绝对时间用 `October 20, 2026 at 4:15 PM` 格式；
+  2. 提交标题（加粗白字）；
+  3. `5 files changed, 96 insertions(+), 29 deletions(-)` —— 增删行数分别用绿/红；
+  4. `(◈ 提交图标) 短 SHA`（蓝色）+ **可复制的小按钮**（点了把 SHA 写进系统剪贴板，`clip`）。
+- 统计数字来自 `git show --numstat`（悬停时按需请求，缓存在 `CommitDetail` 里）。
+- 交互细节：
+  - 指针移到卡片上时卡片**不消失**（否则点不到复制按钮）→ 用「上一帧指针是否在卡片矩形内」判断；
+  - `egui::Area` 默认有淡入动画 + 首帧只做测量，所以用 `.fade_in(false)` 让它立刻出现；
+  - 悬停行的圆点画成空心圈（和图三一致）。
+- 新增动作 `RequestDetail` / `CopyHash`；剪贴板用后台线程调 `clip`，不阻塞 UI 线程。
+
+### 四、守护测试
+
+- `hovering_a_commit_shows_info_card`：模拟指针停在提交行上 → 卡片里出现
+  作者 / 相对时间 / 绝对时间 / `1 file changed` / `70 insertions(+)` / `61 deletions(-)` / 短 SHA；
+  （注意 egui 的 `Area` 首帧是「测量帧」，测试要画两帧才能看到内容）。
+- `scm_view_sections_are_ordered_like_vscode` 保持通过。
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --workspace` | ✅ 167 passed 0 failed（ide-dap 的 3 个 mock_gdb 用例因本机没有 `python` 命令而失败，与本轮无关） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 warning |
+| 真机（WSL 工作区） | ✅ message 框高度正常；文件行 = 文件名(白) + 路径(灰) + 右端 M/U；仓库行 7 个图标与图二一致；悬停提交弹出信息卡（作者 / 1 day ago (October 19, 2026 at 9:29 PM) / 标题 / 5 files changed, 96 insertions(+), 29 deletions(-) / SHA + 复制按钮） |
+
+---
+
 ## 下一步任务：项目主体已完成
 
 myIDE.md 阶段 0-6 全部交付。后续仅按需处理技术债清单，不主动开工。
