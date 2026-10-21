@@ -80,7 +80,7 @@ pub fn parse_refs(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 一个提交里改动的文件（来自 `git show --numstat`）。
+/// 一个提交里改动的文件（来自 `git show --numstat` + `--name-status`）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChangedFile {
     /// 仓库内相对路径。
@@ -89,6 +89,8 @@ pub struct ChangedFile {
     pub insertions: usize,
     /// 删除行数。
     pub deletions: usize,
+    /// 状态字母（M/A/D/R…），来自 `git show --name-status`。
+    pub status: char,
 }
 
 /// 提交详情（作者 / 时间 / 标题 / 正文 / 改动文件）。
@@ -163,9 +165,29 @@ pub fn parse_commit_detail(output: &str) -> CommitDetail {
             path,
             insertions: ins.parse::<usize>().unwrap_or(0),
             deletions: del.parse::<usize>().unwrap_or(0),
+            status: 'M',
         });
     }
     detail
+}
+
+/// 解析 `git show --name-status` 的输出：每行 `状态字母<TAB>路径`
+/// （重命名/复制是 `状态字母<TAB>旧路径<TAB>新路径`，取最后一个）。
+pub fn parse_name_status(output: &str) -> Vec<(char, String)> {
+    output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut cols = l.split('\t');
+            let status = cols.next()?.trim().chars().next()?;
+            let path = cols.next_back()?.trim().to_string();
+            if path.is_empty() {
+                None
+            } else {
+                Some((status, path))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -212,5 +234,15 @@ mod tests {
         assert_eq!(d.insertions(), 12);
         assert_eq!(d.deletions(), 10);
         assert!(d.summary().contains("2 files changed"));
+    }
+
+    #[test]
+    fn parses_name_status() {
+        let out = "M\tsrc/a.cpp\nA\tsrc/b.cpp\nD\tsrc/c.cpp\nR100\tsrc/old.cpp\tsrc/new.cpp\n";
+        let v = parse_name_status(out);
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[0], ('M', "src/a.cpp".to_string()));
+        assert_eq!(v[1], ('A', "src/b.cpp".to_string()));
+        assert_eq!(v[3], ('R', "src/new.cpp".to_string()));
     }
 }

@@ -4,7 +4,7 @@
 //! 多仓库工作区，每个仓库一个 CHANGES 分组）。
 
 use crate::branch::{parse_branches, Branch};
-use crate::log::{parse_commit_detail, parse_log, CommitDetail, GitCommit};
+use crate::log::{parse_commit_detail, parse_log, parse_name_status, CommitDetail, GitCommit};
 use crate::porcelain::{parse_porcelain, GitStatus};
 use crate::process::run_git;
 use std::sync::mpsc::Receiver;
@@ -23,7 +23,7 @@ enum Command {
     Restore { root: String, path: String },
     RestoreAll { root: String },
     Diff { root: String, path: String, cached: bool },
-    CommitDetail { root: String, hash: String },
+    CommitDetail { root: String, hash: String, hover: bool },
     CommitDiff { root: String, hash: String },
     Checkout { root: String, branch: String },
     CreateBranch { root: String, name: String },
@@ -40,7 +40,7 @@ pub enum Event {
     Log { root: String, commits: Vec<GitCommit> },
     Branches { root: String, branches: Vec<Branch> },
     Diff { root: String, path: String, text: String, cached: bool },
-    CommitDetail { root: String, detail: Box<CommitDetail> },
+    CommitDetail { root: String, detail: Box<CommitDetail>, hover: bool },
     CommitDiff { root: String, hash: String, text: String },
     /// 一次性操作（commit/add/restore/push…）完成回执。
     Done { ok: bool, msg: String },
@@ -275,9 +275,10 @@ impl GitManager {
                             }
                         });
                     }
-                    Command::CommitDetail { root, hash } => {
+                    Command::CommitDetail { root, hash, hover } => {
                         let tx = ev_tx.clone();
                         tokio::spawn(async move {
+                            // 一次拿两样：--numstat 给增删行数，--name-status 给状态字母。
                             let args = [
                                 "show",
                                 "--no-color",
@@ -286,15 +287,28 @@ impl GitManager {
                                 "--format=%H%x00%an%x00%ae%x00%ad%x00%s%x00%b%x1e",
                                 &hash,
                             ];
-                            if let Ok((ok, out)) = run_git(&root, &args).await {
-                                if ok {
-                                    let detail = parse_commit_detail(&out);
-                                    let _ = tx.send(Event::CommitDetail {
-                                        root,
-                                        detail: Box::new(detail),
-                                    });
+                            let Ok((ok, out)) = run_git(&root, &args).await else {
+                                return;
+                            };
+                            if !ok {
+                                return;
+                            }
+                            let mut detail = parse_commit_detail(&out);
+                            let status_args = ["show", "--no-color", "--format=", "--name-status", &hash];
+                            if let Ok((true, sout)) = run_git(&root, &status_args).await {
+                                for (st, path) in parse_name_status(&sout) {
+                                    if let Some(f) =
+                                        detail.files.iter_mut().find(|f| f.path == path)
+                                    {
+                                        f.status = st;
+                                    }
                                 }
                             }
+                            let _ = tx.send(Event::CommitDetail {
+                                root,
+                                detail: Box::new(detail),
+                                hover,
+                            });
                         });
                     }
                     Command::CommitDiff { root, hash } => {
@@ -524,9 +538,19 @@ impl GitManager {
 
     /// 读取提交详情（作者 / 正文 / 改动文件）。
     pub fn commit_detail(&self, root: &str, hash: &str) {
+        self.commit_detail_inner(root, hash, false);
+    }
+
+    /// 读取提交详情（悬停卡片用；与「选中」的详情分开存，互不覆盖）。
+    pub fn commit_detail_hover(&self, root: &str, hash: &str) {
+        self.commit_detail_inner(root, hash, true);
+    }
+
+    fn commit_detail_inner(&self, root: &str, hash: &str, hover: bool) {
         let _ = self.cmd_tx.send(Command::CommitDetail {
             root: root.to_string(),
             hash: hash.to_string(),
+            hover,
         });
     }
 

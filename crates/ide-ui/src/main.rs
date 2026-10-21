@@ -3318,10 +3318,13 @@ impl LiteIdeApp {
         }
     }
 
-    fn poll_git(&mut self) {
+    fn poll_git(&mut self, ctx: &egui::Context) {
         while let Some(ev) = self.git.poll() {
             let done = matches!(ev, GitEvent::Done { .. });
             self.scm.on_event(&ev);
+            // 本 IDE 是「按需重绘」的：git 数据回来了必须主动要一帧，
+            // 否则面板要等鼠标再动一下才会刷新。
+            ctx.request_repaint();
             if let GitEvent::Done { ok, msg } = ev {
                 if ok {
                     self.flash(msg);
@@ -3393,7 +3396,6 @@ impl LiteIdeApp {
                 | scm::Action::Pull(idx)
                 | scm::Action::Sync(idx)
                 | scm::Action::SelectCommit { repo: idx, .. }
-                | scm::Action::ShowCommitDiff { repo: idx, .. }
                 | scm::Action::RequestDetail { repo: idx, .. }
                 | scm::Action::FocusMessage(idx) => self.scm.repos.get(*idx).map(|r| r.path.clone()),
                 scm::Action::Stage { repo: idx, .. }
@@ -3404,7 +3406,6 @@ impl LiteIdeApp {
                 scm::Action::OpenDiff { repo: idx, .. } => {
                     self.scm.repos.get(*idx).map(|r| r.path.clone())
                 }
-                scm::Action::CloseDetail => None,
                 scm::Action::CopyHash(_) => None,
             };
             match action {
@@ -3508,21 +3509,28 @@ impl LiteIdeApp {
                 }
                 scm::Action::SelectCommit { repo, hash } => {
                     if let Some(r) = self.scm.repos.get(repo).map(|x| x.path.clone()) {
+                        // 再点一次同一条 = 收起展开（VS Code 的行为）
+                        let already = self
+                            .scm
+                            .repos
+                            .get(repo)
+                            .and_then(|x| x.selected.clone())
+                            .as_deref()
+                            == Some(hash.as_str());
                         if let Some(rs) = self.scm.repos.get_mut(repo) {
-                            rs.selected = Some(hash.clone());
+                            rs.selected = if already { None } else { Some(hash.clone()) };
                         }
-                        self.git.commit_detail(&r, &hash);
-                        self.git.commit_diff(&r, &hash);
-                    }
-                }
-                scm::Action::ShowCommitDiff { repo, hash } => {
-                    if let Some(r) = self.scm.repos.get(repo).map(|x| x.path.clone()) {
-                        self.git.commit_diff(&r, &hash);
+                        if !already {
+                            self.git.commit_detail(&r, &hash);
+                        } else {
+                            self.scm.detail = None;
+                        }
                     }
                 }
                 scm::Action::RequestDetail { repo, hash } => {
                     if let Some(r) = self.scm.repos.get(repo).map(|x| x.path.clone()) {
-                        self.git.commit_detail(&r, &hash);
+                        // 悬停用的详情（不覆盖「选中提交」的展开数据）
+                        self.git.commit_detail_hover(&r, &hash);
                     }
                 }
                 scm::Action::CopyHash(hash) => {
@@ -3545,10 +3553,6 @@ impl LiteIdeApp {
                             }
                         }
                     }
-                }
-                scm::Action::CloseDetail => {
-                    self.scm.detail = None;
-                    self.scm.detail_diff.clear();
                 }
                 scm::Action::FocusMessage(_) => {
                     self.flash("请在提交信息框中输入内容".to_string());
@@ -6473,7 +6477,7 @@ impl eframe::App for LiteIdeApp {
         self.sync_document();
         self.poll_dap();
         self.poll_search();
-        self.poll_git();
+        self.poll_git(ctx);
         self.sync_editor_breakpoints();
         self.poll_terminal(ctx);
 
@@ -6716,7 +6720,6 @@ enum Codicon {
     CloudDownload,  // eac2 cloud-download
     CloudUpload,    // eac3 cloud-upload
     Account,        // eb99 account
-    Close,          // ea76 close
     Repo,           // ea62 repo
     History,        // ea82 history（时钟）
     GitCommit,      // eafc git-commit
@@ -6767,7 +6770,6 @@ impl Codicon {
         Codicon::CloudDownload,
         Codicon::CloudUpload,
         Codicon::Account,
-        Codicon::Close,
         Codicon::Repo,
         Codicon::History,
         Codicon::GitCommit,
@@ -6817,7 +6819,6 @@ impl Codicon {
             Codicon::CloudDownload => 0xeac2,
             Codicon::CloudUpload => 0xeac3,
             Codicon::Account => 0xeb99,
-            Codicon::Close => 0xea76,
             Codicon::Repo => 0xea62,
             Codicon::History => 0xea82,
             Codicon::GitCommit => 0xeafc,
@@ -9187,6 +9188,39 @@ mod tests {
         );
     }
 
+    /// 点开一条提交 → 改动文件在**这条提交下面展开**（VS Code 的行为，
+    /// 不是在面板底部另开一个窗口）。
+    #[test]
+    fn selected_commit_expands_files_inline() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        let mut repo = scm_repo();
+        repo.commits[0].hash = "abc1234".into();
+        app.scm.set_repos(vec![repo]);
+        app.scm.repos[0].selected = Some("abc1234".into());
+        app.scm.detail = Some(ide_git::log::CommitDetail {
+            hash: "abc1234def".into(),
+            subject: "fix broken edge API".into(),
+            files: vec![ide_git::log::ChangedFile {
+                path: "src/expanded.cpp".into(),
+                insertions: 3,
+                deletions: 1,
+                status: 'M',
+            }],
+            ..Default::default()
+        });
+        app.sidebar_content = SidebarContent::SourceControl;
+        app.settings.show_sidebar = true;
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        let all = frame_texts(&out).join("\n");
+        assert!(
+            all.contains("expanded.cpp"),
+            "选中的提交下面应展开改动文件，实际：{all}"
+        );
+        assert!(all.contains("M"), "展开的文件应带状态字母");
+    }
+
     /// 悬停 GRAPH 里的某条提交 → 弹出信息卡片（作者 / 时间 / 标题 / 统计 / SHA + 复制按钮）。
     #[test]
     fn hovering_a_commit_shows_info_card() {
@@ -9213,17 +9247,18 @@ mod tests {
             })
             .expect("应画出提交标题");
 
-        // 预置提交详情（相当于 `git show --numstat` 的结果）。
-        app.scm.detail = Some(ide_git::log::CommitDetail {
+        // 预置提交详情（相当于 `git show --numstat` 的结果；悬停用 hover_detail）。
+        app.scm.hover_detail = Some(ide_git::log::CommitDetail {
             hash: "abc1234def".into(),
             author: "Alice".into(),
             subject: "fix broken edge API".into(),
             ..Default::default()
         });
-        app.scm.detail.as_mut().unwrap().files = vec![ide_git::log::ChangedFile {
+        app.scm.hover_detail.as_mut().unwrap().files = vec![ide_git::log::ChangedFile {
             path: "src/a.cpp".into(),
             insertions: 70,
             deletions: 61,
+            status: 'M',
         }];
 
         // 第二帧：把指针放到那一行上 → 记录悬停；卡片是 egui::Area，

@@ -63,12 +63,10 @@ pub enum Action {
     Sync(usize),
     SelectCommit { repo: usize, hash: String },
     OpenDiff { repo: usize, path: String, cached: bool },
-    ShowCommitDiff { repo: usize, hash: String },
     /// 取某条提交的详情（悬停卡片要显示改动统计）。
     RequestDetail { repo: usize, hash: String },
     /// 复制提交 ID 到剪贴板。
     CopyHash(String),
-    CloseDetail,
     /// 把焦点放到该仓库的提交信息输入框。
     FocusMessage(usize),
 }
@@ -139,6 +137,15 @@ impl RepoState {
     }
 }
 
+/// GRAPH 列表里的一行：提交行，或选中提交下面展开的「改动文件」行。
+#[derive(Debug, Clone, Copy)]
+enum GraphRow {
+    /// 第 i 条提交。
+    Commit(usize),
+    /// 第 i 条提交下面展开的改动文件列表。
+    Files(usize),
+}
+
 /// 悬停在 GRAPH 某条提交上时弹出的信息卡片（对齐 Git Graph / VS Code 的提交详情）。
 #[derive(Debug, Clone)]
 pub struct HoverCard {
@@ -199,8 +206,12 @@ pub struct ScmPanel {
     pub frame_hover: Option<HoverCard>,
     /// 当前显示中的悬停卡片（指针移到卡片上时保持打开）。
     pub hover_card: Option<HoverCard>,
-    /// 上一帧卡片是否被指针悬停（用于「指针移到卡片上不消失」）。
-    pub card_hovered: bool,
+    /// 悬停卡片的矩形（算「保持显示」的范围用）。
+    pub card_rect: Option<egui::Rect>,
+    /// 悬停卡片锚定的提交行矩形。
+    pub anchor_rect: Option<egui::Rect>,
+    /// 悬停提交的详情（用于信息卡里的统计），与选中的详情分开存。
+    pub hover_detail: Option<CommitDetail>,
     /// 工作区根目录（用于发现仓库）。
     pub root: String,
 }
@@ -261,10 +272,15 @@ impl ScmPanel {
                     r.branches = branches.clone();
                 }
             }
-            ide_git::Event::CommitDetail { root, detail } => {
+            ide_git::Event::CommitDetail { root, detail, hover } => {
                 if let Some(idx) = self.repo_index(root) {
-                    self.detail_repo = idx;
-                    self.detail = Some((**detail).clone());
+                    if *hover {
+                        // 悬停用的详情：只给信息卡看，不影响「选中提交」的展开。
+                        self.hover_detail = Some((**detail).clone());
+                    } else {
+                        self.detail_repo = idx;
+                        self.detail = Some((**detail).clone());
+                    }
                 }
             }
             ide_git::Event::CommitDiff { text, .. } => {
@@ -329,7 +345,6 @@ impl ScmPanel {
                     }
                     // 悬停信息卡片（弹在侧栏右侧）
                     self.draw_hover_card(ui, &mut actions);
-                    self.draw_detail(ui, &mut actions);
                 }
             });
 
@@ -1246,134 +1261,230 @@ impl ScmPanel {
             return;
         }
         let selected = repos[idx].selected.clone();
+        // 行模型：提交行 + （选中的提交下面）展开的改动文件行。
+        // 用统一的行高，show_rows 就能虚拟滚动。
+        let mut rows: Vec<GraphRow> = Vec::with_capacity(commits.len() + 8);
+        for (i, c) in commits.iter().enumerate() {
+            rows.push(GraphRow::Commit(i));
+            if selected.as_deref() == Some(c.hash.as_str()) {
+                rows.push(GraphRow::Files(i));
+            }
+        }
         let row_h = 22.0_f32;
-        let count = commits.len();
+        let count = rows.len();
+        // 选中的提交详情（展开的改动文件列表）
+        let selected_files: Vec<ide_git::log::ChangedFile> = match (&self.detail, self.detail_repo) {
+            (Some(d), r) if r == idx => d.files.clone(),
+            _ => Vec::new(),
+        };
         egui::ScrollArea::vertical()
             .id_source(("scm_graph", idx))
             .auto_shrink([false, false])
             .max_height(260.0)
             .show_rows(ui, row_h, count, |ui, range| {
-                for i in range {
-                    let c = &commits[i];
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), row_h),
-                        egui::Sense::click(),
-                    );
-                    let is_sel = selected.as_deref() == Some(c.hash.as_str());
-                    if is_sel {
-                        ui.painter().rect_filled(rect, 0.0, hex(SELECTED_BG));
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(rect, 0.0, hex(HOVER_BG));
-                    }
-                    let cy = rect.center().y;
-                    // 图形：竖线 + 圆点（悬停时画成空心圈，和 Git Graph 一致）
-                    let gx = rect.left() + 14.0;
-                    let painter = ui.painter();
-                    if i + 1 < count {
-                        painter.vline(
-                            gx,
-                            egui::Rangef::new(cy, cy + row_h),
-                            egui::Stroke::new(1.5_f32, hex("#4a4a4a")),
-                        );
-                    }
-                    if resp.hovered() {
-                        painter.circle_stroke(
-                            egui::pos2(gx, cy),
-                            4.0,
-                            egui::Stroke::new(1.5_f32, hex("#4a9eff")),
-                        );
-                    } else {
-                        painter.circle_filled(egui::pos2(gx, cy), 4.0, hex("#4a9eff"));
-                    }
-                    let font = egui::FontId::proportional(12.0);
-                    let small = egui::FontId::proportional(11.0);
-                    let text_x = rect.left() + 26.0;
-                    // 作者（右对齐）
-                    let author = ellipsize(&c.author, 12);
-                    let aw = if author.is_empty() {
-                        0.0
-                    } else {
-                        measure(ui, &author, &small)
-                    };
-                    // 引用标签（分支名）——先量宽度，标题要给它让位
-                    let refs: Vec<String> = c
-                        .refs
-                        .iter()
-                        .map(|r| r.replace("HEAD -> ", ""))
-                        .filter(|r| !r.is_empty())
-                        // 最多显示两个标签（VS Code 的图形视图也只标主要分支）
-                        .take(2)
-                        .collect();
-                    let mut ref_width = 0.0;
-                    for r in &refs {
-                        ref_width += measure(ui, r, &small) + 12.0;
-                    }
-                    // 标题（按剩余宽度截断）
-                    let avail = rect.right() - 6.0 - aw - ref_width - text_x;
-                    let subject = truncate_to_width(ui, &c.subject, &font, avail);
-                    let subject_w = measure(ui, &subject, &font);
-                    painter.text(
-                        egui::pos2(text_x, cy),
-                        egui::Align2::LEFT_CENTER,
-                        &subject,
-                        font.clone(),
-                        hex(FG),
-                    );
-                    // 引用标签
-                    let mut ref_x = text_x + subject_w + 6.0;
-                    for r in &refs {
-                        let w = measure(ui, r, &small);
-                        let chip = egui::Rect::from_min_size(
-                            egui::pos2(ref_x, cy - 8.0),
-                            egui::vec2(w + 8.0, 16.0),
-                        );
-                        painter.rect_stroke(
-                            chip,
-                            3.0,
-                            egui::Stroke::new(1.0_f32, hex(REF_FG).gamma_multiply(0.6)),
-                        );
-                        painter.text(
-                            chip.center(),
-                            egui::Align2::CENTER_CENTER,
-                            r,
-                            small.clone(),
-                            hex(REF_FG),
-                        );
-                        ref_x += w + 12.0;
-                    }
-                    // 作者
-                    if !author.is_empty() {
-                        painter.text(
-                            egui::pos2(rect.right() - 6.0 - aw, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &author,
-                            small.clone(),
-                            hex(FG_DIM),
-                        );
-                    }
-                    if resp.clicked() {
-                        actions.push(Action::SelectCommit {
-                            repo: idx,
-                            hash: c.hash.clone(),
-                        });
-                    }
-                    // 悬停 → 记录信息卡片的锚点（卡片本体在 draw() 末尾弹）
-                    if resp.hovered() {
-                        self.frame_hover = Some(HoverCard {
-                            repo: idx,
-                            hash: c.hash.clone(),
-                            author: c.author.clone(),
-                            date: c.date.clone(),
-                            subject: c.subject.clone(),
-                            refs: c
+                for k in range {
+                    match rows[k] {
+                        GraphRow::Commit(i) => {
+                            let c = &commits[i];
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), row_h),
+                                egui::Sense::click(),
+                            );
+                            let is_sel = selected.as_deref() == Some(c.hash.as_str());
+                            if is_sel {
+                                ui.painter().rect_filled(rect, 0.0, hex(SELECTED_BG));
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(rect, 0.0, hex(HOVER_BG));
+                            }
+                            let cy = rect.center().y;
+                            // 图形：竖线 + 圆点（悬停时画成空心圈，和 Git Graph 一致）
+                            let gx = rect.left() + 14.0;
+                            let painter = ui.painter();
+                            if i + 1 < count {
+                                painter.vline(
+                                    gx,
+                                    egui::Rangef::new(cy, cy + row_h),
+                                    egui::Stroke::new(1.5_f32, hex("#4a4a4a")),
+                                );
+                            }
+                            if resp.hovered() {
+                                painter.circle_stroke(
+                                    egui::pos2(gx, cy),
+                                    4.0,
+                                    egui::Stroke::new(1.5_f32, hex("#4a9eff")),
+                                );
+                            } else {
+                                painter.circle_filled(egui::pos2(gx, cy), 4.0, hex("#4a9eff"));
+                            }
+                            let font = egui::FontId::proportional(12.5);
+                            let small = egui::FontId::proportional(11.0);
+                            let text_x = rect.left() + 26.0;
+                            // 作者（右对齐）
+                            let author = ellipsize(&c.author, 12);
+                            let aw = if author.is_empty() {
+                                0.0
+                            } else {
+                                measure(ui, &author, &small)
+                            };
+                            // 引用标签（分支名）——先量宽度，标题要给它让位
+                            let refs: Vec<String> = c
                                 .refs
                                 .iter()
                                 .map(|r| r.replace("HEAD -> ", ""))
                                 .filter(|r| !r.is_empty())
-                                .take(3)
-                                .collect(),
-                            anchor: rect,
-                        });
+                                // 最多显示两个标签（VS Code 的图形视图也只标主要分支）
+                                .take(2)
+                                .collect();
+                            let mut ref_width = 0.0;
+                            for r in &refs {
+                                ref_width += measure(ui, r, &small) + 12.0;
+                            }
+                            // 标题（按剩余宽度截断）
+                            let avail = rect.right() - 6.0 - aw - ref_width - text_x;
+                            let subject = truncate_to_width(ui, &c.subject, &font, avail);
+                            let subject_w = measure(ui, &subject, &font);
+                            painter.text(
+                                egui::pos2(text_x, cy),
+                                egui::Align2::LEFT_CENTER,
+                                &subject,
+                                font.clone(),
+                                hex(FG),
+                            );
+                            // 引用标签
+                            let mut ref_x = text_x + subject_w + 6.0;
+                            for r in &refs {
+                                let w = measure(ui, r, &small);
+                                let chip = egui::Rect::from_min_size(
+                                    egui::pos2(ref_x, cy - 8.0),
+                                    egui::vec2(w + 8.0, 16.0),
+                                );
+                                painter.rect_stroke(
+                                    chip,
+                                    3.0,
+                                    egui::Stroke::new(1.0_f32, hex(REF_FG).gamma_multiply(0.6)),
+                                );
+                                painter.text(
+                                    chip.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    r,
+                                    small.clone(),
+                                    hex(REF_FG),
+                                );
+                                ref_x += w + 12.0;
+                            }
+                            // 作者
+                            if !author.is_empty() {
+                                painter.text(
+                                    egui::pos2(rect.right() - 6.0 - aw, cy),
+                                    egui::Align2::LEFT_CENTER,
+                                    &author,
+                                    small.clone(),
+                                    hex(FG_DIM),
+                                );
+                            }
+                            if resp.clicked() {
+                                actions.push(Action::SelectCommit {
+                                    repo: idx,
+                                    hash: c.hash.clone(),
+                                });
+                            }
+                            // 悬停 → 记录信息卡片的锚点（卡片本体在 draw() 末尾弹）
+                            if resp.hovered() {
+                                self.frame_hover = Some(HoverCard {
+                                    repo: idx,
+                                    hash: c.hash.clone(),
+                                    author: c.author.clone(),
+                                    date: c.date.clone(),
+                                    subject: c.subject.clone(),
+                                    refs: c
+                                        .refs
+                                        .iter()
+                                        .map(|r| r.replace("HEAD -> ", ""))
+                                        .filter(|r| !r.is_empty())
+                                        .take(3)
+                                        .collect(),
+                                    anchor: rect,
+                                });
+                            }
+                        }
+                        GraphRow::Files(i) => {
+                            // 选中的提交：在它下面展开改动的文件（VS Code 的行为）
+                            let _ = i;
+                            if selected_files.is_empty() {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), row_h),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().text(
+                                    egui::pos2(rect.left() + 30.0, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    "(正在读取改动…)",
+                                    egui::FontId::proportional(12.0),
+                                    hex(FG_DIM),
+                                );
+                                continue;
+                            }
+                            for f in &selected_files {
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), row_h),
+                                    egui::Sense::click(),
+                                );
+                                if resp.hovered() {
+                                    ui.painter().rect_filled(rect, 0.0, hex(HOVER_BG));
+                                }
+                                let cy = rect.center().y;
+                                let font = egui::FontId::proportional(12.0);
+                                let (name, dir) = split_path(&f.path);
+                                let name_w = measure(ui, name, &font);
+                                let text_x = rect.left() + 32.0;
+                                let avail = rect.right() - 18.0 - text_x - name_w;
+                                let dir_text = if dir.is_empty() {
+                                    String::new()
+                                } else {
+                                    let mut d = truncate_to_width(ui, dir, &font, avail.max(10.0));
+                                    d.push('/');
+                                    d
+                                };
+                                // 小圆点（VS Code 的提交展开项图标）
+                                ui.painter().circle_filled(
+                                    egui::pos2(rect.left() + 24.0, cy),
+                                    3.0,
+                                    hex("#4a9eff"),
+                                );
+                                ui.painter().text(
+                                    egui::pos2(text_x, cy),
+                                    egui::Align2::LEFT_CENTER,
+                                    name,
+                                    font.clone(),
+                                    hex(FG),
+                                );
+                                if !dir_text.is_empty() {
+                                    ui.painter().text(
+                                        egui::pos2(text_x + name_w + 6.0, cy),
+                                        egui::Align2::LEFT_CENTER,
+                                        &dir_text,
+                                        font.clone(),
+                                        hex(FG_DIM),
+                                    );
+                                }
+                                // 状态字母（最右）
+                                ui.painter().text(
+                                    egui::pos2(rect.right() - 16.0, cy),
+                                    egui::Align2::LEFT_CENTER,
+                                    f.status.to_string(),
+                                    font,
+                                    badge_color(f.status),
+                                );
+                                if resp.clicked() {
+                                    // 点开这个文件（在编辑器里打开）
+                                    actions.push(Action::OpenDiff {
+                                        repo: idx,
+                                        path: f.path.clone(),
+                                        cached: false,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -1390,17 +1501,34 @@ impl ScmPanel {
     /// (◈) 2c6a524   [⧉]
     /// ```
     fn draw_hover_card(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        // 指针在卡片上时保持打开（否则没法点「复制」按钮）。
-        if self.card_hovered {
+        // 「保持显示」判定（VS Code 的做法）：
+        // 指针只要还在「提交行 + 卡片」这一块范围里（两者外接矩形再放宽一点），
+        // 卡片就不消失 —— 这样鼠标可以平移过去点「复制」按钮。
+        let pointer = ui.ctx().pointer_hover_pos();
+        let keep_zone = match (self.card_rect, self.anchor_rect) {
+            (Some(c), Some(a)) => Some(c.union(a).expand(8.0)),
+            _ => None,
+        };
+        let in_zone = match (pointer, keep_zone) {
+            (Some(p), Some(z)) => z.contains(p),
+            _ => false,
+        };
+        // 指针移到别的提交行上 → 换成那张卡的详情。
+        if let Some(fresh) = self.frame_hover.clone() {
+            self.hover_card = Some(fresh);
+        } else if !in_zone {
+            // 完全离开了有效范围 → 收起卡片。
+            self.hover_card = None;
+            self.card_rect = None;
+            self.anchor_rect = None;
             return;
         }
-        let Some(card) = self.frame_hover.clone() else {
-            self.hover_card = None;
+        let Some(card) = self.hover_card.clone() else {
             return;
         };
         // 换了一条提交 → 重新取详情（统计信息要 `git show --numstat`）。
         let need_detail = self
-            .detail
+            .hover_detail
             .as_ref()
             .map(|d| !card.hash.is_empty() && !d.hash.starts_with(&card.hash))
             .unwrap_or(true);
@@ -1410,12 +1538,12 @@ impl ScmPanel {
                 hash: card.hash.clone(),
             });
         }
-        self.hover_card = Some(card.clone());
+        self.anchor_rect = Some(card.anchor);
 
         let anchor = card.anchor;
         let pos = egui::pos2(anchor.right() + 10.0, anchor.top());
         let mut copy = false;
-        let detail = self.detail.clone();
+        let detail = self.hover_detail.clone();
         let resp = egui::Area::new(egui::Id::new("scm_hover_card"))
             .fixed_pos(pos)
             .order(egui::Order::Middle)
@@ -1431,7 +1559,7 @@ impl ScmPanel {
                         // 第一行：作者 + 时间
                         ui.horizontal(|ui| {
                             let (icon_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(13.0, 14.0), egui::Sense::hover());
                             draw_codicon(
                                 ui.painter(),
                                 icon_rect.center(),
@@ -1439,16 +1567,16 @@ impl ScmPanel {
                                 Codicon::Account,
                                 hex(FG_DIM),
                             );
-                            ui.add_space(3.0);
+                            ui.add_space(1.0);
                             ui.label(
                                 RichText::new(card.author.clone())
                                     .size(12.5)
                                     .strong()
                                     .color(hex(REF_FG)),
                             );
-                            ui.add_space(12.0);
+                            ui.add_space(6.0);
                             let (icon_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(13.0, 14.0), egui::Sense::hover());
                             draw_codicon(
                                 ui.painter(),
                                 icon_rect.center(),
@@ -1456,7 +1584,7 @@ impl ScmPanel {
                                 Codicon::History,
                                 hex(FG_DIM),
                             );
-                            ui.add_space(3.0);
+                            ui.add_space(1.0);
                             let abs = format_absolute_time(&card.date);
                             ui.label(
                                 RichText::new(if abs.is_empty() {
@@ -1568,7 +1696,7 @@ impl ScmPanel {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             let (icon_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(13.0, 14.0), egui::Sense::hover());
                             draw_codicon(
                                 ui.painter(),
                                 icon_rect.center(),
@@ -1576,13 +1704,13 @@ impl ScmPanel {
                                 Codicon::GitCommit,
                                 hex(REF_FG),
                             );
-                            ui.add_space(4.0);
+                            ui.add_space(1.0);
                             ui.label(
                                 RichText::new(card.hash.clone())
                                     .size(12.5)
                                     .color(hex(REF_FG)),
                             );
-                            ui.add_space(10.0);
+                            ui.add_space(4.0);
                             let (btn_rect, btn) =
                                 ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                             if btn.hovered() {
@@ -1603,148 +1731,10 @@ impl ScmPanel {
                         });
                     });
             });
-        // 指针在卡片上时保持打开（否则点不到「复制」按钮）。
-        {
-            let rect = resp.response.rect;
-            self.card_hovered = ui
-                .ctx()
-                .pointer_hover_pos()
-                .map(|p| rect.contains(p))
-                .unwrap_or(false);
-        }
+        // 记录卡片矩形（下一帧算「保持显示」范围用）。
+        self.card_rect = Some(resp.response.rect);
         if copy {
             actions.push(Action::CopyHash(card.hash.clone()));
-        }
-    }
-
-    // ---- 提交详情卡片 ----
-
-    fn draw_detail(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let Some(detail) = self.detail.clone() else { return };
-        ui.add_space(6.0);
-        let frame = egui::Frame::popup(ui.style())
-            .fill(hex("#252526"))
-            .stroke(egui::Stroke::new(1.0_f32, hex(BORDER)))
-            .inner_margin(egui::Margin::same(8.0))
-            .rounding(4.0);
-        let mut close = false;
-        let mut show_diff = false;
-        let diff_text = self.detail_diff.clone();
-        frame.show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let (icon_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                draw_codicon(
-                    ui.painter(),
-                    icon_rect.center(),
-                    14.0,
-                    Codicon::Account,
-                    hex(FG_DIM),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(detail.author.clone())
-                        .size(12.0)
-                        .strong()
-                        .color(hex(FG)),
-                );
-                ui.label(
-                    RichText::new(relative_time(&detail.date))
-                        .size(11.0)
-                        .color(hex(FG_DIM)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (close_rect, resp) =
-                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                    draw_codicon(
-                        ui.painter(),
-                        close_rect.center(),
-                        14.0,
-                        Codicon::Close,
-                        hex(FG_DIM),
-                    );
-                    if resp.clicked() {
-                        close = true;
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            ui.label(RichText::new(detail.subject.clone()).size(12.5).color(hex(FG)));
-            if !detail.body.is_empty() {
-                ui.add_space(2.0);
-                ui.label(RichText::new(detail.body.clone()).size(12.0).color(hex(FG_DIM)));
-            }
-            ui.add_space(4.0);
-            ui.label(RichText::new(detail.summary()).size(12.0).color(hex(FG_DIM)));
-            ui.add_space(4.0);
-            for f in &detail.files {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(f.path.clone()).size(12.0).color(hex(FG)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if f.deletions > 0 {
-                            ui.label(
-                                RichText::new(format!("-{}", f.deletions))
-                                    .size(11.0)
-                                    .color(hex(CHANGED_DELETED)),
-                            );
-                        }
-                        if f.insertions > 0 {
-                            ui.label(
-                                RichText::new(format!("+{}", f.insertions))
-                                    .size(11.0)
-                                    .color(hex(CHANGED_ADDED)),
-                            );
-                        }
-                    });
-                });
-            }
-            if !diff_text.is_empty() {
-                ui.add_space(4.0);
-                let show = ui
-                    .add(
-                        egui::Label::new(
-                            RichText::new("显示差异")
-                                .size(12.0)
-                                .color(hex(ACCENT_TEXT))
-                                .underline(),
-                        )
-                        .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text("显示该提交的 diff");
-                if show.clicked() {
-                    show_diff = true;
-                }
-                ui.add_space(2.0);
-                egui::ScrollArea::vertical()
-                    .max_height(200.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for line in ide_git::diff::classify_diff(&diff_text) {
-                            let color = match line.kind {
-                                ide_git::diff::DiffLineKind::Added => hex(CHANGED_ADDED),
-                                ide_git::diff::DiffLineKind::Removed => hex(CHANGED_DELETED),
-                                ide_git::diff::DiffLineKind::HunkHeader => hex("#9cdcfe"),
-                                ide_git::diff::DiffLineKind::Context => hex("#858585"),
-                            };
-                            ui.label(
-                                RichText::new(line.text.as_str())
-                                    .monospace()
-                                    .size(10.5)
-                                    .color(color),
-                            );
-                        }
-                    });
-            }
-        });
-        if close {
-            actions.push(Action::CloseDetail);
-        }
-        if show_diff {
-            actions.push(Action::ShowCommitDiff {
-                repo: self.detail_repo,
-                hash: self.detail.as_ref().map(|d| d.hash.clone()).unwrap_or_default(),
-            });
         }
     }
 }
