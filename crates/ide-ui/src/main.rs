@@ -4991,34 +4991,94 @@ impl LiteIdeApp {
         let mut close: Option<usize> = None;
         let mut pin: Option<usize> = None;
         let mut last_tab_click = self.tab_last_click;
+        // VS Code：所有标签**等宽**（按最长的那个算），右侧**预留叉叉的位置**，
+        // 叉叉默认不画、鼠标移到标签上才出现 —— 这样叉叉不会压住标题。
+        const TAB_X_SLOT: f32 = 24.0;
+        const TAB_PAD_X: f32 = 9.0;
+        const TAB_MAX_W: f32 = 340.0;
+        let mono = egui::FontId::monospace(12.0);
+        // 标签标题（含「未保存」标记）
+        let label_text = |t: &Tab| -> String {
+            let mut s = t.title.clone();
+            if t.dirty {
+                s.push_str(" — ");
+            }
+            s
+        };
+        // 标题排版（和下面画的时候用同一套，保证宽度一致）
+        let layout_label = |ui: &egui::Ui, text: &str, color: egui::Color32, italic: bool| {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                text,
+                0.0,
+                egui::text::TextFormat {
+                    font_id: mono.clone(),
+                    color,
+                    italics: italic,
+                    ..Default::default()
+                },
+            );
+            ui.painter().layout_job(job)
+        };
+        // 所有标签等宽：按最长的标题算宽度
+        let mut max_label_w: f32 = 0.0;
+        for (i, t) in self.tabs.iter().enumerate() {
+            let preview = self.tabs.is_preview(i);
+            let w = layout_label(ui, &label_text(t), hex("#ffffff"), preview).size().x;
+            max_label_w = max_label_w.max(w);
+        }
+        let tab_w = (max_label_w + TAB_X_SLOT + TAB_PAD_X * 2.0).min(TAB_MAX_W);
+        let text_w = (tab_w - TAB_X_SLOT - TAB_PAD_X * 2.0).max(20.0);
         ui.horizontal(|ui| {
             ui.set_min_height(34.0);
             for i in 0..n {
-                let (title, dirty, active, preview) = {
+                let (dirty, active, preview) = {
                     let Some(t) = self.tabs.get(i) else { continue };
                     let preview = self.tabs.is_preview(i);
-                    (t.title.clone(), t.dirty, i == self.tabs.active(), preview)
+                    (t.dirty, i == self.tabs.active(), preview)
                 };
+                let text_color = if active { hex("#ffffff") } else { hex("#999999") };
+                let bg = if active { hex(p.bg_editor) } else { egui::Color32::TRANSPARENT };
+                let title = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
                 let mut label = title.clone();
                 if dirty {
                     label.push_str(" — ");
                 }
-                let text_color = if active { hex("#ffffff") } else { hex("#999999") };
-                let bg = if active { hex(p.bg_editor) } else { egui::Color32::TRANSPARENT };
-                // 预览（未锁定）标签用斜体区分，与 VS Code 一致。
-                let mut text =
-                    egui::RichText::new(&label).monospace().size(12.0).color(text_color);
-                if preview {
-                    text = text.italics();
+                // 太长就截断（标题不能被叉叉压住）
+                if layout_label(ui, &label, text_color, preview).size().x > text_w {
+                    let mut n = label.chars().count();
+                    while n > 1 {
+                        n -= 1;
+                        let mut s: String = label.chars().take(n).collect();
+                        s.push('…');
+                        if layout_label(ui, &s, text_color, preview).size().x <= text_w {
+                            label = s;
+                            break;
+                        }
+                    }
                 }
-                let mut resp = ui
-                    .add(
-                        egui::Button::new(text)
-                            .fill(bg)
-                            .min_size(egui::vec2(0.0, 30.0))
-                            .stroke(egui::Stroke::new(0.0f32, egui::Color32::TRANSPARENT)),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                // 自己画标签（不用 Button）：文字左对齐 + 右侧留出叉叉的位置。
+                // 注意：`allocate_exact_size` 只负责占位，**不做交互**，
+                // 所以还要 `ui.interact` 一次才有 hover / click。
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(tab_w, 30.0),
+                    egui::Sense::click(),
+                );
+                let mut resp =
+                    ui.interact(rect, egui::Id::new(("tab", i)), egui::Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                ui.painter().rect_filled(rect, 0.0, bg);
+                // 标题（左对齐、垂直居中）
+                let galley = layout_label(ui, &label, text_color, preview);
+                let gsize = galley.size();
+                ui.painter().add(egui::Shape::galley(
+                    egui::pos2(
+                        rect.left() + TAB_PAD_X,
+                        rect.center().y - gsize.y * 0.5,
+                    ),
+                    galley,
+                    text_color,
+                ));
                 if preview {
                     resp = resp.on_hover_text(
                         "预览标签：双击标签页（或在文件中编辑）即锁定，否则下次打开文件会被替换",
@@ -5030,8 +5090,8 @@ impl LiteIdeApp {
                     // 那样标签条会跟着变灰。
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(
-                            resp.rect.left_top(),
-                            egui::vec2(resp.rect.width(), TAB_ACTIVE_INDICATOR_H),
+                            rect.left_top(),
+                            egui::vec2(rect.width(), TAB_ACTIVE_INDICATOR_H),
                         ),
                         0.0,
                         hex(p.tab_active_border),
@@ -5052,7 +5112,7 @@ impl LiteIdeApp {
                 }
                 if resp.hovered() {
                     let x = egui::Rect::from_center_size(
-                        egui::pos2(resp.rect.right() - 12.0, resp.rect.center().y),
+                        egui::pos2(rect.right() - TAB_X_SLOT * 0.5, rect.center().y),
                         egui::vec2(16.0, 16.0),
                     );
                     let hit = ui.interact(x, egui::Id::new(("tab_close", i)), egui::Sense::click());
@@ -9284,6 +9344,57 @@ mod tests {
         assert!(!collapsed.contains("Ctrl+Enter to commit on"), "折叠后不应有 message 框");
         assert!(!collapsed.contains("main.cpp"), "折叠后不应有文件列表");
         assert!(collapsed.contains("repo"), "折叠后仍应显示仓库名");
+    }
+
+    /// 标签标题不能被关闭按钮压住（VS Code：右侧给叉叉预留位置）。
+    #[test]
+    fn tab_title_does_not_overlap_close_button() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.tabs.open_untitled();
+        if let Some(t) = app.tabs.get_mut(0) {
+            t.title = "MakeLists.txt".to_string();
+        }
+        // 第一帧：用标签栏自己画，找到标题的位置
+        let out = ctx.run(probe_raw_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_bar(ui));
+        });
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("MakeLists") => {
+                    Some(t.pos + egui::vec2(t.galley.size().x * 0.5, t.galley.size().y * 0.5))
+                }
+                _ => None,
+            })
+            .expect("应画出标签标题");
+        // 第二帧：指针移到标题上 → 出现叉叉，且不压住标题
+        let mut input = probe_raw_input();
+        input.events.push(egui::Event::PointerMoved(pos));
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_bar(ui));
+        });
+        let mut title_right = 0.0_f32;
+        let mut x_left = f32::MAX;
+        for cs in &out.shapes {
+            if let egui::Shape::Text(t) = &cs.shape {
+                let txt = t.galley.text().to_string();
+                if txt.contains("MakeLists") {
+                    title_right = title_right.max(t.pos.x + t.galley.size().x);
+                }
+                if txt == "\u{ea76}" {
+                    x_left = x_left.min(t.pos.x);
+                }
+            }
+        }
+        assert!(title_right > 0.0, "应画出标签标题");
+        assert!(x_left < f32::MAX, "悬停时应画出关闭按钮");
+        assert!(
+            title_right <= x_left,
+            "标题右边缘 {title_right} 不应超过叉叉左边缘 {x_left}"
+        );
     }
 
     /// 标签页的关闭按钮：VS Code 默认不显示，鼠标移上去才出现。
