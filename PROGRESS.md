@@ -23,6 +23,42 @@ Rust 写的轻量 IDE，Windows + WSL2(Ubuntu2404) 下做 C++ 开发，对标 VS
 - **clangd 主线程 comm 名是 `clangd.main`**——WSL 里 kill clangd 必须 `pkill -f clangd`，`pkill -x clangd` 匹配不到（已实测）
 - WSL 工具链已装好（`scripts/setup-wsl.sh` 幂等安装，全部就位）：clangd 18.1.3、cmake 3.28.3、ninja 1.11.1、bear 3.1.3、gdb 15.1、git 2.43.0、rg 14.1.0、gcc/g++ 13.3.0
 - 环境变量：`LITEIDE_LSP_CMD` 整条覆盖 LSP 启动命令；`LITEIDE_WSL_DISTRO` 指定发行版；`LITEIDE_GDB_CMD`（整条覆盖 gdb）、`LITEIDE_DEBUG_BIN`（调试二进制优先）；`LITEIDE_RG_CMD`（整条覆盖 rg）、`LITEIDE_GIT_CMD`（整条覆盖 git，测试用 Windows git 时设为 `git`）；阶段 5 新增 `LITEIDE_NO_CJK=1`（跳过 CJK 字体加载，内存诊断用，正常使用不要设）
+- **Python 在 `D:\Python311\python.exe`（3.11.9），不在 PATH 上**：
+  - 要在 PowerShell 里直接用 python：`$env:PATH = "D:\Python311;$env:PATH"`（只对当前会话有效）；
+  - `ide-dap` 的 mock gdb 测试（`crates/ide-dap/tests/mock_gdb.py`）需要 python，
+    测试里已改成自动找 `D:\Python311\python.exe`（找不到才回退到 PATH 上的 `python`），
+    所以 `cargo test --workspace` 现在不用改 PATH 也能全绿。
+
+## 手动重新编译（常用命令）
+
+```powershell
+cd E:\TestDeepSeek
+
+# 1) 调试版（改完代码想立刻看效果用这个）
+cargo build -p ide-ui
+.\target\debug\liteide.exe
+
+# 2) 发布版（带 LTO，慢一点但只有 ~11 MB）
+cargo build --release
+.\target\release\liteide.exe
+
+# 3) 只编译 + 跑测试 / 静态检查（提交前跑一遍）
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+# 4) 一键全量 CI（fmt + release + test + clippy）
+powershell -ExecutionPolicy Bypass -File scripts\ci.ps1
+
+# 5) 打包成 dist/ + ZIP（+ 有 Inno Setup 时做安装包）
+powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
+```
+
+注意：
+- 编译前先关掉正在运行的 `liteide.exe`（否则 `target\debug\liteide.exe` 被占用，会报
+  “拒绝访问”）；必要时 `Stop-Process -Name liteide -Force`。
+- **不要 `rustup update`**（本机 Rust 固定在 stable 1.99.1，见 `rust-toolchain.toml`）。
+- 想让 IDE 启动时直接打开「源代码管理」视图自检：`$env:LITEIDE_OPEN_SCM="1"; .\target\debug\liteide.exe`。
+- 依赖走 rsproxy 源（`.cargo/config.toml` 已配），网络不通时会卡在下载依赖。
 
 ## 目录结构
 

@@ -26,12 +26,23 @@ fn mock_script() -> PathBuf {
 const BIN: &str = r"E:\TestDeepSeek\testdata\debug_target";
 const SRC: &str = r"E:\TestDeepSeek\testdata\debug_target.cpp";
 
+/// 找 python 解释器：先找 PATH 上的 `python`，找不到就用本机装的
+/// `D:\Python311\python.exe`（这台机器的 Python 不在 PATH 上，
+/// 否则 mock gdb 起不来，测试会一直等不到事件）。
+fn python_cmd() -> String {
+    let local = r"D:\Python311\python.exe";
+    if std::path::Path::new(local).exists() {
+        return local.to_string();
+    }
+    "python".to_string()
+}
+
 /// 设置 mock 环境变量并返回守卫（测试结束前必须 remove_var 再释放守卫）。
 /// 同一进程并行测试会互相覆盖环境变量，故用静态互斥锁串行化；
 /// 前一个测试失败可能导致锁被污染（poison），用 into_inner 恢复。
 fn with_mock_env() -> std::sync::MutexGuard<'static, ()> {
     let guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    let cmdline = format!("python {}", mock_script().display());
+    let cmdline = format!("{} {}", python_cmd(), mock_script().display());
     unsafe { std::env::set_var("LITEIDE_GDB_CMD", &cmdline) };
     guard
 }
