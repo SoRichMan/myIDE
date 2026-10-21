@@ -279,6 +279,7 @@ impl GitManager {
                         let tx = ev_tx.clone();
                         tokio::spawn(async move {
                             // 一次拿两样：--numstat 给增删行数，--name-status 给状态字母。
+                            // 两个 git 调用并发跑（WSL 启动本来就慢，串行要等两倍时间）。
                             let args = [
                                 "show",
                                 "--no-color",
@@ -287,15 +288,25 @@ impl GitManager {
                                 "--format=%H%x00%an%x00%ae%x00%ad%x00%s%x00%b%x1e",
                                 &hash,
                             ];
-                            let Ok((ok, out)) = run_git(&root, &args).await else {
+                            let status_args = [
+                                "show",
+                                "--no-color",
+                                "--format=",
+                                "--name-status",
+                                &hash,
+                            ];
+                            let (numstat, name_status) = tokio::join!(
+                                run_git(&root, &args),
+                                run_git(&root, &status_args)
+                            );
+                            let Ok((ok, out)) = numstat else {
                                 return;
                             };
                             if !ok {
                                 return;
                             }
                             let mut detail = parse_commit_detail(&out);
-                            let status_args = ["show", "--no-color", "--format=", "--name-status", &hash];
-                            if let Ok((true, sout)) = run_git(&root, &status_args).await {
+                            if let Ok((true, sout)) = name_status {
                                 for (st, path) in parse_name_status(&sout) {
                                     if let Some(f) =
                                         detail.files.iter_mut().find(|f| f.path == path)

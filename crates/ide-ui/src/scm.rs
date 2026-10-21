@@ -218,6 +218,12 @@ pub struct ScmPanel {
     pub anchor_rect: Option<egui::Rect>,
     /// 悬停提交的详情（用于信息卡里的统计），与选中的详情分开存。
     pub hover_detail: Option<CommitDetail>,
+    /// 已经请求过详情的悬停提交（短 SHA）。
+    ///
+    /// 悬停时**每帧**都会走到这里，如果每次都发一次 git 请求，
+    /// 一秒钟能发几十个 `git show`，把 git 队列塞满 → 点提交时排队好几秒。
+    /// 所以只在这条提交第一次被悬停时请求一次。
+    pub hover_requested: Option<String>,
     /// 工作区根目录（用于发现仓库）。
     pub root: String,
 }
@@ -1574,13 +1580,12 @@ impl ScmPanel {
         let Some(card) = self.hover_card.clone() else {
             return;
         };
-        // 换了一条提交 → 重新取详情（统计信息要 `git show --numstat`）。
-        let need_detail = self
-            .hover_detail
-            .as_ref()
-            .map(|d| !card.hash.is_empty() && !d.hash.starts_with(&card.hash))
-            .unwrap_or(true);
-        if need_detail {
+        // 换了一条提交 → 请求一次详情（统计信息要 `git show --numstat`）。
+        // 关键：**同一条提交只请求一次**，否则每帧都发 git 请求会把队列塞满。
+        if self.hover_requested.as_deref() != Some(card.hash.as_str()) {
+            self.hover_requested = Some(card.hash.clone());
+            // 换提交了：旧的统计作废，等新详情回来。
+            self.hover_detail = None;
             actions.push(Action::RequestDetail {
                 repo: card.repo,
                 hash: card.hash.clone(),

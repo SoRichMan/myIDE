@@ -5050,8 +5050,26 @@ impl LiteIdeApp {
                 if resp.middle_clicked() {
                     close = Some(i); // 中键 → 关闭（VS Code 习惯）
                 }
-                if ui.small_button("×").on_hover_text("关闭标签").clicked() {
-                    close = Some(i);
+                if resp.hovered() {
+                    let x = egui::Rect::from_center_size(
+                        egui::pos2(resp.rect.right() - 12.0, resp.rect.center().y),
+                        egui::vec2(16.0, 16.0),
+                    );
+                    let hit = ui.interact(x, egui::Id::new(("tab_close", i)), egui::Sense::click());
+                    if hit.hovered() {
+                        ui.painter().rect_filled(x, 3.0, hex("#ffffff").gamma_multiply(0.1));
+                    }
+                    draw_codicon(
+                        ui.painter(),
+                        x.center(),
+                        14.0,
+                        Codicon::Close,
+                        if hit.hovered() { hex("#ffffff") } else { hex("#999999") },
+                    );
+                    if hit.clicked() {
+                        close = Some(i);
+                    }
+                    hit.on_hover_text("关闭标签");
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5504,6 +5522,27 @@ impl LiteIdeApp {
             .exact_width(width)
             .frame(egui::Frame::none().fill(hex(bg)))
             .show(ctx, |ui| {
+                // 侧栏滚轮：egui 的 `smooth_scroll_delta` 会把一格滚轮摊到十几帧里，
+                // 而我们是**按需重绘**的 → 滚轮几乎没反应。
+                // 这里直接把原始滚轮增量塞回去（和编辑器 / Ctrl+P 列表一个套路）。
+                let panel_rect = ui.max_rect();
+                if ui.rect_contains_pointer(panel_rect) {
+                    let mut wheel = 0.0_f32;
+                    for ev in ui.input(|i| i.events.clone()) {
+                        if let egui::Event::MouseWheel { unit, delta, .. } = ev {
+                            wheel += match unit {
+                                // 一格滚轮 ≈ 3 行（VS Code 的 mouseWheelScrollSensitivity）
+                                egui::MouseWheelUnit::Line => delta.y * 60.0,
+                                // 触控板：按像素 1:1
+                                egui::MouseWheelUnit::Point => delta.y,
+                                egui::MouseWheelUnit::Page => delta.y * 400.0,
+                            };
+                        }
+                    }
+                    if wheel != 0.0 {
+                        ui.ctx().input_mut(|i| i.smooth_scroll_delta = egui::vec2(0.0, wheel));
+                    }
+                }
                 ui.add_space(4.0);
                 match self.sidebar_content {
                     SidebarContent::Explorer => self.draw_explorer_content(ui),
@@ -6722,6 +6761,7 @@ enum Codicon {
     CloudDownload,  // eac2 cloud-download
     CloudUpload,    // eac3 cloud-upload
     Account,        // eb99 account
+    Close,          // ea76 close（标签页关闭按钮）
     Repo,           // ea62 repo
     History,        // ea82 history（时钟）
     GitCommit,      // eafc git-commit
@@ -6819,6 +6859,7 @@ impl Codicon {
             Codicon::CloudDownload => 0xeac2,
             Codicon::CloudUpload => 0xeac3,
             Codicon::Account => 0xeb99,
+            Codicon::Close => 0xea76,
             Codicon::Repo => 0xea62,
             Codicon::History => 0xea82,
             Codicon::GitCommit => 0xeafc,
@@ -9245,6 +9286,78 @@ mod tests {
         assert!(collapsed.contains("repo"), "折叠后仍应显示仓库名");
     }
 
+    /// 标签页的关闭按钮：VS Code 默认不显示，鼠标移上去才出现。
+    #[test]
+    fn tab_close_button_only_shows_on_hover() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.tabs.open_untitled();
+        let has_close = |out: &egui::FullOutput| {
+            out.shapes.iter().any(|cs| {
+                matches!(&cs.shape, egui::Shape::Text(t) if t.galley.text() == "\u{ea76}")
+            })
+        };
+        // 不悬停：没有叉叉
+        let out = ctx.run(probe_raw_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_bar(ui));
+        });
+        assert!(!has_close(&out), "默认不应显示关闭按钮");
+        // 悬停在标签上：出现叉叉
+        let mut input = probe_raw_input();
+        input.events.push(egui::Event::PointerMoved(egui::pos2(40.0, 17.0)));
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_bar(ui));
+        });
+        assert!(has_close(&out), "悬停时应显示关闭按钮");
+    }
+
+    /// 悬停同一条提交时，详情请求只发一次（否则每帧都发 git 请求会拖垮整个队列）。
+    #[test]
+    fn hover_requests_commit_detail_only_once() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.scm.set_repos(vec![scm_repo()]);
+        app.sidebar_content = SidebarContent::SourceControl;
+        app.settings.show_sidebar = true;
+        // 第一帧：找到提交标题的位置
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("fix broken edge API") => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("应画出提交标题");
+        let count = |out: &egui::FullOutput| -> usize {
+            out.shapes.len()
+        };
+        let _ = count;
+        // 悬停：连续几帧，只有第一帧发一次请求。
+        let mut input = probe_raw_input();
+        input.events.push(egui::Event::PointerMoved(pos));
+        let mut requested = 0;
+        for _ in 0..3 {
+            let mut acts: Vec<scm::Action> = Vec::new();
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    acts = app.scm.draw(ui);
+                });
+            });
+            requested += acts
+                .iter()
+                .filter(|a| matches!(a, scm::Action::RequestDetail { .. }))
+                .count();
+            input = probe_raw_input();
+            input.events.push(egui::Event::PointerMoved(pos));
+        }
+        assert_eq!(requested, 1, "同一条提交只应请求一次详情，实际 {requested} 次");
+    }
+
     /// 悬停 GRAPH 里的某条提交 → 弹出信息卡片（作者 / 时间 / 标题 / 统计 / SHA + 复制按钮）。
     #[test]
     fn hovering_a_commit_shows_info_card() {
@@ -9273,6 +9386,8 @@ mod tests {
             .expect("应画出提交标题");
 
         // 预置提交详情（相当于 `git show --numstat` 的结果；悬停用 hover_detail）。
+        // 同时标记「已请求过」，避免测试里再发一次请求把预置的详情清掉。
+        app.scm.hover_requested = Some("abc1234".into());
         app.scm.hover_detail = Some(ide_git::log::CommitDetail {
             hash: "abc1234def".into(),
             author: "Alice".into(),

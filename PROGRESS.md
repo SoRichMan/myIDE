@@ -1707,6 +1707,46 @@ GRAPH
 
 ---
 
+## 第二十二轮：点提交秒回 / 标签页叉叉只在悬停时出现 / 侧栏滚轮（2026-10-21）
+
+用户三条反馈：
+
+### 1. 点一条提交要好几秒才出结果
+
+- **根因：悬停时每帧都在发 git 请求**。
+  `draw_hover_card` 里「详情还没到就再请求一次」的判断每帧都成立 →
+  一秒钟能发几十个 `git show`（每个都要起一个 `wsl.exe`）→
+  git 队列被塞满，点提交时排在后面 → 好几秒。
+- 修复：**同一条提交只请求一次**（新增 `hover_requested` 记住已请求的短 SHA），
+  换提交时才发新请求；顺带把旧的 `hover_detail` 清掉。
+- 另外把 `git show --numstat` 和 `git show --name-status` **并发**跑
+  （原来是串行，两个 WSL 启动叠加）→ 详情延迟从 ~220ms 降到 ~110ms。
+- 顺带修了另一个「点了没反应」的老毛病：git 数据回来后 IDE 是**按需重绘**的，
+  不主动 `request_repaint()` 的话面板要等鼠标再动一下才刷新（上一轮已补）。
+
+### 2. 标签页的叉叉和 VS Code 不一致
+
+- VS Code：**默认不显示叉叉，鼠标移到标签上才出现**（改过的标签显示圆点）；
+- 之前每个标签都常驻一个 `×` 按钮；
+- 现在改成：悬停该标签时在右侧画 codicon `close`（`ea76`）+ 圆角底色 + 提示，
+  平时不画；中键关闭的行为保留。
+
+### 3. 顺带修好：侧栏面板用滚轮滚不动
+
+- egui 0.28 的 `smooth_scroll_delta` 会把一格滚轮摊到十几帧里慢慢放出来
+  （`unprocessed_scroll_delta` 的指数平滑），而 IDE 是**按需重绘**的 →
+  剩下的量永远等不到下一帧 → 侧栏（资源管理器 / 源代码管理）几乎滚不动；
+- 修复：侧栏面板里直接读原始 `Event::MouseWheel`，一格 = 3 行（60px），
+  写回 `smooth_scroll_delta`（和编辑器 / Ctrl+P 列表一个套路）。
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --workspace` | ✅ 全部通过（新增 `tab_close_button_only_shows_on_hover`、`hover_requests_commit_detail_only_once`） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 warning |
+| 实测 | 单条 `git show` 走 WSL 约 110ms；并发后详情 ~0.15s 出来，不再是好几秒 |
+
+---
+
 ## 下一步任务：项目主体已完成
 
 myIDE.md 阶段 0-6 全部交付。后续仅按需处理技术债清单，不主动开工。
