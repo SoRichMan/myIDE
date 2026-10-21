@@ -83,11 +83,17 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec { id: "terminal.kill", title: "Terminal: Kill Active Terminal", zh: "结束活动终端", category: "Terminal", shortcut: "", safe: false },
         CommandSpec { id: "terminal.openWsl", title: "Terminal: Open in WSL", zh: "在 WSL 中打开终端", category: "Terminal", shortcut: "", safe: false },
         // ---- Git ----
-        CommandSpec { id: "git.openPanel", title: "Git: Open Panel", zh: "打开 Git 面板", category: "Git", shortcut: "Ctrl+Shift+G", safe: false },
+        CommandSpec { id: "git.openPanel", title: "Git: Open Source Control View", zh: "打开源代码管理视图", category: "Git", shortcut: "Ctrl+Shift+G", safe: false },
         CommandSpec { id: "git.refresh", title: "Git: Refresh Status", zh: "刷新 Git 状态", category: "Git", shortcut: "", safe: false },
         CommandSpec { id: "git.commit", title: "Git: Commit…", zh: "提交更改", category: "Git", shortcut: "", safe: false },
         CommandSpec { id: "git.diffActive", title: "Git: Diff Active File", zh: "查看活动文件差异", category: "Git", shortcut: "", safe: false },
         CommandSpec { id: "git.showHistory", title: "Git: Show History", zh: "查看提交历史", category: "Git", shortcut: "", safe: false },
+        CommandSpec { id: "git.stageAll", title: "Git: Stage All Changes", zh: "暂存所有更改", category: "Git", shortcut: "", safe: false },
+        CommandSpec { id: "git.unstageAll", title: "Git: Unstage All Changes", zh: "取消暂存所有更改", category: "Git", shortcut: "", safe: false },
+        CommandSpec { id: "git.discardAll", title: "Git: Discard All Changes", zh: "丢弃所有更改", category: "Git", shortcut: "", safe: false },
+        CommandSpec { id: "git.sync", title: "Git: Sync", zh: "同步更改（拉取 + 变基）", category: "Git", shortcut: "", safe: false },
+        CommandSpec { id: "git.pull", title: "Git: Pull", zh: "拉取", category: "Git", shortcut: "", safe: false },
+        CommandSpec { id: "git.push", title: "Git: Push", zh: "推送", category: "Git", shortcut: "", safe: false },
         // ---- Settings ----
         CommandSpec { id: "settings.open", title: "Settings", zh: "打开设置", category: "Settings", shortcut: "Ctrl+,", safe: true },
         CommandSpec { id: "settings.increaseFont", title: "Increase Font Size", zh: "增大字号", category: "Settings", shortcut: "Ctrl+Plus", safe: false },

@@ -3,6 +3,9 @@
 use std::time::Duration;
 use tokio::process::Command;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 pub const WSL_EXE: &str = "wsl.exe";
 const GIT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -37,7 +40,8 @@ pub fn win_to_wsl_path(p: &str) -> String {
     }
 }
 
-fn shell_quote(s: &str) -> String {
+/// shell 引号（命令拼装用）。
+pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -88,6 +92,26 @@ pub async fn run_git(root_win: &str, args: &[&str]) -> Result<(bool, String), St
     };
     let ok = out.status.success();
     Ok((ok, String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// 同步地在 WSL 里跑一条 shell 命令（阻塞）。
+///
+/// 只在「切换工作区、发现仓库」这类一次性场合使用；
+/// 日常的 git 操作走 `run_git`（异步）。
+pub fn run_wsl_blocking(distro: &str, script: &str) -> Result<String, String> {
+    let mut c = std::process::Command::new(WSL_EXE);
+    c.args(["-d", distro, "--", "bash", "-lc", script]);
+    #[cfg(windows)]
+    {
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = c
+        .output()
+        .map_err(|e| format!("wsl 命令失败: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]

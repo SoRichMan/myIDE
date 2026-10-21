@@ -78,7 +78,7 @@ E:\TestDeepSeek\
 └── target\release\liteide.exe  9.68 MB
 ```
 
-## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十五轮 Ctrl+左键跳转定义 + 跳转历史 + 缓存）
+## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十六轮 VS Code 风格的源代码管理面板 CHANGES + GRAPH）
 
 ### 已交付
 
@@ -1385,6 +1385,95 @@ LSP 路径（`ide-lsp/src/path_map.rs`）新增 `posix_to_uri` / `uri_to_posix`�
 | 真机：滚轮方向设置 | ✅ 编辑器里 `normal` / `reversed` 切换立即生效；**终端不受影响**（已按要求回退） |
 | 真机：Terminal 光标位置 | ✅ 300 行历史下光标块正好落在提示符末尾（修复前：光标不画 / 偏到中间） |
 | 真机：Terminal 往回翻后输入 | ✅ 输入即刻跳回最新输出，提示符与光标对齐 |
+
+---
+
+## 第十六轮：VS Code 风格的「源代码管理」面板（CHANGES + GRAPH）（2026-10-21）
+
+用户需求：**完善任务资源文件管理** —— 开发一个和 VS Code 自带的 Git 管理面板相似的功能，
+涵盖基本 git 操作、git 提交记录，**图标 / 位置 / 操作方式都尽量与 VS Code 一致**（参考用户截图）。
+
+### 一、整体形态：从「浮动窗口」改成「侧栏视图」
+
+- 之前只有一个自造的浮动窗口 `Git (Ctrl+Shift+G)`（`egui::Window`），和 VS Code 完全不同；
+- 现在改成 **VS Code 的 Source Control 视图**：活动栏的源代码管理图标（codicon `ea68`）
+  点开 → **左侧侧栏**显示 `SOURCE CONTROL` 视图（`SidebarContent::SourceControl`）；
+- `Ctrl+Shift+G` 同样切到该视图（VS Code 语义：聚焦 SCM 视图，而不是弹窗）；
+- 视图宽度默认 340 px（VS Code 的 SCM 比资源管理器宽，要放提交信息框 + 提交按钮），
+  用户拖过分隔线后保留用户宽度；
+- 删掉了原来的浮动窗口实现（`draw_git_panel`）与它独占的 4 个状态字段。
+
+### 二、面板结构（对齐用户截图）
+
+```
+SOURCE CONTROL                       ⋯      ← 视图标题 + 更多操作菜单
+CHANGES
+  ⑂ candanza   master  ↺ ⟳ + ✓ ⟳ ⋯   ← 每个仓库一个分组（VS Code 多仓库工作区）
+    Message (Ctrl+Enter to commit on "master")
+    [ ✓ 提交                    ▾ ]
+    ▾ 暂存的更改 (2)
+        M src/main.cpp
+    ▾ 更改 (3)
+        M src/other.cpp
+  ⑂ scripts    master  ↺ ⟳ + ✓ ⟳ ⋯
+    Message (Ctrl+Enter to commit on "master")
+    [ ✓ 提交                    ▾ ]
+GRAPH
+  ⑂ candanza            ⇣ ⇡ ⟳ ⋯
+  ● test(nbmias): restore bug174…  [master][origin/master]   gezijian
+  ● Fragment modify stage 4                                  fubin
+  ┌ 提交详情卡片（作者 / 相对时间 / 标题 / 正文 / 改动文件 + 增删行数 / diff）┐
+```
+
+- **多仓库**：工作区里有几个 git 仓库就显示几个 CHANGES 分组（根 + 一级子目录，
+  和 VS Code 一致，不会把 `external/` 里的第三方仓库也列出来）；
+  远程（WSL）工作区在 WSL 里 `find` 一次拿仓库列表。
+- **提交信息框**：占位提示文案与 VS Code 完全一致
+  `Message (Ctrl+Enter to commit on "master")`，背景用 `input.background` (#3c3c3c)；
+  `Ctrl+Enter` 直接提交。
+- **提交按钮**：蓝色主按钮 + 右侧 `▾` 下拉段（下拉里是 提交 / 提交并推送 / 修补上一次提交），
+  语义与 VS Code 一致：**只提交已暂存内容**（不再像老实现那样先 `git add -A`）。
+- **文件列表**：`暂存的更改` / `更改` 两组，状态字母用 VS Code 的 gitDecoration 配色
+  （M 黄 / A 绿 / D 红 / U 绿）；路径是「灰色目录前缀 + 正常色文件名」，放不下时只截断目录前缀；
+  悬停出现行内操作（暂存 `+` / 取消暂存 `–` / 丢弃 `↺`），点文件 = 看 diff + 在编辑器里打开。
+- **GRAPH 段**：提交列表（蓝点 + 竖线 = 提交图）、标题按可用宽度截断、
+  分支标签（`master` / `origin/master`）用蓝色描边 chip、作者右对齐灰色；
+  点某条提交 → 下方出**详情卡片**（作者 / 相对时间「22 hours ago」/ 标题 / 正文 /
+  `1 file changed, 70 insertions(+), 61 deletions(-)` / 每个文件的 +– 行数 / 该提交的 diff）。
+
+### 三、后端（`ide-git`）扩展
+
+- `log.rs`：`GitCommit` 增加 `full/email/parents/refs`；`%D` 解析引用标签（`HEAD -> master`）；
+  新增 `CommitDetail`（作者 / 正文 / 改动文件与增删行数，`git show --numstat`）。
+- `branch.rs`：`git branch -a --format=…` 解析本地 / 远程分支与当前分支。
+- `porcelain.rs`：`GitStatus` 增加 `upstream/ahead/behind`，并区分
+  `staged()` / `unstaged()` / `untracked()`。
+- `manager.rs`：命令扩到 19 个（stage/unstage/discard/全部操作/commit/commit --amend/
+  checkout/create branch/push/pull/sync/diff/commit detail/commit diff…），
+  **所有事件都带上仓库根路径**，UI 才能同时管多个仓库。
+- `repos.rs`：仓库发现（本地扫目录；远程在 WSL 里 `find`，一次调用搞定）。
+
+### 四、图标
+
+- codicon 全部用 VS Code 的真 codepoint（从本机 VS Code 的 `codicon.css` 里核对）：
+  分支 `ea68`、check `eab2`、discard `eae2`、sync `ea77`、cloud-download `eac2`、
+  cloud-upload `eac3`、remove `eb3b`、account `eb99`、close `ea76`；
+  新增的码位都进了 `Codicon::ALL` 守护测试（校验字体真的有这些字形）。
+
+### 五、守护测试
+
+- `scm_view_renders_vscode_sections`：SOURCE CONTROL / CHANGES / GRAPH / 提交按钮 /
+  分支名 / 提交标题 / 改动的文件都在；
+- `scm_view_sections_are_ordered_like_vscode`：标题 → CHANGES → 提交按钮 → GRAPH → 提交列表
+  的**上下顺序**与 VS Code 一致，输入框占位提示文案一致；
+- `ide-git`：`parse_log` 新旧格式、`parse_commit_detail`、`parse_branches`、
+  `discover_repos`（根仓库 + 嵌套仓库）单测。
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --workspace` | ✅ 165 passed 0 failed（ide-dap 的 3 个 mock_gdb 用例因本机没有 `python` 命令而失败，与本轮无关） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 warning |
+| 真机（WSL 工作区 `/home/work/NewLithoTune/candanza`） | ✅ 面板渲染与用户截图一致：两个仓库分组（candanza / scripts）、分支 chip、提交框 + 蓝色提交按钮、`更改 (8)` 文件列表、GRAPH 提交图（含 master / origin/master 标签与作者） |
 
 ---
 

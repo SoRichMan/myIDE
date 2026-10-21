@@ -1,5 +1,10 @@
 //! GitManager：UI 线程门面，git 子进程在独立 tokio runtime。
+//!
+//! 每个事件都带上「仓库根路径」，以便 UI 同时管理多个仓库（VS Code 的
+//! 多仓库工作区，每个仓库一个 CHANGES 分组）。
 
+use crate::branch::{parse_branches, Branch};
+use crate::log::{parse_commit_detail, parse_log, CommitDetail, GitCommit};
 use crate::porcelain::{parse_porcelain, GitStatus};
 use crate::process::run_git;
 use std::sync::mpsc::Receiver;
@@ -9,19 +14,35 @@ use tokio::sync::mpsc::UnboundedSender;
 enum Command {
     Refresh { root: String },
     Log { root: String },
-    Commit { root: String, message: String },
+    Branches { root: String },
+    Commit { root: String, message: String, amend: bool },
     Add { root: String, path: String },
+    AddAll { root: String },
     Unstage { root: String, path: String },
+    UnstageAll { root: String },
     Restore { root: String, path: String },
+    RestoreAll { root: String },
     Diff { root: String, path: String, cached: bool },
+    CommitDetail { root: String, hash: String },
+    CommitDiff { root: String, hash: String },
+    Checkout { root: String, branch: String },
+    CreateBranch { root: String, name: String },
+    Push { root: String },
+    Pull { root: String },
+    Fetch { root: String },
+    Sync { root: String },
 }
 
+/// 异步事件（全部回传仓库根，便于多仓库 UI 分派）。
 #[derive(Debug, Clone)]
 pub enum Event {
-    Status(Box<GitStatus>),
-    Log(Vec<crate::log::GitCommit>),
-    Diff { path: String, text: String },
-    /// 一次性操作（commit/add/restore）完成回执。
+    Status { root: String, status: Box<GitStatus> },
+    Log { root: String, commits: Vec<GitCommit> },
+    Branches { root: String, branches: Vec<Branch> },
+    Diff { root: String, path: String, text: String, cached: bool },
+    CommitDetail { root: String, detail: Box<CommitDetail> },
+    CommitDiff { root: String, hash: String, text: String },
+    /// 一次性操作（commit/add/restore/push…）完成回执。
     Done { ok: bool, msg: String },
 }
 
@@ -42,7 +63,7 @@ impl GitManager {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Event>();
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(2)
             .thread_name("git-worker")
             .enable_all()
             .build()
@@ -57,18 +78,27 @@ impl GitManager {
                             match run_git(&root, &args).await {
                                 Ok((ok, out)) if ok => {
                                     let st = parse_porcelain(&out);
-                                    let _ = tx.send(Event::Status(Box::new(st)));
+                                    let _ = tx.send(Event::Status { root, status: Box::new(st) });
                                 }
                                 Ok((_, out)) => {
                                     // 非仓库或 git 失败：空状态 + 提示（不 panic）。
-                                    let _ = tx.send(Event::Status(Box::default()));
+                                    let _ = tx.send(Event::Status {
+                                        root: root.clone(),
+                                        status: Box::default(),
+                                    });
                                     let _ = tx.send(Event::Done {
                                         ok: false,
-                                        msg: format!("git status 失败: {}", out.trim()).chars().take(200).collect(),
+                                        msg: format!("git status 失败: {}", out.trim())
+                                            .chars()
+                                            .take(200)
+                                            .collect(),
                                     });
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(Event::Status(Box::default()));
+                                    let _ = tx.send(Event::Status {
+                                        root: root.clone(),
+                                        status: Box::default(),
+                                    });
                                     let _ = tx.send(Event::Done { ok: false, msg: e });
                                 }
                             }
@@ -79,33 +109,65 @@ impl GitManager {
                         tokio::spawn(async move {
                             let args = [
                                 "log",
-                                "--pretty=format:%h%x00%an%x00%ad%x00%s",
-                                "--date=short",
+                                "--decorate",
+                                "--pretty=format:%h%x00%H%x00%an%x00%ae%x00%ad%x00%s%x00%P%x00%D",
+                                "--date=iso",
                                 "-n",
-                                "100",
+                                "300",
                             ];
                             if let Ok((ok, out)) = run_git(&root, &args).await {
                                 if ok {
-                                    let commits = crate::log::parse_log(&out);
-                                    let _ = tx.send(Event::Log(commits));
+                                    let commits = parse_log(&out);
+                                    let _ = tx.send(Event::Log { root, commits });
                                 }
                             }
                         });
                     }
-                    Command::Commit { root, message } => {
+                    Command::Branches { root } => {
                         let tx = ev_tx.clone();
                         tokio::spawn(async move {
-                            // 先 add -A，再 commit。失败回执给 UI。
-                            if let Err(e) = run_git(&root, &["add", "-A"]).await {
-                                let _ = tx.send(Event::Done { ok: false, msg: e });
-                                return;
+                            let args = [
+                                "branch",
+                                "-a",
+                                "--format=%(refname:short)%x00%(objectname:short)%x00%(HEAD)",
+                            ];
+                            if let Ok((ok, out)) = run_git(&root, &args).await {
+                                if ok {
+                                    let branches = parse_branches(&out);
+                                    let _ = tx.send(Event::Branches { root, branches });
+                                }
                             }
-                            match run_git(&root, &["commit", "-m", &message]).await {
+                        });
+                    }
+                    Command::Commit { root, message, amend } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            let args: Vec<String> = if amend {
+                                vec!["commit".into(), "--amend".into(), "-m".into(), message.clone()]
+                            } else {
+                                vec!["commit".into(), "-m".into(), message.clone()]
+                            };
+                            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                            match run_git(&root, &refs).await {
                                 Ok((ok, out)) => {
                                     let msg = if ok {
-                                        format!("提交成功: {}", out.lines().last().unwrap_or("").trim())
+                                        let last = out
+                                            .lines()
+                                            .rev()
+                                            .find(|l| !l.trim().is_empty())
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_string();
+                                        if last.starts_with("[") {
+                                            last
+                                        } else {
+                                            format!("提交成功: {last}")
+                                        }
                                     } else {
-                                        format!("提交失败: {}", out.trim().chars().take(200).collect::<String>())
+                                        format!(
+                                            "提交失败: {}",
+                                            out.trim().chars().take(300).collect::<String>()
+                                        )
                                     };
                                     let _ = tx.send(Event::Done { ok, msg });
                                 }
@@ -118,7 +180,7 @@ impl GitManager {
                     Command::Add { root, path } => {
                         let tx = ev_tx.clone();
                         tokio::spawn(async move {
-                            match run_git(&root, &["add", &path]).await {
+                            match run_git(&root, &["add", "--", &path]).await {
                                 Ok((ok, out)) => {
                                     let _ = tx.send(Event::Done { ok, msg: out.trim().to_string() });
                                 }
@@ -128,10 +190,10 @@ impl GitManager {
                             }
                         });
                     }
-                    Command::Restore { root, path } => {
+                    Command::AddAll { root } => {
                         let tx = ev_tx.clone();
                         tokio::spawn(async move {
-                            match run_git(&root, &["checkout", "--", &path]).await {
+                            match run_git(&root, &["add", "-A"]).await {
                                 Ok((ok, out)) => {
                                     let _ = tx.send(Event::Done { ok, msg: out.trim().to_string() });
                                 }
@@ -154,6 +216,45 @@ impl GitManager {
                             }
                         });
                     }
+                    Command::UnstageAll { root } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            match run_git(&root, &["reset", "HEAD", "--"]).await {
+                                Ok((ok, out)) => {
+                                    let _ = tx.send(Event::Done { ok, msg: out.trim().to_string() });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Event::Done { ok: false, msg: e });
+                                }
+                            }
+                        });
+                    }
+                    Command::Restore { root, path } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            match run_git(&root, &["checkout", "--", &path]).await {
+                                Ok((ok, out)) => {
+                                    let _ = tx.send(Event::Done { ok, msg: out.trim().to_string() });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Event::Done { ok: false, msg: e });
+                                }
+                            }
+                        });
+                    }
+                    Command::RestoreAll { root } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            match run_git(&root, &["checkout", "--", "."]).await {
+                                Ok((ok, out)) => {
+                                    let _ = tx.send(Event::Done { ok, msg: out.trim().to_string() });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Event::Done { ok: false, msg: e });
+                                }
+                            }
+                        });
+                    }
                     Command::Diff { root, path, cached } => {
                         let tx = ev_tx.clone();
                         tokio::spawn(async move {
@@ -164,7 +265,176 @@ impl GitManager {
                             };
                             if let Ok((ok, out)) = run_git(&root, &args).await {
                                 if ok {
-                                    let _ = tx.send(Event::Diff { path, text: out });
+                                    let _ = tx.send(Event::Diff {
+                                        root,
+                                        path,
+                                        text: out,
+                                        cached,
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    Command::CommitDetail { root, hash } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            let args = [
+                                "show",
+                                "--no-color",
+                                "--numstat",
+                                "--date=iso",
+                                "--format=%H%x00%an%x00%ae%x00%ad%x00%s%x00%b%x1e",
+                                &hash,
+                            ];
+                            if let Ok((ok, out)) = run_git(&root, &args).await {
+                                if ok {
+                                    let detail = parse_commit_detail(&out);
+                                    let _ = tx.send(Event::CommitDetail {
+                                        root,
+                                        detail: Box::new(detail),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    Command::CommitDiff { root, hash } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            let args = ["show", "--no-color", "--format=", &hash];
+                            if let Ok((ok, out)) = run_git(&root, &args).await {
+                                if ok {
+                                    let _ = tx.send(Event::CommitDiff { root, hash, text: out });
+                                }
+                            }
+                        });
+                    }
+                    Command::Checkout { root, branch } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            match run_git(&root, &["checkout", &branch]).await {
+                                Ok((ok, out)) => {
+                                    let msg = if ok {
+                                        format!("已切换到 {branch}")
+                                    } else {
+                                        format!(
+                                            "切换失败: {}",
+                                            out.trim().chars().take(200).collect::<String>()
+                                        )
+                                    };
+                                    let _ = tx.send(Event::Done { ok, msg });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Event::Done { ok: false, msg: e });
+                                }
+                            }
+                        });
+                    }
+                    Command::CreateBranch { root, name } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            match run_git(&root, &["checkout", "-b", &name]).await {
+                                Ok((ok, out)) => {
+                                    let msg = if ok {
+                                        format!("已创建分支 {name}")
+                                    } else {
+                                        format!(
+                                            "创建分支失败: {}",
+                                            out.trim().chars().take(200).collect::<String>()
+                                        )
+                                    };
+                                    let _ = tx.send(Event::Done { ok, msg });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Event::Done { ok: false, msg: e });
+                                }
+                            }
+                        });
+                    }
+                    Command::Push { root } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            match run_git(&root, &["push"]).await {
+                                Ok((ok, out)) => {
+                                    let msg = if ok {
+                                        format!("已推送: {}", out.trim().lines().last().unwrap_or(""))
+                                    } else {
+                                        format!(
+                                            "推送失败: {}",
+                                            out.trim().chars().take(200).collect::<String>()
+                                        )
+                                    };
+                                    let _ = tx.send(Event::Done { ok, msg });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Event::Done { ok: false, msg: e });
+                                }
+                            }
+                        });
+                    }
+                    Command::Pull { root } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            match run_git(&root, &["pull"]).await {
+                                Ok((ok, out)) => {
+                                    let msg = if ok {
+                                        format!("已拉取: {}", out.trim().lines().last().unwrap_or(""))
+                                    } else {
+                                        format!(
+                                            "拉取失败: {}",
+                                            out.trim().chars().take(200).collect::<String>()
+                                        )
+                                    };
+                                    let _ = tx.send(Event::Done { ok, msg });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Event::Done { ok: false, msg: e });
+                                }
+                            }
+                        });
+                    }
+                    Command::Fetch { root } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            match run_git(&root, &["fetch", "--all"]).await {
+                                Ok((ok, out)) => {
+                                    let msg = if ok {
+                                        format!("已获取: {}", out.trim().lines().last().unwrap_or(""))
+                                    } else {
+                                        format!(
+                                            "获取失败: {}",
+                                            out.trim().chars().take(200).collect::<String>()
+                                        )
+                                    };
+                                    let _ = tx.send(Event::Done { ok, msg });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Event::Done { ok: false, msg: e });
+                                }
+                            }
+                        });
+                    }
+                    Command::Sync { root } => {
+                        let tx = ev_tx.clone();
+                        tokio::spawn(async move {
+                            let pull = run_git(&root, &["pull", "--rebase"]).await;
+                            match pull {
+                                Ok((ok, out)) if ok => {
+                                    let _ = tx.send(Event::Done {
+                                        ok: true,
+                                        msg: format!("同步完成: {}", out.trim().lines().last().unwrap_or("")),
+                                    });
+                                }
+                                Ok((_, out)) => {
+                                    let _ = tx.send(Event::Done {
+                                        ok: false,
+                                        msg: format!(
+                                            "同步失败: {}",
+                                            out.trim().chars().take(200).collect::<String>()
+                                        ),
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Event::Done { ok: false, msg: e });
                                 }
                             }
                         });
@@ -188,21 +458,50 @@ impl GitManager {
         let _ = self.cmd_tx.send(Command::Log { root: root.to_string() });
     }
 
+    pub fn load_branches(&self, root: &str) {
+        let _ = self.cmd_tx.send(Command::Branches { root: root.to_string() });
+    }
+
+    /// 提交（只提交已暂存内容，VS Code 语义）。
     pub fn commit(&self, root: &str, message: &str) {
-        let _ = self.cmd_tx.send(Command::Commit { root: root.to_string(), message: message.to_string() });
+        self.commit_inner(root, message, false);
+    }
+
+    /// 修补上一次提交（`git commit --amend`）。
+    pub fn amend(&self, root: &str, message: &str) {
+        self.commit_inner(root, message, true);
+    }
+
+    fn commit_inner(&self, root: &str, message: &str, amend: bool) {
+        let _ = self.cmd_tx.send(Command::Commit {
+            root: root.to_string(),
+            message: message.to_string(),
+            amend,
+        });
     }
 
     pub fn add(&self, root: &str, path: &str) {
         let _ = self.cmd_tx.send(Command::Add { root: root.to_string(), path: path.to_string() });
     }
 
+    /// 暂存全部改动。
+    pub fn add_all(&self, root: &str) {
+        let _ = self.cmd_tx.send(Command::AddAll { root: root.to_string() });
+    }
+
     pub fn switch_root(&self, root: &str) {
         self.refresh(root);
         self.load_log(root);
+        self.load_branches(root);
     }
 
     pub fn restore(&self, root: &str, path: &str) {
         let _ = self.cmd_tx.send(Command::Restore { root: root.to_string(), path: path.to_string() });
+    }
+
+    /// 丢弃全部工作区改动。
+    pub fn restore_all(&self, root: &str) {
+        let _ = self.cmd_tx.send(Command::RestoreAll { root: root.to_string() });
     }
 
     /// 取消暂存（`git restore --staged -- <path>`）。
@@ -210,8 +509,63 @@ impl GitManager {
         let _ = self.cmd_tx.send(Command::Unstage { root: root.to_string(), path: path.to_string() });
     }
 
+    /// 取消全部暂存。
+    pub fn unstage_all(&self, root: &str) {
+        let _ = self.cmd_tx.send(Command::UnstageAll { root: root.to_string() });
+    }
+
     pub fn diff(&self, root: &str, path: &str, cached: bool) {
-        let _ = self.cmd_tx.send(Command::Diff { root: root.to_string(), path: path.to_string(), cached });
+        let _ = self.cmd_tx.send(Command::Diff {
+            root: root.to_string(),
+            path: path.to_string(),
+            cached,
+        });
+    }
+
+    /// 读取提交详情（作者 / 正文 / 改动文件）。
+    pub fn commit_detail(&self, root: &str, hash: &str) {
+        let _ = self.cmd_tx.send(Command::CommitDetail {
+            root: root.to_string(),
+            hash: hash.to_string(),
+        });
+    }
+
+    /// 读取提交的完整 diff。
+    pub fn commit_diff(&self, root: &str, hash: &str) {
+        let _ = self.cmd_tx.send(Command::CommitDiff {
+            root: root.to_string(),
+            hash: hash.to_string(),
+        });
+    }
+
+    pub fn checkout(&self, root: &str, branch: &str) {
+        let _ = self.cmd_tx.send(Command::Checkout {
+            root: root.to_string(),
+            branch: branch.to_string(),
+        });
+    }
+
+    pub fn create_branch(&self, root: &str, name: &str) {
+        let _ = self.cmd_tx.send(Command::CreateBranch {
+            root: root.to_string(),
+            name: name.to_string(),
+        });
+    }
+
+    pub fn push(&self, root: &str) {
+        let _ = self.cmd_tx.send(Command::Push { root: root.to_string() });
+    }
+
+    pub fn pull(&self, root: &str) {
+        let _ = self.cmd_tx.send(Command::Pull { root: root.to_string() });
+    }
+
+    pub fn fetch(&self, root: &str) {
+        let _ = self.cmd_tx.send(Command::Fetch { root: root.to_string() });
+    }
+
+    pub fn sync(&self, root: &str) {
+        let _ = self.cmd_tx.send(Command::Sync { root: root.to_string() });
     }
 }
 

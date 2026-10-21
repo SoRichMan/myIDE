@@ -5,6 +5,7 @@
 mod commands;
 mod editor;
 mod fileindex;
+mod scm;
 mod settings;
 mod tabs;
 mod terminal;
@@ -16,7 +17,7 @@ use editor::EditorAction;
 use ide_core::theme::{palette, PaletteHex, ThemeKind};
 use ide_ext::ExtensionHost;
 use ide_dap::manager::{BreakpointSpec, DapManager, DapStatus, Event as DapEvent, StackFrame, VarNode};
-use ide_git::{Event as GitEvent, GitManager, GitStatus};
+use ide_git::{Event as GitEvent, GitManager};
 use ide_lsp::manager::{Event as LspEvent, LspManager, LspStatus};
 use ide_lsp::message::{Position, SymbolInfo};
 use ide_lsp::path_map::{path_to_uri_any, posix_to_uri, uri_to_posix, uri_to_win};
@@ -299,6 +300,8 @@ enum SidebarContent {
     /// 全局搜索：与 VS Code 一致，搜索结果占用「资源管理器」所在的侧栏位置。
     Search,
     Outline,
+    /// 源代码管理（VS Code 的 Source Control 视图：CHANGES + GRAPH）。
+    SourceControl,
 }
 
 /// 设置面板收集的动作（渲染闭包外应用）。
@@ -441,12 +444,11 @@ struct LiteIdeApp {
     pending_search_seq: Option<u64>,
     /// 下一帧把焦点交给侧栏搜索输入框（Ctrl+Shift+F 时）。
     content_search_focus: bool,
-    git_panel_open: bool,
     debug_open: bool,
-    git_status: GitStatus,
-    git_log: Vec<ide_git::log::GitCommit>,
-    git_diff_text: String,
-    git_commit_input: String,
+    /// 源代码管理面板（VS Code 风格的 Source Control 视图）。
+    scm: scm::ScmPanel,
+    /// 启动时是否已按 `LITEIDE_OPEN_SCM` 打开过 SCM 视图。
+    scm_opened_at_start: bool,
     // ---- 阶段 5：设置 / 多标签 / 命令面板 / 视图 ----
     /// 扩展宿主：启动时激活内置扩展，注册表供界面查询语言/配色。
     host: ExtensionHost,
@@ -658,12 +660,9 @@ impl LiteIdeApp {
             content_results: Vec::new(),
             pending_search_seq: None,
             content_search_focus: false,
-            git_panel_open: false,
             debug_open: false,
-            git_status: GitStatus::default(),
-            git_log: Vec::new(),
-            git_diff_text: String::new(),
-            git_commit_input: String::new(),
+            scm: scm::ScmPanel::default(),
+            scm_opened_at_start: false,
             host,
             settings,
             config_mtime,
@@ -974,7 +973,9 @@ impl LiteIdeApp {
         let root = self.workspace_root();
         self.search.load_files(&root);
         self.rebuild_explorer();
-        self.git.switch_root(&root);
+        // 源代码管理：重新发现工作区里的 git 仓库（VS Code 多仓库工作区）。
+        self.discover_scm_repos();
+        self.refresh_git_now();
         // clangd 的根只在 initialize 时确定：根变了就重连。
         let uri = self.workspace_uri();
         self.root_uri = uri.clone();
@@ -3275,173 +3276,6 @@ impl LiteIdeApp {
         self.load_tab_into_editor(idx);
     }
 
-    fn draw_git_panel(&mut self, ctx: &egui::Context) {
-        if !self.git_panel_open {
-            return;
-        }
-        let mut open = true;
-        let status = self.git_status.clone();
-        let commits = self.git_log.clone();
-        let diff_text = self.git_diff_text.clone();
-        let mut commit_input = self.git_commit_input.clone();
-        let mut want_refresh = false;
-        let mut want_diff: Option<String> = None;
-        let mut want_stage: Option<String> = None;
-        let mut want_unstage: Option<String> = None;
-        let mut want_discard: Option<String> = None;
-        let mut want_commit: Option<String> = None;
-        egui::Window::new("Git  (Ctrl+Shift+G)")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(680.0)
-            .default_height(480.0)
-            .anchor(egui::Align2::RIGHT_TOP, [-20.0, 60.0])
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("branch:").size(12.0).color(hex("#bbbbbb")));
-                    ui.label(
-                        RichText::new(status.branch.clone().unwrap_or_else(|| "(not a repo)".into()))
-                            .size(12.0)
-                            .color(hex("#dcdcaa")),
-                    );
-                    if ui.small_button("Refresh").clicked() {
-                        want_refresh = true;
-                    }
-                });
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(200.0)
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("CHANGES").size(11.0).color(hex("#9cdcfe")));
-                        if status.entries.is_empty() {
-                            ui.label(RichText::new("(working tree clean)").size(11.0).color(hex("#6a6a6a")));
-                        }
-                        for e in &status.entries {
-                            let badge = e.badge();
-                            let color = match badge {
-                                'M' | 'A' => hex("#73c991"),
-                                'D' => hex("#f48771"),
-                                '?' => hex("#c5c5c5"),
-                                _ => hex("#d4d4d4"),
-                            };
-                            let staged = e.staged != '.' && e.staged != '?' && e.staged != ' ';
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("{badge}")).monospace().size(12.0).color(color));
-                                let path = e.path.clone();
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new(path.as_str()).monospace().size(11.0)),
-                                    )
-                                    .on_hover_text("查看 diff")
-                                    .clicked()
-                                {
-                                    want_diff = Some(path.clone());
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .small_button("↺")
-                                            .on_hover_text("放弃修改 (git checkout --)")
-                                            .clicked()
-                                        {
-                                            want_discard = Some(path.clone());
-                                        }
-                                        if staged
-                                            && ui
-                                                .small_button("－")
-                                                .on_hover_text("取消暂存")
-                                                .clicked()
-                                        {
-                                            want_unstage = Some(path.clone());
-                                        }
-                                        if ui
-                                            .small_button("＋")
-                                            .on_hover_text("暂存 (git add)")
-                                            .clicked()
-                                        {
-                                            want_stage = Some(path.clone());
-                                        }
-                                    },
-                                );
-                            });
-                        }
-                    });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut commit_input)
-                            .hint_text("commit message...  (Ctrl+Enter)")
-                            .desired_width(380.0),
-                    );
-                    if ui.button("Commit").clicked() && !commit_input.trim().is_empty() {
-                        want_commit = Some(commit_input.trim().to_string());
-                    }
-                });
-                ui.separator();
-                ui.label(RichText::new("RECENT COMMITS").size(11.0).color(hex("#9cdcfe")));
-                egui::ScrollArea::vertical()
-                    .max_height(140.0)
-                    .show(ui, |ui| {
-                        for c in &commits {
-                            ui.label(
-                                RichText::new(format!("{}  {}  {}  {}", c.hash, c.date, c.author, c.subject))
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(hex("#d4d4d4")),
-                            );
-                        }
-                        if commits.is_empty() {
-                            ui.label(RichText::new("(no commits)").size(11.0).color(hex("#6a6a6a")));
-                        }
-                    });
-                if !diff_text.is_empty() {
-                    ui.separator();
-                    ui.label(RichText::new("DIFF").size(11.0).color(hex("#9cdcfe")));
-                    egui::ScrollArea::vertical()
-                        .max_height(140.0)
-                        .show(ui, |ui| {
-                            for line in ide_git::diff::classify_diff(&diff_text) {
-                                let color = match line.kind {
-                                    ide_git::diff::DiffLineKind::Added => hex("#73c991"),
-                                    ide_git::diff::DiffLineKind::Removed => hex("#f48771"),
-                                    ide_git::diff::DiffLineKind::HunkHeader => hex("#9cdcfe"),
-                                    ide_git::diff::DiffLineKind::Context => hex("#858585"),
-                                };
-                                ui.label(RichText::new(line.text.as_str()).monospace().size(10.5).color(color));
-                            }
-                        });
-                }
-            });
-        self.git_panel_open = open;
-        self.git_commit_input = commit_input;
-        if want_refresh {
-            self.refresh_git_now();
-        }
-        if let Some(path) = want_diff {
-            let root = self.workspace_root();
-            self.git.diff(&root, &path, false);
-        }
-        if let Some(path) = want_stage {
-            let root = self.workspace_root();
-            self.git.add(&root, &path);
-        }
-        if let Some(path) = want_unstage {
-            let root = self.workspace_root();
-            self.git.unstage(&root, &path);
-        }
-        if let Some(path) = want_discard {
-            let root = self.workspace_root();
-            self.git.restore(&root, &path);
-        }
-        if let Some(msg) = want_commit {
-            let root = self.workspace_root();
-            self.git.commit(&root, &msg);
-            self.git_commit_input.clear();
-        }
-    }
-
     fn poll_search(&mut self) {
         while let Some(ev) = self.search.poll() {
             match ev {
@@ -3467,28 +3301,238 @@ impl LiteIdeApp {
 
     fn poll_git(&mut self) {
         while let Some(ev) = self.git.poll() {
-            match ev {
-                GitEvent::Status(st) => self.git_status = *st,
-                GitEvent::Log(commits) => self.git_log = commits,
-                GitEvent::Diff { text, .. } => self.git_diff_text = text,
-                GitEvent::Done { ok, msg } => {
-                    if ok {
-                        self.flash(msg);
-                        let root = self.workspace_root();
-                        self.git.refresh(&root);
-                        self.git.load_log(&root);
-                    } else {
-                        self.flash(format!("Git: {msg}"));
+            let done = matches!(ev, GitEvent::Done { .. });
+            self.scm.on_event(&ev);
+            if let GitEvent::Done { ok, msg } = ev {
+                if ok {
+                    self.flash(msg);
+                    self.refresh_git_now();
+                } else {
+                    self.flash(format!("Git: {msg}"));
+                }
+            } else if done {
+                self.refresh_git_now();
+            }
+        }
+    }
+
+    /// 刷新所有仓库的状态 / 提交 / 分支。
+    fn refresh_git_now(&self) {
+        for repo in &self.scm.repos {
+            self.git.refresh(&repo.path);
+            self.git.load_log(&repo.path);
+            self.git.load_branches(&repo.path);
+        }
+    }
+
+    /// 发现工作区里的 git 仓库（本地直接扫目录，远程在 WSL 里 `find`）。
+    fn discover_scm_repos(&mut self) {
+        let root = self.workspace_root();
+        if self.is_remote() {
+            let distro = self
+                .settings
+                .remote_distro
+                .clone()
+                .unwrap_or_else(|| "Ubuntu2404".to_string());
+            let paths = ide_git::repos::discover_repos_wsl(&root, &distro);
+            self.scm.set_repo_paths(paths);
+        } else {
+            self.scm.set_root(&root);
+        }
+    }
+
+    /// 切换到源代码管理视图（VS Code 的 Ctrl+Shift+G）。
+    fn open_scm_view(&mut self) {
+        self.sidebar_content = SidebarContent::SourceControl;
+        self.settings.show_sidebar = true;
+        // VS Code 的 SCM 视图比资源管理器宽（要放提交信息框 + 提交按钮）。
+        if self.sidebar_width <= SIDEBAR_DEFAULT_WIDTH + 0.5 {
+            self.sidebar_width = 340.0;
+        }
+        self.save_settings();
+        if self.scm.repos.is_empty() {
+            self.discover_scm_repos();
+        }
+        self.refresh_git_now();
+    }
+
+    /// 执行源代码管理面板产生的动作。
+    fn apply_scm_actions(&mut self, actions: Vec<scm::Action>) {
+        for action in actions {
+            let root = match &action {
+                scm::Action::RefreshAll => None,
+                scm::Action::RefreshRepo(idx)
+                | scm::Action::StageAll(idx)
+                | scm::Action::UnstageAll(idx)
+                | scm::Action::DiscardAll(idx)
+                | scm::Action::Commit { repo: idx, .. }
+                | scm::Action::CommitPush { repo: idx, .. }
+                | scm::Action::Amend { repo: idx }
+                | scm::Action::Checkout { repo: idx, .. }
+                | scm::Action::CreateBranch { repo: idx, .. }
+                | scm::Action::Push(idx)
+                | scm::Action::Pull(idx)
+                | scm::Action::Sync(idx)
+                | scm::Action::SelectCommit { repo: idx, .. }
+                | scm::Action::ShowCommitDiff { repo: idx, .. }
+                | scm::Action::FocusMessage(idx) => self.scm.repos.get(*idx).map(|r| r.path.clone()),
+                scm::Action::Stage { repo: idx, .. }
+                | scm::Action::Unstage { repo: idx, .. }
+                | scm::Action::Discard { repo: idx, .. } => {
+                    self.scm.repos.get(*idx).map(|r| r.path.clone())
+                }
+                scm::Action::OpenDiff { repo: idx, .. } => {
+                    self.scm.repos.get(*idx).map(|r| r.path.clone())
+                }
+                scm::Action::CloseDetail => None,
+            };
+            match action {
+                scm::Action::RefreshAll => self.refresh_git_now(),
+                scm::Action::RefreshRepo(_) => {
+                    if let Some(r) = root {
+                        self.git.refresh(&r);
+                        self.git.load_log(&r);
+                        self.git.load_branches(&r);
                     }
+                }
+                scm::Action::Stage { path, .. } => {
+                    if let Some(r) = root {
+                        self.git.add(&r, &path);
+                    }
+                }
+                scm::Action::StageAll(_) => {
+                    if let Some(r) = root {
+                        self.git.add_all(&r);
+                    }
+                }
+                scm::Action::Unstage { path, .. } => {
+                    if let Some(r) = root {
+                        self.git.unstage(&r, &path);
+                    }
+                }
+                scm::Action::UnstageAll(_) => {
+                    if let Some(r) = root {
+                        self.git.unstage_all(&r);
+                    }
+                }
+                scm::Action::Discard { path, .. } => {
+                    if let Some(r) = root {
+                        self.git.restore(&r, &path);
+                    }
+                }
+                scm::Action::DiscardAll(_) => {
+                    if let Some(r) = root {
+                        self.git.restore_all(&r);
+                    }
+                }
+                scm::Action::Commit { message, .. } => {
+                    if let Some(r) = root {
+                        self.git.commit(&r, &message);
+                        // VS Code：提交后清空提交信息框
+                        let target = r.clone();
+                        if let Some(rs) = self.scm.repos.iter_mut().find(|x| x.path == target) {
+                            rs.message.clear();
+                        }
+                    }
+                }
+                scm::Action::CommitPush { message, .. } => {
+                    if let Some(r) = root {
+                        self.git.commit(&r, &message);
+                        self.git.push(&r);
+                        let target = r.clone();
+                        if let Some(rs) = self.scm.repos.iter_mut().find(|x| x.path == target) {
+                            rs.message.clear();
+                        }
+                    }
+                }
+                scm::Action::Amend { .. } => {
+                    if let Some(r) = root {
+                        let target = r.clone();
+                        let msg = self
+                            .scm
+                            .repos
+                            .iter()
+                            .find(|x| x.path == target)
+                            .map(|x| x.message.trim().to_string())
+                            .unwrap_or_default();
+                        if !msg.is_empty() {
+                            self.git.amend(&r, &msg);
+                        }
+                    }
+                }
+                scm::Action::Checkout { branch, .. } => {
+                    if let Some(r) = root {
+                        self.git.checkout(&r, &branch);
+                    }
+                }
+                scm::Action::CreateBranch { name, .. } => {
+                    if let Some(r) = root {
+                        self.git.create_branch(&r, &name);
+                    }
+                }
+                scm::Action::Push(_) => {
+                    if let Some(r) = root {
+                        self.git.push(&r);
+                    }
+                }
+                scm::Action::Pull(_) => {
+                    if let Some(r) = root {
+                        self.git.pull(&r);
+                    }
+                }
+                scm::Action::Sync(_) => {
+                    if let Some(r) = root {
+                        self.git.sync(&r);
+                    }
+                }
+                scm::Action::SelectCommit { repo, hash } => {
+                    if let Some(r) = self.scm.repos.get(repo).map(|x| x.path.clone()) {
+                        if let Some(rs) = self.scm.repos.get_mut(repo) {
+                            rs.selected = Some(hash.clone());
+                        }
+                        self.git.commit_detail(&r, &hash);
+                        self.git.commit_diff(&r, &hash);
+                    }
+                }
+                scm::Action::ShowCommitDiff { repo, hash } => {
+                    if let Some(r) = self.scm.repos.get(repo).map(|x| x.path.clone()) {
+                        self.git.commit_diff(&r, &hash);
+                    }
+                }
+                scm::Action::OpenDiff { path, cached, .. } => {
+                    if let Some(r) = root {
+                        self.git.diff(&r, &path, cached);
+                        // VS Code：点文件会同时在编辑器里打开它
+                        let full = if self.is_remote() {
+                            PathBuf::from(format!("{}/{}", r.trim_end_matches('/'), path))
+                        } else {
+                            PathBuf::from(&r).join(&path)
+                        };
+                        match self.read_text_file(&full) {
+                            Ok(text) => self.open_file(full, text, false),
+                            Err(e) => {
+                                tracing::debug!("SCM：打开文件失败 {path}: {e}");
+                            }
+                        }
+                    }
+                }
+                scm::Action::CloseDetail => {
+                    self.scm.detail = None;
+                    self.scm.detail_diff.clear();
+                }
+                scm::Action::FocusMessage(_) => {
+                    self.flash("请在提交信息框中输入内容".to_string());
                 }
             }
         }
     }
 
-    fn refresh_git_now(&self) {
-        let root = self.workspace_root();
-        self.git.refresh(&root);
-        self.git.load_log(&root);
+    /// 绘制源代码管理视图（VS Code 的 Source Control 侧栏）。
+    fn draw_source_control_content(&mut self, ui: &mut egui::Ui) {
+        let actions = self.scm.draw(ui);
+        if !actions.is_empty() {
+            self.apply_scm_actions(actions);
+        }
     }
 
     // ---- 阶段 5：设置 ----
@@ -4047,32 +4091,63 @@ impl LiteIdeApp {
             "debug.stepOut" => self.on_debug_finish(),
             "debug.addWatch" => self.on_add_watch(),
             "git.openPanel" => {
-                self.git_panel_open = true;
-                self.refresh_git_now();
+                self.open_scm_view();
             }
             "git.refresh" => self.refresh_git_now(),
             "git.commit" => {
-                let msg = self.git_commit_input.clone();
-                if msg.trim().is_empty() {
+                let msg = self
+                    .scm
+                    .repos
+                    .first()
+                    .map(|r| r.message.trim().to_string())
+                    .unwrap_or_default();
+                if msg.is_empty() {
                     self.flash("请先输入提交信息".to_string());
-                } else {
-                    let root = self.workspace_root();
-                    self.git.commit(&root, msg.trim());
-                    self.git_commit_input.clear();
+                } else if let Some(r) = self.scm.repos.first().map(|r| r.path.clone()) {
+                    self.git.commit(&r, &msg);
                 }
             }
             "git.diffActive" => {
                 if let Some(p) = self.active_tab_path() {
                     let root = self.workspace_root();
                     self.git.diff(&root, &p.to_string_lossy(), false);
-                    self.git_panel_open = true;
+                    self.open_scm_view();
                 } else {
                     self.flash("没有打开的文件".to_string());
                 }
             }
             "git.showHistory" => {
-                self.git_panel_open = true;
-                self.refresh_git_now();
+                self.open_scm_view();
+            }
+            "git.stageAll" => {
+                for repo in &self.scm.repos {
+                    self.git.add_all(&repo.path);
+                }
+            }
+            "git.unstageAll" => {
+                for repo in &self.scm.repos {
+                    self.git.unstage_all(&repo.path);
+                }
+            }
+            "git.discardAll" => {
+                for repo in &self.scm.repos {
+                    self.git.restore_all(&repo.path);
+                }
+            }
+            "git.sync" => {
+                for repo in &self.scm.repos {
+                    self.git.sync(&repo.path);
+                }
+            }
+            "git.pull" => {
+                for repo in &self.scm.repos {
+                    self.git.pull(&repo.path);
+                }
+            }
+            "git.push" => {
+                for repo in &self.scm.repos {
+                    self.git.push(&repo.path);
+                }
             }
             "settings.open" => {
                 self.settings_open = !self.settings_open;
@@ -5327,15 +5402,13 @@ impl LiteIdeApp {
                     }
                     self.save_settings();
                 }
-                if item(
-                    ui,
-                    Codicon::SourceControl,
-                    "源代码管理 (Ctrl+Shift+G)",
-                    self.git_panel_open,
-                ) {
-                    self.git_panel_open = !self.git_panel_open;
-                    if self.git_panel_open {
-                        self.refresh_git_now();
+                // 源代码管理视图（VS Code：占用侧栏位置，再次点击收起）。
+                let scm_on = self.sidebar_content == SidebarContent::SourceControl;
+                if item(ui, Codicon::SourceControl, "源代码管理 (Ctrl+Shift+G)", scm_on) {
+                    if scm_on && self.settings.show_sidebar {
+                        self.settings.show_sidebar = false;
+                    } else {
+                        self.open_scm_view();
                     }
                 }
                 if item(ui, Codicon::RunView, "运行与调试 (F5)", self.debug_open) {
@@ -5400,6 +5473,7 @@ impl LiteIdeApp {
                     SidebarContent::Explorer => self.draw_explorer_content(ui),
                     SidebarContent::Search => self.draw_search_content(ui),
                     SidebarContent::Outline => self.draw_outline_content(ui),
+                    SidebarContent::SourceControl => self.draw_source_control_content(ui),
                 }
 
                 // ---- 右侧分割线：可拖动“挤压”编辑器；拖到最左松开则滑走收起 ----
@@ -5634,7 +5708,7 @@ impl LiteIdeApp {
                     }
 
                     // ---- 左：分支 / LSP / DBG ----
-                    if let Some(branch) = &self.git_status.branch {
+                    if let Some(branch) = self.scm.primary_branch() {
                         statusbar_item(
                             ui,
                             Some(&format!("branch: {branch}")),
@@ -6276,6 +6350,12 @@ impl eframe::App for LiteIdeApp {
             self.start_file_index();
         }
 
+        // 调试用：`LITEIDE_OPEN_SCM=1` 启动即打开源代码管理视图（截图 / 自检）。
+        if !self.scm_opened_at_start && std::env::var("LITEIDE_OPEN_SCM").is_ok() {
+            self.scm_opened_at_start = true;
+            self.open_scm_view();
+        }
+
         // 设置热重载：外部修改 JSON 自动生效
         if self.settings.hot_reload(&mut self.config_mtime) {
             tracing::info!("settings hot-reloaded");
@@ -6447,10 +6527,7 @@ impl eframe::App for LiteIdeApp {
             }
             Some(EditorAction::ContentSearch) => self.open_content_search(),
             Some(EditorAction::GitPanel) => {
-                self.git_panel_open = !self.git_panel_open;
-                if self.git_panel_open {
-                    self.refresh_git_now();
-                }
+                self.open_scm_view();
             }
             Some(EditorAction::Settings) => {
                 self.settings_open = !self.settings_open;
@@ -6481,7 +6558,6 @@ impl eframe::App for LiteIdeApp {
         self.update_hover(ctx);
         self.draw_symbol_search(ctx);
         self.draw_file_picker(ctx);
-        self.draw_git_panel(ctx);
         self.draw_settings(ctx);
         self.draw_goto_line(ctx);
         self.draw_command_palette(ctx);
@@ -6575,6 +6651,15 @@ enum Codicon {
     // 终端面板标题栏动作。
     Add,   // ea60 add
     Trash, // ea81 trash
+    // 源代码管理面板
+    Check,          // eab2 check
+    Discard,        // eae2 discard
+    Sync,           // ea77 sync
+    Remove,         // eb3b remove
+    CloudDownload,  // eac2 cloud-download
+    CloudUpload,    // eac3 cloud-upload
+    Account,        // eb99 account
+    Close,          // ea76 close
 }
 
 impl Codicon {
@@ -6611,6 +6696,14 @@ impl Codicon {
         Codicon::Remote,
         Codicon::Add,
         Codicon::Trash,
+        Codicon::Check,
+        Codicon::Discard,
+        Codicon::Sync,
+        Codicon::Remove,
+        Codicon::CloudDownload,
+        Codicon::CloudUpload,
+        Codicon::Account,
+        Codicon::Close,
     ];
 
     /// 字体里的码位（U+Exxx）。
@@ -6646,6 +6739,14 @@ impl Codicon {
             Codicon::Remote => 0xeb3a,
             Codicon::Add => 0xea60,
             Codicon::Trash => 0xea81,
+            Codicon::Check => 0xeab2,
+            Codicon::Discard => 0xeae2,
+            Codicon::Sync => 0xea77,
+            Codicon::Remove => 0xeb3b,
+            Codicon::CloudDownload => 0xeac2,
+            Codicon::CloudUpload => 0xeac3,
+            Codicon::Account => 0xeb99,
+            Codicon::Close => 0xea76,
         };
         char::from_u32(cp).unwrap_or(' ')
     }
@@ -8914,5 +9015,115 @@ mod tests {
             .find(|(s, _)| s == "\u{ea7c}")
             .expect("应画出「⋯」");
         assert!((dots.1.y - boxes[0].bottom()).abs() <= 1.0);
+    }
+
+    // ---- 源代码管理（Source Control）视图 ----
+
+    /// 收集一帧里画出的所有文本。
+    fn frame_texts(out: &egui::FullOutput) -> Vec<String> {
+        out.shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 造一个带改动 + 提交的仓库状态。
+    fn scm_repo() -> scm::RepoState {
+        let mut repo = scm::RepoState::new("E:/repo".into(), "repo".into());
+        repo.status = ide_git::porcelain::parse_porcelain(
+            "# branch.head main\n\
+             1 M. N... 100644 100644 100644 a b c src/main.cpp\n\
+             ? new.txt\n",
+        );
+        repo.commits = vec![ide_git::log::GitCommit {
+            hash: "abc1234".into(),
+            full: "abc1234def".into(),
+            author: "Alice".into(),
+            subject: "fix broken edge API".into(),
+            date: "2026-10-20T14:12:00+08:00".into(),
+            ..Default::default()
+        }];
+        repo
+    }
+
+    /// 源代码管理视图的骨架与 VS Code 一致：SOURCE CONTROL / CHANGES / GRAPH。
+    #[test]
+    fn scm_view_renders_vscode_sections() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.scm.set_repos(vec![scm_repo()]);
+        app.sidebar_content = SidebarContent::SourceControl;
+        app.settings.show_sidebar = true;
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        let texts = frame_texts(&out);
+        let all = texts.join("\n");
+        assert!(all.contains("SOURCE CONTROL"), "应画出视图标题");
+        assert!(all.contains("CHANGES"), "应画出 CHANGES 分组");
+        assert!(all.contains("GRAPH"), "应画出 GRAPH 分组");
+        assert!(all.contains("提交"), "应画出提交按钮");
+        assert!(all.contains("main"), "应显示当前分支");
+        assert!(all.contains("fix broken edge API"), "应显示提交标题");
+        assert!(all.contains("main.cpp"), "应显示改动的文件");
+    }
+
+    /// 视图的上下顺序与 VS Code 一致：标题 → CHANGES → 提交按钮 → GRAPH → 提交列表。
+    #[test]
+    fn scm_view_sections_are_ordered_like_vscode() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.scm.set_repos(vec![scm_repo()]);
+        app.sidebar_content = SidebarContent::SourceControl;
+        app.settings.show_sidebar = true;
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        let mut pos: Vec<(String, f32)> = Vec::new();
+        for cs in &out.shapes {
+            if let egui::Shape::Text(t) = &cs.shape {
+                let s = t.galley.text().to_string();
+                let y = t.pos.y + t.galley.size().y * 0.5;
+                pos.push((s, y));
+            }
+        }
+        let find = |needle: &str| -> Option<f32> {
+            pos.iter()
+                .find(|(s, _)| s.contains(needle))
+                .map(|(_, y)| *y)
+        };
+        let title = find("SOURCE CONTROL").expect("应画出标题");
+        let changes = find("CHANGES").expect("应画出 CHANGES");
+        let commit = find("提交").expect("应画出提交按钮");
+        let graph = find("GRAPH").expect("应画出 GRAPH");
+        let subject = find("fix broken edge API").expect("应画出提交记录");
+        assert!(title < changes, "标题应在 CHANGES 之上");
+        assert!(changes < commit, "提交按钮应在 CHANGES 分组里");
+        assert!(commit < graph, "GRAPH 应在 CHANGES 之后");
+        assert!(graph < subject, "提交记录应在 GRAPH 分组里");
+        // 提交信息输入框的占位提示（VS Code 文案）。
+        assert!(
+            pos.iter().any(|(s, _)| s.contains("Ctrl+Enter to commit on")),
+            "应显示提交信息占位提示"
+        );
+    }
+
+    /// 活动栏的源代码管理图标切到 Source Control 视图。
+    #[test]
+    fn activity_bar_source_control_opens_scm_view() {        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.scm.set_repos(vec![scm_repo()]);
+        app.sidebar_content = SidebarContent::Explorer;
+        app.settings.show_sidebar = true;
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_activity_bar(ctx));
+        // 源代码管理图标是 codicon ea68（活动栏里唯一的分支图标）。
+        let has_icon = out.shapes.iter().any(|cs| matches!(
+            &cs.shape,
+            egui::Shape::Text(t) if t.galley.text() == "\u{ea68}"
+        ));
+        assert!(has_icon, "活动栏应画出源代码管理图标");
+        assert_eq!(app.sidebar_content, SidebarContent::Explorer);
     }
 }

@@ -28,6 +28,12 @@ impl GitEntry {
 pub struct GitStatus {
     /// 当前分支名（detached 时为短 SHA）。
     pub branch: Option<String>,
+    /// 上游分支（如 `origin/master`）。
+    pub upstream: Option<String>,
+    /// 领先上游的提交数。
+    pub ahead: usize,
+    /// 落后上游的提交数。
+    pub behind: usize,
     pub entries: Vec<GitEntry>,
 }
 
@@ -37,6 +43,30 @@ impl GitStatus {
             .iter()
             .find(|e| e.path == rel_path)
             .map(|e| e.badge())
+    }
+
+    /// 已暂存（index 有变化）的文件。
+    pub fn staged(&self) -> Vec<&GitEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.staged != '.' && e.staged != ' ' && e.staged != '?')
+            .collect()
+    }
+
+    /// 工作区里未暂存的改动（不含纯未跟踪文件）。
+    pub fn unstaged(&self) -> Vec<&GitEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.worktree != '.' && e.worktree != ' ')
+            .collect()
+    }
+
+    /// 未跟踪的新文件。
+    pub fn untracked(&self) -> Vec<&GitEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.staged == '?' || e.worktree == '?')
+            .collect()
     }
 }
 
@@ -50,6 +80,22 @@ pub fn parse_porcelain(output: &str) -> GitStatus {
         }
         if let Some(rest) = line.strip_prefix("# branch.head ") {
             st.branch = Some(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+            st.upstream = Some(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            // 形如 `+0 -0`。
+            for token in rest.split_whitespace() {
+                let mut chars = token.chars();
+                match (chars.next(), chars.as_str().parse::<usize>()) {
+                    (Some('+'), Ok(n)) => st.ahead = n,
+                    (Some('-'), Ok(n)) => st.behind = n,
+                    _ => {}
+                }
+            }
             continue;
         }
         if line.starts_with("# branch.") {
