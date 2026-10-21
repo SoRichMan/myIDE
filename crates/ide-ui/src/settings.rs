@@ -27,6 +27,12 @@ pub struct AppSettings {
     pub remote_distro: Option<String>,
     /// 远程工作区的 POSIX 路径（如 `/home/work/proj`）；与 `remote_distro` 成对出现。
     pub remote_path: Option<String>,
+    /// 鼠标滚轮方向：
+    /// - `"normal"`：滚轮向下 = 看到更后面的内容（VS Code 行为）；
+    /// - `"reversed"`：与上面相反。
+    ///
+    /// 改完立刻生效（设置是热重载的）。
+    pub mouse_scroll_direction: String,
 }
 
 impl Default for AppSettings {
@@ -40,11 +46,17 @@ impl Default for AppSettings {
             show_breadcrumbs: true,
             remote_distro: None,
             remote_path: None,
+            mouse_scroll_direction: "normal".to_string(),
         }
     }
 }
 
 impl AppSettings {
+    /// 滚轮方向是否反转（`"reversed"` = 反向）。
+    pub fn scroll_reversed(&self) -> bool {
+        self.mouse_scroll_direction.trim().eq_ignore_ascii_case("reversed")
+    }
+
     /// 配置文件绝对路径。
     pub fn config_path() -> PathBuf {
         if let Ok(dir) = std::env::var("LITEIDE_CONFIG_DIR") {
@@ -139,6 +151,19 @@ mod tests {
             ThemeKind::from_name(&AppSettings::default().theme),
             ThemeKind::CppDark
         );
+    }
+
+    #[test]
+    fn scroll_direction_defaults_to_normal_and_can_be_inverted() {
+        let mut s = AppSettings::default();
+        assert!(!s.scroll_reversed(), "默认应与 VS Code 一致");
+        s.mouse_scroll_direction = "reversed".to_string();
+        assert!(s.scroll_reversed());
+        // 大小写/空格不敏感。
+        s.mouse_scroll_direction = " Reversed ".to_string();
+        assert!(s.scroll_reversed());
+        s.mouse_scroll_direction = "normal".to_string();
+        assert!(!s.scroll_reversed());
     }
 
     #[test]

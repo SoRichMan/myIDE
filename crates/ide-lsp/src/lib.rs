@@ -17,4 +17,4 @@ pub mod process;
 
 pub use client::{LspClient, LspError, LspEvents, ServerEvent, DEFAULT_TIMEOUT};
 pub use manager::{Command, Event, LspManager, LspStatus};
-pub use message::{HoverInfo, Location, Position, Range, SymbolInfo};
+pub use message::{HoverInfo, Location, Position, Range, SymbolInfo, WorkspaceSymbol};

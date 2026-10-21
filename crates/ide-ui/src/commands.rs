@@ -60,6 +60,7 @@ pub fn registry() -> &'static [CommandSpec] {
         // ---- Go ----
         CommandSpec { id: "go.definition", title: "Go to Definition", zh: "转到定义", category: "Go", shortcut: "F12", safe: false },
         CommandSpec { id: "go.back", title: "Go Back", zh: "返回上一位置", category: "Go", shortcut: "Alt+Left", safe: true },
+        CommandSpec { id: "go.forward", title: "Go Forward", zh: "前进到下一位置", category: "Go", shortcut: "Alt+Right", safe: true },
         CommandSpec { id: "go.line", title: "Go to Line…", zh: "跳转到行", category: "Go", shortcut: "Ctrl+G", safe: true },
         CommandSpec { id: "go.symbol", title: "Go to Symbol…", zh: "跳转到符号", category: "Go", shortcut: "Ctrl+T", safe: true },
         // ---- Search ----

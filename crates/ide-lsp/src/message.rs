@@ -61,6 +61,21 @@ pub struct SymbolInfo {
     pub children: Vec<SymbolInfo>,
 }
 
+/// 工作区符号（`workspace/symbol` 的结果项）。
+///
+/// 语义索引在服务端（clangd）里，`textDocument/definition` 找不到时
+/// 可以退到这里按名字找定义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSymbol {
+    pub name: String,
+    /// LSP `SymbolKind` 数值（含义同 [`SymbolInfo::kind`]）。
+    pub kind: u32,
+    /// 所属容器（类/命名空间），clangd 会给。
+    pub container: Option<String>,
+    /// 符号所在位置。
+    pub location: Location,
+}
+
 // ---------------------------------------------------------------------------
 // Value → 类型 解析（宽容模式）
 // ---------------------------------------------------------------------------
@@ -197,6 +212,33 @@ fn parse_one_symbol(v: &Value) -> Option<SymbolInfo> {
     }
 }
 
+/// 解析 `workspace/symbol` 响应：`SymbolInformation[]`。
+///
+/// 每项形如 `{ name, kind, containerName?, location: { uri, range } }`。
+pub fn parse_workspace_symbols(result: &Value) -> Vec<WorkspaceSymbol> {
+    let Value::Array(items) = result else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|v| {
+            let name = v.get("name")?.as_str()?.to_string();
+            let kind = v.get("kind").and_then(|k| k.as_u64()).unwrap_or(0) as u32;
+            let container = v
+                .get("containerName")
+                .and_then(|c| c.as_str())
+                .map(String::from);
+            let location = parse_one_location(v.get("location")?)?;
+            Some(WorkspaceSymbol {
+                name,
+                kind,
+                container,
+                location,
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -242,6 +284,48 @@ mod tests {
     fn parse_definition_null_and_empty() {
         assert!(parse_locations(&Value::Null).is_empty());
         assert!(parse_locations(&json!([])).is_empty());
+    }
+
+    #[test]
+    fn parse_workspace_symbols_flat_list() {
+        let v = json!([
+            {
+                "name": "Foo::bar",
+                "kind": 6,
+                "containerName": "Foo",
+                "location": {
+                    "uri": "file:///a.cpp",
+                    "range": {"start": {"line": 12, "character": 4}, "end": {"line": 12, "character": 7}}
+                }
+            },
+            {
+                "name": "kMax",
+                "kind": 14,
+                "location": {
+                    "uri": "file:///b.h",
+                    "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 5}}
+                }
+            }
+        ]);
+        let syms = parse_workspace_symbols(&v);
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "Foo::bar");
+        assert_eq!(syms[0].kind, 6);
+        assert_eq!(syms[0].container.as_deref(), Some("Foo"));
+        assert_eq!(syms[0].location.uri, "file:///a.cpp");
+        assert_eq!(syms[0].location.range.start.line, 12);
+        // 没有 containerName 也能解析。
+        assert_eq!(syms[1].container, None);
+        assert_eq!(syms[1].location.range.start.character, 0);
+    }
+
+    #[test]
+    fn parse_workspace_symbols_ignores_garbage() {
+        assert!(parse_workspace_symbols(&Value::Null).is_empty());
+        assert!(parse_workspace_symbols(&json!([])).is_empty());
+        // 缺 location 的项要跳过，不能 panic。
+        let v = json!([{"name": "x", "kind": 12}]);
+        assert!(parse_workspace_symbols(&v).is_empty());
     }
 
     #[test]

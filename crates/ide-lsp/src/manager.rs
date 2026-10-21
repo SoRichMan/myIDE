@@ -10,7 +10,7 @@
 //! 状态用 `Arc<Mutex<LspStatus>>` 随时可读。
 
 use crate::client::{LspClient, LspError, LspEvents, ServerEvent};
-use crate::message::{HoverInfo, Location, Position, SymbolInfo};
+use crate::message::{HoverInfo, Location, Position, SymbolInfo, WorkspaceSymbol};
 use crate::process::{pick_wsl_distro, probe_clangd, spawn_clangd};
 use crate::DEFAULT_TIMEOUT;
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,8 @@ pub enum Command {
     Definition { uri: String, pos: Position, seq: u64 },
     Hover { uri: String, pos: Position, seq: u64 },
     Symbols { uri: String, seq: u64 },
+    /// 按名字在工作区里找符号（definition 找不到时的兜底）。
+    WorkspaceSymbol { query: String, seq: u64 },
     Restart,
     /// 换根（远程目录切换）：重启 clangd 并 `initialize` 到新根。
     Reopen { root_uri: String },
@@ -70,6 +72,11 @@ pub enum Event {
     Definition { seq: u64, result: Result<Vec<Location>, String> },
     Hover { seq: u64, result: Result<Option<HoverInfo>, String> },
     Symbols { seq: u64, result: Result<Vec<SymbolInfo>, String> },
+    /// `workspace/symbol` 的结果。
+    WorkspaceSymbol {
+        seq: u64,
+        result: Result<Vec<WorkspaceSymbol>, String>,
+    },
     ServerLog(String),
     Diagnostics { uri: String, items: serde_json::Value },
 }
@@ -200,6 +207,13 @@ impl LspManager {
     pub fn request_symbols(&mut self, uri: String) -> u64 {
         let seq = self.next_seq();
         let _ = self.cmd_tx.send(Command::Symbols { uri, seq });
+        seq
+    }
+
+    /// 按名字查工作区符号；结果通过 `Event::WorkspaceSymbol{seq, ..}` 返回。
+    pub fn request_workspace_symbol(&mut self, query: String) -> u64 {
+        let seq = self.next_seq();
+        let _ = self.cmd_tx.send(Command::WorkspaceSymbol { query, seq });
         seq
     }
 
@@ -482,6 +496,10 @@ async fn handle_command(st: &mut SessionState, client: &mut LspClient, cmd: Comm
         Command::Symbols { uri, seq } => {
             let result = client.document_symbol(&uri).await.map_err(err_string);
             let _ = st.ui_tx.send(Event::Symbols { seq, result });
+        }
+        Command::WorkspaceSymbol { query, seq } => {
+            let result = client.workspace_symbol(&query).await.map_err(err_string);
+            let _ = st.ui_tx.send(Event::WorkspaceSymbol { seq, result });
         }
     }
 }

@@ -78,7 +78,7 @@ E:\TestDeepSeek\
 └── target\release\liteide.exe  9.68 MB
 ```
 
-## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十四轮 WSL 内部文件访问 + 编辑器下方集成终端）
+## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十五轮 Ctrl+左键跳转定义 + 跳转历史 + 缓存）
 
 ### 已交付
 
@@ -1176,6 +1176,215 @@ LSP 路径（`ide-lsp/src/path_map.rs`）新增 `posix_to_uri` / `uri_to_posix`�
 - 远程工作区仍无文件监视，外部改动要手动刷新。
 - 跑 `cargo test --workspace` 的 mock 集成测试需要 `python` 在 PATH；本机只有 `py` 启动器，
   临时把 Store 的 Python 别名目录加进 PATH 即可（不影响项目代码）。
+
+---
+
+## 第十五轮：Ctrl+左键跳转定义 + 跳转历史 + 缓存（2026-10-20）
+
+用户需求：**打开 C++ 文件后，Ctrl+左键点符号能跳到定义**（函数、变量等），
+跳转后能用快捷键**回到原位置**（对标 VS Code）；另外要求**性能**：打开多个文件后要有缓存，
+关掉再打开、文件没变时能复用（用户说这是建议、可不采纳——本次按此实现了缓存层）。
+
+### 一、Ctrl+左键跳转定义
+
+- `editor.rs`：正文区点击时若按住 Ctrl/⌘，除了落光标还发出
+  `EditorAction::GotoDefinitionAt(字符下标)`（VS Code 语义：Ctrl+点击=跟随定义）；
+  新增 `word_at()` / `word_at_line_col()`（严格取标识符，点在空格/标点上不跳）。
+- `main.rs` 的跳转链：
+  1. `textDocument/definition`（clangd，最准，能区分同名重载/宏）；
+  2. clangd 没找到（还没索引完 / 符号不在 compile_commands 里）→ 退到
+     **`workspace/symbol`** 按名字找（新增 LSP 请求，见下）；
+  3. 仍找不到 → 状态栏提示「未找到定义」。
+- 跳到目标后**自动把光标滚进可视区**（新增 `scroll_cursor_into_view()`），
+  之前跳完目标可能在屏幕外看不见。
+
+### 二、跳转历史（VS Code 的 Go Back / Go Forward）
+
+- 后退栈（原有 `jump_stack`）+ **新增前进栈** `forward_stack`；
+  `Alt+Left` = 返回上一位置，`Alt+Right` = 前进（新增命令 `go.forward` / `EditorAction::GoForward`）；
+- 发生新跳转时前进栈清空（VS Code 语义）；
+- 后退/前进都精确回到**文件 + 行 + 列**（真机验证：Ctrl+点击跳走 → Alt+Left 回到
+  `LogInfo.cpp` 的 Ln 16 Col 46 → Alt+Right 又回到 `sink.h` 的 Ln 12 Col 7）。
+
+### 三、缓存（性能）
+
+- **符号查找缓存**：`workspace/symbol` 的结果按名字缓存，TTL 5 分钟
+  （`CACHE_TTL`）；同一个符号反复点、关掉文件再打开时不用再问服务器。
+- **每文件文档符号缓存**：`documentSymbol` 的结果按 uri 缓存（带编辑序列号 + TTL），
+  切回没改过的文件直接复用，不再让 clangd 重新解析一遍；存盘后缓存作废。
+- **文件内容缓存**（本地文件）：mtime + size 都没变就复用已读内容，关掉标签再打开不重复读盘；
+  远程 WSL 文件不缓存内容（拿不到 mtime，容易读到旧内容，而一次 WSL 往返本来就 1ms 左右）。
+
+### 四、LSP 新增 `workspace/symbol`
+
+- `ide-lsp`：`client.workspace_symbol()` / `manager.request_workspace_symbol()` /
+  `Event::WorkspaceSymbol` + `parse_workspace_symbols()`（`SymbolInformation[]` 宽容解析）；
+  `initialize` 里声明 `workspace.symbol` 能力。
+
+### 五、顺带修掉一个会崩 IDE 的老 bug
+
+- **高亮区间重叠导致 panic**：高亮器可能返回嵌套区间（tree-sitter 注入层），
+  渲染时游标倒退，`next_start - cursor_byte` 下溢 → 整个 IDE 崩掉
+  （跳转进 spdlog 头文件必崩）。现在刷新高亮时丢掉重叠区间，渲染处再用
+  `saturating_sub` 兜底；新增回归测试 `overlapping_highlight_ranges_do_not_panic`。
+
+### 七、用户反馈的 4 处体验问题（对标 VS Code）
+
+1. **跳转后目标要落在视口正中**（原来只保证「看得见」，目标贴在上下边缘）：
+   - 新增 `Editor::center_cursor_in_view()`，跳转（`jump_to`）与查找跳转（`scroll_to_char`）都用它；
+   - 真机复验：在 296 行的 `LogInfo.cpp` 里查找 `ensure` → 命中行 169 正好在视口中间。
+2. **悬停提示（VS Code 语义）**：
+   - 悬停词由 `word_range_at()` 算出（字符区间，严格只认标识符）；
+   - **普通悬停：只弹提示框，文字不做任何标记**；
+   - **按住 Ctrl/⌘：整个词高亮**（背景 + 下划线），此时点击 = 跳定义；
+   - 提示框内容按 VS Code 布局拆成「签名（等宽）+ 文档（正文）」，去掉 `///` 前缀、
+     markdown 标题标记和空列表项，并解码 `&amp;` 之类实体。
+3. **鼠标滚动太慢 + 方向反了**：
+   - 根因一：egui 的 `smooth_scroll_delta` 会把一格滚轮摊到十几帧慢慢放出来；
+   - 根因二：原来用 `scroll -= dy`，方向与 Windows 滚轮相反（往下滚纹丝不动）；
+   - 现在直接吃 `Event::MouseWheel`：**滚轮一格 = 3 行/3 列**（VS Code 默认
+     `editor.mouseWheelScrollSensitivity`），触控板按像素 1:1；方向也改对了；
+   - 真机复验：一格滚轮走 3 行，25 格从第 1 行滚到第 76 行。
+4. **悬停提示框内容时有时无、样式不像 VS Code**：
+   - 可靠性：clangd 答「没有内容」或报错时，之前直接放弃且不再重试 → 提示框再也不出现；
+     现在清掉「已请求」标记并按 700ms 退避重试；
+   - 样式：把 markdown 拆成「签名（等宽）+ 文档（正文）」，去掉 `///` 前缀、
+     解码 `&amp;` 之类实体；浮窗改成 VS Code 的编辑器底色 + 细边框；
+   - 测试：`hover_markdown_splits_signature_and_docs`、`wheel_notch_scrolls_three_lines`、
+     `hover_word_cols_covers_the_hovered_word`、`center_cursor_in_view_puts_target_in_middle`。
+
+### 九、用户截图反馈的三处「位置偏移」（根因同一个）
+
+- 现象：悬停下划线偏出标识符、跳转后光标落在符号中间、查找命中的高亮框整体偏移。
+- 根因：正文是 **egui 排版**画的——排版时每个字形都把游标**取整到像素**（Hack 13px
+  实际步进 8.0px），而字体报告的字形宽是浮点数（`glyph_width` = 7.758px）。
+  我们的光标/选区/下划线用「字形宽度求和」算位置，每字符差 0.24px，
+  **一行 60 个字符就差 14px（≈1.8 个字符）**，行尾偏得最明显；
+  点击→字符的反查也用同一套宽度，于是 Ctrl+点击会点到隔壁符号。
+- 修复：
+  - `text_advance()` 改成**用 egui 自己的排版结果**（排版前缀），
+    光标 / 选区 / 悬停下划线 / IME 下划线全部与正文像素对齐；
+  - `col_at_x()`（点击→字符）改成「等宽格粗估 + 真实排版修正」，
+    鼠标命中与绘制位置一致；
+  - 编辑器的 `char_width` 改用 `cell_metrics()`（真实步进），不再用浮点字形宽。
+- 新增守护测试：`advance_matches_real_layout_not_glyph_sum`（排版宽度 ≠ 字形宽度求和
+  且前缀宽度单调）、`click_column_uses_real_layout`（点击位置落在正确字符）、
+  `editor_caret_sits_right_of_the_last_glyph`（光标贴着最后一个字符）。
+
+### 十一、用户反馈：Ctrl+P 找不到文件 + 滚轮方向
+
+1. **Ctrl+P 之前只是「当前目录浏览器」**：输入 `Fragmentation` 在工程深处根本找不到
+   （VS Code 能按文件名模糊命中整个工作区）。
+   - 新增 `crates/ide-ui/src/fileindex.rs`：**后台线程**建工作区文件索引
+     （本地递归遍历；WSL 远程工作区一次 `wsl.exe -- find`），只留源码/配置类后缀
+     （该工程 `find` 出来有 5 万多个文件，含 build/备份目录，全量索引既慢又费内存）；
+   - VS Code 风格的**模糊匹配**（子序列 + 打分：开头/分隔符后/驼峰边界加分，
+     跳过的字符扣分，名字越短越优先），并可按整条相对路径回退匹配；
+   - Picker 优先显示模糊结果（文件名 + 灰色目录前缀），回车打开最匹配的那个；
+     没有匹配时才退回浏览当前目录；索引还在建时显示「(正在索引工作区…)」；
+   - 索引在**第一帧**就启动（远端一次 find 约 0.5s + WSL 冷启动几秒），
+     按 Ctrl+P 时通常已经可用；换工作区根会自动重建。
+   - 远程 `find` 的坑：`-path` 的模式必须**带引号**传给 `wsl.exe`（它会再交给发行版的
+     shell 解析一次），否则 `*/.git/*` 被提前展开，find 直接报错。
+2. **滚轮方向（只改编辑器，终端不动）**：
+   - 编辑器直接吃 `Event::MouseWheel`：**一格 = 3 行**（VS Code 默认
+     `editor.mouseWheelScrollSensitivity`），触控板按像素 1:1；
+   - 新增设置 `mouse_scroll_direction`（`normal` = 与 VS Code 一致 / `reversed` = 反向），
+     在 Settings 面板里切换，**立即生效**（设置是热重载的，启动时也会应用一次）；
+   - 顺带修掉：设置之前只在热重载时应用，**启动时没应用** → 改完 JSON 重启会丢；
+     现在启动即应用。
+
+### 十二、用户反馈二：Ctrl+P 命中高亮 + Terminal 回退
+
+1. **Ctrl+P 的结果要像 VS Code 那样标出「匹配的部分」**（之前整行一个颜色）：
+   - `fuzzy_match` 除了分数还返回**命中字符的下标**；
+   - Picker 用 egui 的 `LayoutJob` 一次排版：命中的字符用强调色（`#4ec9b0`），
+     其余保持灰白，**字距仍走 egui 自己的排版**（不会和目录前缀错位）；
+   - 文件名没命中、改由**目录**命中时，命中位置记在目录前缀上（VS Code 同款）；
+   - 仍然先按文件名匹配、再按目录匹配（文件名优先）。
+2. **Terminal 全部回退**（用户明确要求）：
+   - 滚轮逻辑**原样还原**（`smooth_scroll_delta` + 原来的 `scroll_offset += step*3`），
+     终端不再吃 `Event::MouseWheel`，也不再受 `mouse_scroll_direction` 影响；
+   - 顺带把「往回翻着历史时开始输入」改成**跳回最新输出**（VS Code 行为），
+     免得输入落在屏幕外看不见的地方。
+3. **真正的病根：光标和输入位置错开**（用户截图里的现象）：
+   - 根因是终端绘制时**窗口行 → 实时区行**的换算算错了：基础值写成
+     `k - sb_len`（把整个滚回区长度错加上去），正确值是 `-k`；
+   - 后果：滚回区非空时光标行号落在绘制范围外 → **光标块干脆不画**；
+     视图里含滚回区时光标被画到中间某一行 → 「光标和输入位置错开」；
+   - 这个 bug **早于本轮的滚轮改动**（HEAD 里就是错的），只是之前视图总是贴着
+     实时区，问题没暴露；滚轮一改能滚进历史，就立刻看出来了；
+   - 抽出 `model_row_base()` 并加回归测试 `window_row_maps_to_live_row_with_scrollback_offset`。
+
+### 十三、用户反馈三：Ctrl+P 行内对齐 / 20 条上限 / 滚动方向
+
+1. **图标、文件名、路径三者没对齐到一条中心线**：
+   - 根因：`painter.galley(pos, …)` 只认 galley 的**左上角**，之前直接把行中心当
+     左上角传 → 文字整体下移半行；而 codicon 图标是按中心点画的 → 两者错开；
+   - 改成：文字用 galley 的**墨迹中心**（`mesh_bounds.center().y`）对齐到行中心，
+     图标也按**自己的**墨迹中心对齐（codicon 与等宽字体的度量不同），
+     文件名和路径共用同一套字体 → 天然同一条基线；
+   - 实测偏差 ≤ 0.5 px（缩放截图 + 像素扫描核对）。
+2. **图标和文件名挤在一起** → 图标右侧留 6 px（实测空隙 8 px，VS Code 同量级）。
+3. **路径用灰度**：目录前缀固定灰色 `#8a8a8a`，不再参与命中高亮（VS Code 的
+   路径就是灰的）；文件名里的命中部分继续用强调色。
+4. **默认只显示前 20 条，点「显示更多」才展开**（`PICKER_PAGE` / `PICKER_MAX_RESULTS`）：
+   - 列表短、滚动快、视觉干净；按钮上标出总条数（如「共 57 条」）；
+   - 换查询词自动重新收起。
+5. **自己画虚拟列表，不用 egui 的 `ScrollArea`**：
+   - egui 的 ScrollArea 靠 `smooth_scroll_delta` 滚动，而那个值会被**平滑到十几帧**
+     才发完，我们的窗口又是 on-demand 重绘的 → 滚轮几乎没反应（实测滚 15 格只动几个像素）；
+   - 自己维护偏移：直接吃**原始** `Event::MouseWheel`，一格 3 行（VS Code 手感），
+     方向按 **Windows-Konvention**（滚轮向下 = 往后面的条目），
+     右侧另画一条细滚动条。
+6. **搜索性能**（配合 20 条上限进一步提速）：
+   - 搜索结果**按查询词缓存**（Picker 每帧重绘 —— 没有缓存的话每敲一个键都要
+     重新匹配三万多个条目）；
+   - 文件名的小写形式在**建索引时**就准备好（之前每个条目每次按键都要 `to_lowercase()`）；
+   - `fuzzy_match` 在热路径上不分配内存。
+
+### 十四、用户反馈四：Quick-Input 配色对齐 VS Code + 滚动方向反转
+
+1. **配色**：之前用的是青色 `#4ec9b0`（VS Code 的 *Typ*-Farbe），VS Code im
+   Quick-Input nutzt dagegen `list.highlightForeground`.
+   Die exakten Werte stammen aus dem **lokal installierten VS Code**
+   (`resources/app/extensions/theme-defaults/themes/dark_vs.json` / `dark_modern.json`):
+   - Treffer (Highlight): `list.highlightForeground` = **#2AAAFF**（dunkleres Blau）；
+   - Text: `foreground` = **#CCCCCC**；
+   - Pfad (description): `descriptionForeground` = **#9D9D9D**。
+   - Der Pfad bleibt außerdem **grau** und nimmt nicht an der Treffer-Hervorhebung
+     teil (wie in VS Code).
+2. **Scroll-Richtung umgekehrt**: Rad **nach unten** → **frühere** Einträge,
+   Rad **nach oben** → **spätere** Einträge (so wie es der Nutzer auf seinem
+   System hat). Betrifft Editor **und** Ctrl+P-Liste (gleiche Semantik).
+   - Die Einstellung `mouse_scroll_direction` schaltet weiterhin um
+     (`normal` = VS-Code-Standard, `reversed` = umgekehrt); die Voreinstellung
+     entspricht jetzt der vom Nutzer gewünschten Richtung.
+
+### 十五、验收（第十六轮最终）
+
+| 指标 | 结果 |
+|---|---|
+| `cargo test --workspace` | ✅ **343 passed 0 failed**（10 个 `#[ignore]`） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 warning |
+| `cargo build --release` | ✅ 10,817,536 B ≈ **10.32 MB** |
+| 真机：Ctrl+左键 | ✅ 在 `src/utils/LogInfo.cpp` 的 `spdlog::sinks::sink` 上 Ctrl+点击 → 打开 `external/spdlog/include/spdlog/sinks/sink.h` 并定位到 `class sink`（Ln 12 Col 7） |
+| 真机：Alt+Left / Alt+Right | ✅ 回到 `LogInfo.cpp` Ln 16 Col 46 / 再前进到 `sink.h` Ln 12 Col 7 |
+| 真机：跳转居中 | ✅ 查找 `ensure` → 命中行 169 落在视口正中 |
+| 真机：悬停下划线 | ✅ 悬停 `algorithm` 出现下划线；按住 Ctrl 叠加蓝色背景 |
+| 真机：滚轮速度/方向 | ✅ 一格 = 3 行、方向与 VS Code 一致（25 格 → 第 1 行到第 76 行） |
+| 真机：悬停下划线/查找高亮/光标位置 | ✅ 与文字像素级对齐（缩放截图核对） |
+| 真机：悬停语义 | ✅ 不按 Ctrl：只有提示框、无任何标记；按住 Ctrl：整个词蓝底 + 下划线，点击即跳定义 |
+| 真机：Ctrl+P 模糊搜索 | ✅ 输入 `fragmentation` → 命中 `Fragmentation.h/.cpp`（含 `src/LithotuneOPC/Application/common/` 等），点第一行打开 `Fragmentation.h`（617 行） |
+| 真机：Ctrl+P 命中高亮 | ✅ 只把**匹配的部分**标成强调色（`Fragment`/`ation` 分别命中），其余灰白、目录前缀灰色；缩放截图核对字距无错位 |
+| 真机：Ctrl+P 行内对齐 | ✅ 图标 / 文件名 / 路径在同一条中心线上（像素扫描：偏差 ≤ 0.5 px）；图标与文件名之间 8 px 空隙 |
+| 真机：Ctrl+P 结果上限 | ✅ 默认只显示 20 条 + 「显示更多结果…（共 57 条）」按钮；点开后全部展开并可滚动 |
+| 真机：Ctrl+P 滚动 | ✅ 一格滚轮 = 3 行，右侧有滚动条 |
+| 真机：Quick-Input 配色 | ✅ 命中部分 = VS Code `list.highlightForeground` **#2AAAFF**（像素gemessen 42,163,244），正文 #CCCCCC，路径 #9D9D9D —— 取自本机 VS Code 的 `dark_vs.json` / `dark_modern.json` |
+| 真机：滚动方向反转 | ✅ Rad **runten** → frühere Treffer, Rad **hoch** → spätere Treffer (Thumb wandert 316 → 276 → 316) |
+| 真机：滚轮方向设置 | ✅ 编辑器里 `normal` / `reversed` 切换立即生效；**终端不受影响**（已按要求回退） |
+| 真机：Terminal 光标位置 | ✅ 300 行历史下光标块正好落在提示符末尾（修复前：光标不画 / 偏到中间） |
+| 真机：Terminal 往回翻后输入 | ✅ 输入即刻跳回最新输出，提示符与光标对齐 |
 
 ---
 

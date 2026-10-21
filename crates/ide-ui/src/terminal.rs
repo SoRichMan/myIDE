@@ -867,8 +867,7 @@ pub fn draw_body(
                 break;
             }
             screen.set_scrollback(k);
-            // 窗口第 0 行对应的模型行号（负数表示还在滚回区里）。
-            let model_row_base = k as i64 - sb_len as i64;
+            let model_row_base = model_row_base(k);
             paint_screen(
                 &ui.painter().with_clip_rect(rect),
                 grid_rect,
@@ -943,6 +942,11 @@ pub fn draw_body(
         }
     }
     if !out.is_empty() {
+        // 往回翻着历史时开始输入 → 立刻跳回最新输出（VS Code 行为）。
+        // 否则输入落在屏幕外的最新行上，看起来就是「光标和输入的位置错开」。
+        if session.scroll_offset > 0 {
+            session.scroll_offset = 0;
+        }
         if let Err(err) = session.shell.write(&out) {
             tracing::warn!("[terminal] {err}");
         }
@@ -961,13 +965,25 @@ pub fn draw_body(
 /// 四舍五入到物理像素，实际步进是「取整后的 advance」（100% DPI 下 Hack 13px 是
 /// 8.0，而 `glyph_width` 报 7.758）。两者相差 0.24px/字符，一行 60 个字符就漂移
 /// ~15px——光标会落在文字中间。这里直接量一段真实排版结果的平均步进。
-fn cell_metrics(fonts: &egui::epaint::Fonts, font: &FontId) -> (f32, f32) {
+pub(crate) fn cell_metrics(fonts: &egui::epaint::Fonts, font: &FontId) -> (f32, f32) {
     const SAMPLE: usize = 64;
     let galley = fonts.layout_no_wrap("M".repeat(SAMPLE), font.clone(), Color32::WHITE);
     (
         (galley.size().x / SAMPLE as f32).max(1.0),
         fonts.row_height(font).max(1.0),
     )
+}
+
+/// 窗口第 0 行对应的**实时区**行号（负数 = 还在滚回区里）。
+///
+/// `set_scrollback(k)` 把可见窗口上移 k 行：窗口里的第 `row` 行对应实时区的
+/// `row - k` 行。所以基础值是 `-k`。
+///
+/// 之前这里算成 `k - sb_len`（把整个滚回区长度错加了上去），光标行号整个偏掉：
+/// 滚回区非空时光标落在绘制范围之外（干脆不画），或者偏到中间某一行 ——
+/// 也就是用户看到的「光标和输入的位置错开了」。
+fn model_row_base(scrollback_shown: usize) -> i64 {
+    -(scrollback_shown as i64)
 }
 
 /// 画一段终端网格。
@@ -1312,6 +1328,31 @@ mod tests {
         p.process(b"\x1b[13;1HNEW");
         assert_eq!(row_text(&p, 12), "NEWt@host#");
         assert_eq!(row_text(&p, 20), "", "中间的行不能被改写");
+    }
+
+    /// 视图行 → 实时区行的换算：光标必须落在真正在输入的那一行。
+    ///
+    /// `set_scrollback(k)` 把可见窗口上移 k 行，于是窗口里的第 `row` 行对应
+    /// 实时区的 `row - k` 行（负数 = 还在滚回区里）。之前基础值算成了
+    /// `k - sb_len`，光标行号整个偏掉 —— 表现为「光标和输入位置错开」。
+    #[test]
+    fn window_row_maps_to_live_row_with_scrollback_offset() {
+        // 窗口第 0 行对应的实时区行号 = -k（k = 滚回区露出的行数）。
+        for k in [0usize, 1, 7, 300] {
+            assert_eq!(model_row_base(k), -(k as i64));
+        }
+
+        // 光标的窗口行号：光标在实时区的 cursor_model_row 行，
+        // 窗口里要往下偏 k 行（窗口顶部露出的 k 行在它上面）。
+        let cursor_window_row = |cursor_model_row: u16, k: usize| -> i64 {
+            i64::from(cursor_model_row) - model_row_base(k)
+        };
+        // 没有滚回偏移时，光标行号就是它自己。
+        assert_eq!(cursor_window_row(12, 0), 12);
+        // 露出 7 行历史时，光标在窗口里要往下 7 行。
+        assert_eq!(cursor_window_row(12, 7), 19);
+        // 历史很长（300 行）时也一样只偏 k，不受 sb_len 影响。
+        assert_eq!(cursor_window_row(12, 300), 312);
     }
 
     /// 缩行不能把最新输出裁掉：vt100 会把顶部几行推进滚回区，拉高时再取回来。

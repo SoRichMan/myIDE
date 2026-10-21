@@ -10,7 +10,8 @@
 
 use crate::codec::{encode, FrameDecoder};
 use crate::message::{
-    parse_hover, parse_locations, parse_symbols, HoverInfo, Location, Position, SymbolInfo,
+    parse_hover, parse_locations, parse_symbols, parse_workspace_symbols, HoverInfo, Location,
+    Position, SymbolInfo, WorkspaceSymbol,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -25,6 +26,8 @@ use tokio::sync::{mpsc, oneshot};
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// initialize 超时（clangd 冷启动 + WSL 桥接较慢）。
 pub const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// `workspace/symbol` 超时（要查服务端索引，比普通请求慢）。
+pub const WORKSPACE_SYMBOL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// LSP 层错误。
 #[derive(Debug, thiserror::Error)]
@@ -247,7 +250,7 @@ impl LspClient {
                     "definition": {},
                     "documentSymbol": {"hierarchicalDocumentSymbolSupport": true}
                 },
-                "workspace": {"workspaceFolders": false}
+                "workspace": {"workspaceFolders": false, "symbol": {}}
             }
         });
         self.request("initialize", params, Some(INIT_TIMEOUT)).await
@@ -386,6 +389,24 @@ impl LspClient {
             )
             .await?;
         Ok(parse_symbols(&result))
+    }
+
+    /// `workspace/symbol`（按名字在工作区里找符号）。
+    ///
+    /// `textDocument/definition` 找不到时（clangd 还没索引完、符号在
+    /// compile_commands 之外的文件里……）用它兜底。
+    pub async fn workspace_symbol(
+        &mut self,
+        query: &str,
+    ) -> Result<Vec<WorkspaceSymbol>, LspError> {
+        let result = self
+            .request(
+                "workspace/symbol",
+                json!({"query": query}),
+                Some(WORKSPACE_SYMBOL_TIMEOUT),
+            )
+            .await?;
+        Ok(parse_workspace_symbols(&result))
     }
 
     /// 优雅关闭：`shutdown` 请求 + `exit` 通知。失败也不报错（尽力而为）。

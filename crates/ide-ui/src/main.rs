@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod commands;
 mod editor;
+mod fileindex;
 mod settings;
 mod tabs;
 mod terminal;
@@ -30,11 +31,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 const HOVER_DWELL: Duration = Duration::from_millis(300);
+/// hover 没拿到内容时的重试间隔（clangd 可能还在解析文件）。
+const HOVER_RETRY: Duration = Duration::from_millis(700);
 const FLASH_DUR: Duration = Duration::from_millis(2500);
 /// 跳转栈上限（阶段 5 性能：防无限增长）。
 const JUMP_STACK_CAP: usize = 100;
+/// 缓存有效期（符号查找结果、文件内容）。
+///
+/// 用户提的需求：打开多个文件后要能复用缓存，文件没变时关掉再打开直接用。
+/// 5 分钟足够覆盖一次「编译 → 改 → 再编译」的循环，又不会让缓存无限陈旧。
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// 文件内容缓存条目上限（超出后按插入顺序淘汰最旧的）。
+const FILE_CACHE_CAP: usize = 64;
 /// 关闭标签的恢复栈上限。
 const CLOSED_TAB_CAP: usize = 10;
+/// Ctrl+P 结果默认显示多少条（再多就点「显示更多」）。
+const PICKER_PAGE: usize = 20;
+/// Ctrl+P 结果最多能显示多少条（点「显示更多」后的上限）。
+const PICKER_MAX_RESULTS: usize = 200;
 /// 侧栏（Explorer/Outline）宽度范围与默认值。
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 520.0;
@@ -295,7 +309,40 @@ enum SettingsAction {
     Minimap(bool),
     Breadcrumbs(bool),
     Sidebar(bool),
+    /// 鼠标滚轮方向（`"normal"` / `"reversed"`）。
+    ScrollDirection(String),
     Reset,
+}
+
+/// 文件内容缓存条目（关掉标签再打开时复用）。
+struct CachedFile {
+    text: String,
+    /// 修改时间（秒级；拿不到就是 None，此时只按 TTL 过期）。
+    mtime: Option<u64>,
+    /// 文件大小（字节；拿不到就是 None）。
+    size: Option<u64>,
+    /// 写入缓存的时刻。
+    at: Instant,
+}
+
+/// 单个文件的文档符号缓存条目。
+struct CachedSymbols {
+    syms: Vec<SymbolInfo>,
+    /// 缓存时的编辑序列号（变了就说明文件被改过，缓存作废）。
+    edit_seq: u64,
+    /// 写入缓存的时刻。
+    at: Instant,
+}
+
+/// 本地文件的修改时间（秒）+ 大小（字节）。拿不到就是 None。
+fn local_file_stamp(path: &std::path::Path) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    Some((mtime.unwrap_or(0), md.len()))
 }
 
 struct LiteIdeApp {
@@ -312,15 +359,39 @@ struct LiteIdeApp {
     doc_version: i32,
     last_sync_seq: u64,
     jump_stack: Vec<(PathBuf, usize, usize)>,
+    /// 前进栈（Alt+Right 用；新的跳转会清空它）。
+    forward_stack: Vec<(PathBuf, usize, usize)>,
+    /// 符号查找缓存：符号名 → 定义位置。
+    ///
+    /// `textDocument/definition` 找不到时退到 `workspace/symbol`，结果缓存
+    /// [`CACHE_TTL`] 秒：同一个符号反复点、或关掉文件再打开时都不用再问服务器。
+    symbol_cache: HashMap<String, Vec<ide_lsp::Location>>,
+    /// 缓存写入时间（整体过期判断）。
+    symbol_cache_at: Instant,
+    /// 正在等待的 `workspace/symbol` 请求（seq + 查询名）。
+    pending_ws_symbol: Option<(u64, String)>,
+    /// 文件内容缓存：路径 → （文本、mtime、size、写入时间）。
+    ///
+    /// 标签关掉再打开时，如果文件没被改过就直接复用，省掉一次读盘 / 一次 WSL 往返。
+    file_cache: HashMap<PathBuf, CachedFile>,
     hover_anchor: Option<(usize, Instant)>,
     hover_requested_char: Option<usize>,
     pending_hover: Option<u64>,
-    hover_result: Option<(egui::Pos2, String)>,
+    hover_result: Option<(egui::Pos2, HoverContent)>,
+    /// hover 失败/为空时的下次重试时刻。
+    hover_retry_at: Option<Instant>,
     symbols: Vec<SymbolInfo>,
+    /// 每个文件的文档符号缓存（uri → 符号）。
+    ///
+    /// 切回一个没改过的文件时直接复用，不用再问 clangd 要一遍
+    /// （clangd 每次 documentSymbol 都要重新解析文件）。
+    file_symbols: HashMap<String, CachedSymbols>,
+    /// 当前 `symbols` 属于哪个文件。
+    symbols_uri: Option<String>,
     symbol_search_open: bool,
     symbol_filter: String,
-    pending_def: Option<u64>,
-    pending_sym: Option<u64>,
+    pending_def: Option<(u64, String)>,
+    pending_sym: Option<(u64, String)>,
     flash: Option<(String, Instant)>,
     fonts_ready: bool,
     boot_start: Instant,
@@ -347,6 +418,22 @@ struct LiteIdeApp {
     file_picker_dir: PathBuf,
     /// 当前目录的条目缓存 `(名称, 是否目录)`，仅在切换目录时重读一次。
     file_picker_entries: Vec<(String, bool)>,
+    /// 工作区文件索引（Ctrl+P 的模糊搜索用；后台线程构建）。
+    file_index: fileindex::FileIndex,
+    /// 结果是否已「显示更多」（默认只显示前 20 条）。
+    file_picker_expanded: bool,
+    /// 结果列表的滚动偏移（自己维护，见 `draw_file_picker`）。
+    file_picker_scroll: f32,
+    /// Picker 结果缓存（按查询词，避免每帧重扫三万条）。
+    file_picker_hits: Vec<fileindex::Hit>,
+    /// 缓存对应的查询词。
+    file_picker_hits_query: String,
+    /// 缓存对应的条数上限。
+    file_picker_hits_limit: usize,
+    /// 缓存里一共命中多少条（用来决定要不要显示「更多」）。
+    file_picker_hits_total: usize,
+    /// 是否已经启动过索引构建。
+    file_index_started: bool,
     /// 下一帧把焦点交给文件浏览器的输入框。
     file_picker_focus: bool,
     content_query: String,
@@ -506,7 +593,7 @@ impl LiteIdeApp {
         }
         let indent_hint = detect_indent(&editor.text());
         let applied_theme = theme_kind;
-        Self {
+        let mut app = Self {
             editor: Some(editor),
             status_line,
             lsp: LspManager::new(),
@@ -519,11 +606,19 @@ impl LiteIdeApp {
             doc_version: 1,
             last_sync_seq: 0,
             jump_stack: Vec::new(),
+            forward_stack: Vec::new(),
+            symbol_cache: HashMap::new(),
+            symbol_cache_at: Instant::now(),
+            pending_ws_symbol: None,
+            file_cache: HashMap::new(),
             hover_anchor: None,
             hover_requested_char: None,
             pending_hover: None,
             hover_result: None,
+            hover_retry_at: None,
             symbols: Vec::new(),
+            file_symbols: HashMap::new(),
+            symbols_uri: None,
             symbol_search_open: false,
             symbol_filter: String::new(),
             pending_def: None,
@@ -550,6 +645,14 @@ impl LiteIdeApp {
             file_picker_query: String::new(),
             file_picker_dir: PathBuf::new(),
             file_picker_entries: Vec::new(),
+            file_index: fileindex::FileIndex::new(),
+            file_picker_expanded: false,
+            file_picker_scroll: 0.0,
+            file_picker_hits: Vec::new(),
+            file_picker_hits_query: String::new(),
+            file_picker_hits_limit: 0,
+            file_picker_hits_total: 0,
+            file_index_started: false,
             file_picker_focus: false,
             content_query: String::new(),
             content_results: Vec::new(),
@@ -630,9 +733,19 @@ impl LiteIdeApp {
             remote_item_rect: None,
             remote: WslFs::new(),
             terminal: TerminalSet::new(),
-        }
+        };
+        // 启动就把设置应用上（字号 / 主题 / 滚轮方向等）。
+        app.apply_settings_to_ui();
+        app
     }
 
+    /// 启动后尽早建好工作区文件索引（Ctrl+P 的模糊搜索要用）。
+    ///
+    /// 索引在后台线程建（远端工程一次 find 要几秒），第一帧就启动，
+    /// 这样用户按下 Ctrl+P 时通常已经能直接搜。
+    fn start_file_index(&mut self) {
+        self.ensure_file_index();
+    }
     /// 远程工作区的根（WSL 发行版内的 POSIX 路径）；未连接时为 `None`。
     ///
     /// 这里刻意不用 `\\wsl.localhost\...`：连上 WSL 后，文件、rg、git、clangd、终端
@@ -687,16 +800,68 @@ impl LiteIdeApp {
     }
 
     /// 读文本：远程走 WSL 内部（POSIX 路径），本地走 `std::fs`。
+    ///
+    /// 本地文件带一层内容缓存：mtime + size 都没变就直接复用（关掉标签再打开时
+    /// 不用重新读盘）。远程文件不缓存内容——WSL 那边拿不到 mtime，缓存容易读到
+    /// 旧内容，而一次 WSL 往返本来就只有 1ms 左右。
     fn read_text_file(&mut self, path: &std::path::Path) -> Result<String, String> {
         if self.is_remote_path(path) {
             let distro = self.settings.remote_distro.clone().unwrap_or_default();
             return self.remote.read_text(&distro, &path.to_string_lossy());
         }
-        std::fs::read_to_string(path).map_err(|e| e.to_string())
+        if let Some(text) = self.cached_file_text(path) {
+            return Ok(text);
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        self.store_file_cache(path, &text);
+        Ok(text)
+    }
+
+    /// 本地文件缓存命中（mtime + size 都没变才算命中）。
+    fn cached_file_text(&mut self, path: &std::path::Path) -> Option<String> {
+        let entry = self.file_cache.get(path)?;
+        if entry.at.elapsed() > CACHE_TTL {
+            return None;
+        }
+        let stamp = local_file_stamp(path)?;
+        if entry.mtime == Some(stamp.0) && entry.size == Some(stamp.1) {
+            Some(entry.text.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 存一份文件内容进缓存（超出上限就淘汰最旧的）。
+    fn store_file_cache(&mut self, path: &std::path::Path, text: &str) {
+        let Some((mtime, size)) = local_file_stamp(path) else {
+            return;
+        };
+        if self.file_cache.len() >= FILE_CACHE_CAP {
+            // HashMap 无序：随便丢一个最旧的（用写入时间最小的那条）。
+            if let Some(oldest) = self
+                .file_cache
+                .iter()
+                .min_by_key(|(_, v)| v.at)
+                .map(|(k, _)| k.clone())
+            {
+                self.file_cache.remove(&oldest);
+            }
+        }
+        self.file_cache.insert(
+            path.to_path_buf(),
+            CachedFile {
+                text: text.to_string(),
+                mtime: Some(mtime),
+                size: Some(size),
+                at: Instant::now(),
+            },
+        );
     }
 
     /// 写文本：远程写进 WSL 里的真实文件（不是 9P 视图），本地直接写盘。
     fn write_text_file(&mut self, path: &std::path::Path, text: &str) -> Result<(), String> {
+        // 文件刚被改过，缓存里的旧内容作废。
+        self.file_cache.remove(path);
         if self.is_remote_path(path) {
             let distro = self.settings.remote_distro.clone().unwrap_or_default();
             return self
@@ -881,6 +1046,11 @@ impl LiteIdeApp {
         self.lsp_ready_synced = false;
         self.hover_result = None;
         self.symbols.clear();
+        self.symbols_uri = None;
+        // 大纲/符号搜索：能命中缓存就直接用（文件没改过就不用再问 clangd）。
+        if let Some(uri) = self.current_uri.clone() {
+            self.request_symbols_for(&uri);
+        }
         self.editor_clean_seq = self.last_sync_seq;
         self.indent_hint = self
             .editor
@@ -1074,8 +1244,9 @@ impl LiteIdeApp {
         if self.lsp_status.is_ready() {
             if let Some(uri) = self.current_uri.clone() {
                 self.lsp.save_document(uri.clone());
-                let seq = self.lsp.request_symbols(uri);
-                self.pending_sym = Some(seq);
+                // 存盘后内容变了，符号缓存作废，重新要一遍。
+                self.file_symbols.remove(&uri);
+                self.request_symbols_for(&uri);
             }
         }
     }
@@ -1155,6 +1326,7 @@ impl LiteIdeApp {
         {
             if let Some(ed) = &mut self.editor {
                 ed.set_cursor_line_col(line, col);
+                ed.center_cursor_in_view();
             }
             return;
         }
@@ -1162,6 +1334,7 @@ impl LiteIdeApp {
             self.switch_to_tab(idx);
             if let Some(ed) = &mut self.editor {
                 ed.set_cursor_line_col(line, col);
+                ed.center_cursor_in_view();
             }
             return;
         }
@@ -1170,6 +1343,7 @@ impl LiteIdeApp {
                 self.open_file(target, text, true);
                 if let Some(ed) = &mut self.editor {
                     ed.set_cursor_line_col(line, col);
+                    ed.center_cursor_in_view();
                 }
             }
             Err(e) => self.flash(format!("无法打开 {}: {e}", win)),
@@ -1199,13 +1373,16 @@ impl LiteIdeApp {
     }
 
     fn poll_lsp(&mut self) {
+        // 文件索引的后台结果（Ctrl+P 模糊搜索用）。
+        self.file_index.poll();
         while let Some(ev) = self.lsp.poll() {
             match ev {
                 LspEvent::Status(s) => self.lsp_status = s,
                 LspEvent::Definition { seq, result } => {
-                    if self.pending_def == Some(seq) {
-                        self.pending_def = None;
-                        self.handle_definition(result);
+                    if let Some((pending_seq, name)) = self.pending_def.take() {
+                        if pending_seq == seq {
+                            self.handle_definition(name, result);
+                        }
                     }
                 }
                 LspEvent::Hover { seq, result } => {
@@ -1215,17 +1392,60 @@ impl LiteIdeApp {
                     }
                 }
                 LspEvent::Symbols { seq, result } => {
-                    if self.pending_sym == Some(seq) {
-                        self.pending_sym = None;
-                        match result {
-                            Ok(syms) => self.symbols = syms,
-                            Err(e) => tracing::warn!("documentSymbol 失败: {e}"),
+                    if let Some((pending_seq, uri)) = self.pending_sym.take() {
+                        if pending_seq == seq {
+                            let edit_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
+                            match result {
+                                Ok(syms) => {
+                                    // 进缓存：切回这个文件时直接复用。
+                                    self.file_symbols.insert(
+                                        uri.clone(),
+                                        CachedSymbols {
+                                            syms: syms.clone(),
+                                            edit_seq,
+                                            at: Instant::now(),
+                                        },
+                                    );
+                                    if self.current_uri.as_deref() == Some(uri.as_str()) {
+                                        self.symbols = syms;
+                                        self.symbols_uri = Some(uri);
+                                    }
+                                }
+                                Err(e) => tracing::warn!("documentSymbol 失败: {e}"),
+                            }
+                        }
+                    }
+                }
+                LspEvent::WorkspaceSymbol { seq, result } => {
+                    if let Some((pending_seq, name)) = self.pending_ws_symbol.take() {
+                        if pending_seq == seq {
+                            self.handle_workspace_symbol(name, result);
                         }
                     }
                 }
                 LspEvent::ServerLog(_) | LspEvent::Diagnostics { .. } => {}
             }
         }
+    }
+
+    /// 同步当前文件的文档符号（大纲 / 符号搜索）。
+    ///
+    /// 优先用缓存：文件没被改过（编辑序列号一致）且缓存没过 TTL，就直接复用，
+    /// 省掉一次 clangd 的 documentSymbol 解析。
+    fn request_symbols_for(&mut self, uri: &str) {
+        let edit_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
+        if let Some(c) = self.file_symbols.get(uri) {
+            if c.edit_seq == edit_seq && c.at.elapsed() < CACHE_TTL {
+                self.symbols = c.syms.clone();
+                self.symbols_uri = Some(uri.to_string());
+                return;
+            }
+        }
+        if !self.lsp_status.is_ready() {
+            return;
+        }
+        let seq = self.lsp.request_symbols(uri.to_string());
+        self.pending_sym = Some((seq, uri.to_string()));
     }
 
     fn sync_document(&mut self) {
@@ -1237,8 +1457,7 @@ impl LiteIdeApp {
                 if let Some(ed) = &self.editor {
                     self.lsp
                         .open_document(uri.clone(), ed.text(), self.doc_version);
-                    let seq = self.lsp.request_symbols(uri);
-                    self.pending_sym = Some(seq);
+                    self.request_symbols_for(&uri);
                 }
                 self.lsp_ready_synced = true;
                 self.last_sync_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
@@ -1255,27 +1474,36 @@ impl LiteIdeApp {
         }
     }
 
-    fn handle_definition(&mut self, result: Result<Vec<ide_lsp::Location>, String>) {
+    fn handle_definition(&mut self, name: String, result: Result<Vec<ide_lsp::Location>, String>) {
         match result {
             Ok(locs) if !locs.is_empty() => {
-                let loc = &locs[0];
-                // 远程工作区：clangd 回的是 `file:///home/...`（WSL 内部路径）。
-                let target = if self.is_remote() {
-                    uri_to_posix(&loc.uri).or_else(|| uri_to_win(&loc.uri))
-                } else {
-                    uri_to_win(&loc.uri)
-                };
-                match target {
-                    Some(win) => {
-                        let line = loc.range.start.line as usize;
-                        let col = loc.range.start.character as usize;
-                        tracing::info!("jump -> {win}:{}", line + 1);
-                        self.jump_to(&win, line, col);
+                if let Some(loc) = locs.first() {
+                    // 远程工作区：clangd 回的是 `file:///home/...`（WSL 内部路径）。
+                    let target = if self.is_remote() {
+                        uri_to_posix(&loc.uri).or_else(|| uri_to_win(&loc.uri))
+                    } else {
+                        uri_to_win(&loc.uri)
+                    };
+                    match target {
+                        Some(win) => {
+                            let line = loc.range.start.line as usize;
+                            let col = loc.range.start.character as usize;
+                            tracing::info!("jump -> {win}:{}", line + 1);
+                            self.jump_to(&win, line, col);
+                        }
+                        None => self.flash(format!("无法解析目标路径: {}", loc.uri)),
                     }
-                    None => self.flash(format!("无法解析目标路径: {}", loc.uri)),
                 }
             }
-            Ok(_) => self.flash("未找到定义".to_string()),
+            // clangd 没找到（还没索引完 / 符号在 compile_commands 之外）：
+            // 退到按名字找。
+            Ok(_) => {
+                if name.is_empty() {
+                    self.flash("未找到定义".to_string());
+                } else {
+                    self.lookup_symbol_by_name(name);
+                }
+            }
             Err(e) => self.flash(format!("跳转失败: {e}")),
         }
     }
@@ -1288,12 +1516,21 @@ impl LiteIdeApp {
                     .as_ref()
                     .and_then(|e| e.mouse_pos())
                     .unwrap_or(egui::Pos2::ZERO);
-                self.hover_result = Some((pos, clean_markdown(&info.markdown)));
+                self.hover_result = Some((pos, split_hover_markdown(&info.markdown)));
+                self.hover_retry_at = None;
             }
-            Ok(None) => self.hover_result = None,
+            // clangd 暂时没有（文件还在解析 / 符号不在索引里）：清掉「已请求」标记，
+            // 过一会儿自动重试 —— 以前这里直接放弃，提示框就再也不出现了。
+            Ok(None) => {
+                self.hover_result = None;
+                self.hover_requested_char = None;
+                self.hover_retry_at = Some(Instant::now() + HOVER_RETRY);
+            }
             Err(e) => {
                 tracing::warn!("hover 失败: {e}");
                 self.hover_result = None;
+                self.hover_requested_char = None;
+                self.hover_retry_at = Some(Instant::now() + HOVER_RETRY);
             }
         }
     }
@@ -1787,16 +2024,56 @@ impl LiteIdeApp {
     }
 
     fn on_goto_definition(&mut self) {
-        if !self.lsp_status.is_ready() {
-            self.flash("LSP 未就绪，无法跳转".to_string());
-            return;
-        }
-        let Some(uri) = self.current_uri.clone() else {
-            return;
-        };
         let Some((line, col)) = self.editor.as_ref().map(|e| e.cursor_line_col()) else {
             return;
         };
+        self.goto_definition_at(line, col);
+    }
+
+    /// Ctrl+左键：在点击位置跳到定义。
+    fn on_goto_definition_at_char(&mut self, char_idx: usize) {
+        let Some((line, col)) = self.editor.as_ref().map(|e| e.char_to_line_col(char_idx)) else {
+            return;
+        };
+        self.goto_definition_at(line, col);
+    }
+
+    /// 跳到 (line, col) 处的符号定义。
+    ///
+    /// 优先问 clangd（`textDocument/definition`，最准）；clangd 没就绪或答「没有」时，
+    /// 退到 `workspace/symbol` 按名字找（服务端索引），再退到本地缓存。
+    fn goto_definition_at(&mut self, line: usize, col: usize) {
+        // 记下跳转前的位置，供 Alt+Left 返回。
+        self.push_jump_history(line, col);
+        let name = self
+            .editor
+            .as_ref()
+            .and_then(|e| e.word_at_line_col(line, col))
+            .unwrap_or_default();
+
+        if self.lsp_status.is_ready() {
+            if let Some(uri) = self.current_uri.clone() {
+                let seq = self.lsp.request_definition(
+                    uri,
+                    Position {
+                        line: line as u32,
+                        character: col as u32,
+                    },
+                );
+                self.pending_def = Some((seq, name));
+                return;
+            }
+        }
+        // LSP 没就绪：直接走按名字找的路���。
+        if name.is_empty() {
+            self.flash("LSP 未就绪，无法跳转".to_string());
+            return;
+        }
+        self.lookup_symbol_by_name(name);
+    }
+
+    /// 压入跳转历史（后退栈），并清空前进栈。
+    fn push_jump_history(&mut self, line: usize, col: usize) {
         let same_pos = match self.jump_stack.last() {
             Some((p, l, c)) => {
                 let same_file = self
@@ -1817,21 +2094,152 @@ impl LiteIdeApp {
                 }
             }
         }
-        let seq = self.lsp.request_definition(
-            uri,
-            Position {
-                line: line as u32,
-                character: col as u32,
-            },
-        );
-        self.pending_def = Some(seq);
+        // VS Code 语义：发生新的跳转后，前进栈作废。
+        self.forward_stack.clear();
+    }
+
+    /// 按名字在工作区里找定义（`workspace/symbol`）。
+    fn lookup_symbol_by_name(&mut self, name: String) {
+        if name.is_empty() {
+            return;
+        }
+        // 缓存命中就直接跳（省一次服务器往返）。
+        if let Some(locs) = self.cached_symbol_locations(&name) {
+            if let Some(loc) = locs.first() {
+                self.goto_location(loc.clone());
+                return;
+            }
+        }
+        if !self.lsp_status.is_ready() {
+            self.flash(format!("未找到 `{name}` 的定义（LSP 未就绪）"));
+            return;
+        }
+        let seq = self.lsp.request_workspace_symbol(name.clone());
+        self.pending_ws_symbol = Some((seq, name));
+    }
+
+    /// 缓存里的符号位置（超过 TTL 视为没有）。
+    fn cached_symbol_locations(&mut self, name: &str) -> Option<Vec<ide_lsp::Location>> {
+        if self.symbol_cache_at.elapsed() > CACHE_TTL {
+            self.symbol_cache.clear();
+            self.symbol_cache_at = Instant::now();
+            return None;
+        }
+        self.symbol_cache.get(name).cloned()
+    }
+
+    /// 收到 `workspace/symbol` 的结果：进缓存并跳到最合适的一个。
+    fn handle_workspace_symbol(&mut self, name: String, result: Result<Vec<ide_lsp::WorkspaceSymbol>, String>) {
+        let syms = match result {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("workspace/symbol 失败: {e}");
+                Vec::new()
+            }
+        };
+        // 只保留名字完全匹配的（clangd 的模糊匹配会带上一堆同前缀的）。
+        let exact: Vec<ide_lsp::WorkspaceSymbol> = syms
+            .into_iter()
+            .filter(|s| s.name == name)
+            .collect();
+        let locs: Vec<ide_lsp::Location> = exact.iter().map(|s| s.location.clone()).collect();
+        if locs.is_empty() {
+            self.flash(format!("未找到 `{name}` 的定义"));
+            return;
+        }
+        self.symbol_cache.insert(name.clone(), locs.clone());
+        self.symbol_cache_at = Instant::now();
+        if let Some(loc) = self.pick_symbol_location(&locs) {
+            self.goto_location(loc);
+        }
+    }
+
+    /// 在多个候选位置里挑一个：优先当前文件，其次离当前文件路径最近的。
+    fn pick_symbol_location(&self, locs: &[ide_lsp::Location]) -> Option<ide_lsp::Location> {
+        let cur = self.current_file.clone()?;
+        let cur_dir = cur.parent().map(|p| p.to_path_buf());
+        let mut best: Option<(usize, &ide_lsp::Location)> = None;
+        for loc in locs {
+            let Some(path) = self.location_path(loc) else {
+                continue;
+            };
+            let score = if path == cur {
+                0
+            } else if let (Some(dir), Some(pdir)) = (&cur_dir, path.parent()) {
+                if dir == pdir {
+                    1
+                } else {
+                    2
+                }
+            } else {
+                3
+            };
+            if best.map(|(s, _)| score < s).unwrap_or(true) {
+                best = Some((score, loc));
+            }
+        }
+        best.map(|(_, l)| l.clone())
+    }
+
+    /// LSP 返回的 URI → 本地/远程路径。
+    fn location_path(&self, loc: &ide_lsp::Location) -> Option<PathBuf> {
+        if self.is_remote() {
+            uri_to_posix(&loc.uri).map(PathBuf::from)
+        } else {
+            uri_to_win(&loc.uri).map(PathBuf::from)
+        }
+    }
+
+    /// 跳到某个位置。
+    fn goto_location(&mut self, loc: ide_lsp::Location) {
+        let Some(path) = self.location_path(&loc) else {
+            self.flash(format!("无法解析目标路径: {}", loc.uri));
+            return;
+        };
+        let line = loc.range.start.line as usize;
+        let col = loc.range.start.character as usize;
+        tracing::info!("jump -> {}:{}", path.display(), line + 1);
+        self.jump_to(&path.to_string_lossy(), line, col);
     }
 
     fn on_go_back(&mut self) {
         if let Some((path, line, col)) = self.jump_stack.pop() {
+            // 当前位置存进前进栈，Alt+Right 可以再回来。
+            if let Some(cur) = self.current_file.clone() {
+                let (cl, cc) = self
+                    .editor
+                    .as_ref()
+                    .map(|e| e.cursor_line_col())
+                    .unwrap_or((line, col));
+                self.forward_stack.push((cur, cl, cc));
+                if self.forward_stack.len() > JUMP_STACK_CAP {
+                    let drop = self.forward_stack.len() - JUMP_STACK_CAP;
+                    self.forward_stack.drain(0..drop);
+                }
+            }
             self.jump_to(&path.to_string_lossy(), line, col);
         } else {
             self.flash("没有可返回的位置".to_string());
+        }
+    }
+
+    fn on_go_forward(&mut self) {
+        if let Some((path, line, col)) = self.forward_stack.pop() {
+            if let Some(cur) = self.current_file.clone() {
+                let (cl, cc) = self
+                    .editor
+                    .as_ref()
+                    .map(|e| e.cursor_line_col())
+                    .unwrap_or((line, col));
+                self.jump_stack.push((cur, cl, cc));
+                if self.jump_stack.len() > JUMP_STACK_CAP {
+                    let drop = self.jump_stack.len() - JUMP_STACK_CAP;
+                    self.jump_stack.drain(0..drop);
+                }
+            }
+            self.jump_to(&path.to_string_lossy(), line, col);
+        } else {
+            self.flash("没有可前进的位置".to_string());
         }
     }
 
@@ -1842,8 +2250,14 @@ impl LiteIdeApp {
                 match self.hover_anchor {
                     Some((ac, t)) if ac == c => {
                         let ready = self.lsp_status.is_ready();
+                        // 没拿到内容时按 HOVER_RETRY 重试（clangd 可能还在解析）。
+                        let retry_ok = self
+                            .hover_retry_at
+                            .map(|at| Instant::now() >= at)
+                            .unwrap_or(true);
                         if t.elapsed() >= HOVER_DWELL
                             && ready
+                            && retry_ok
                             && self.hover_requested_char != Some(c)
                             && self.pending_hover.is_none()
                         {
@@ -1867,6 +2281,7 @@ impl LiteIdeApp {
                         if self.hover_requested_char != Some(c) {
                             self.hover_result = None;
                             self.hover_requested_char = None;
+                            self.hover_retry_at = None;
                         }
                         self.hover_anchor = Some((c, Instant::now()));
                     }
@@ -1875,25 +2290,42 @@ impl LiteIdeApp {
             None => {
                 self.hover_anchor = None;
                 self.hover_requested_char = None;
+                self.hover_retry_at = None;
                 self.hover_result = None;
             }
         }
-        if let Some((pos, text)) = &self.hover_result {
-            if !text.is_empty() {
+        if let Some((pos, content)) = &self.hover_result {
+            if content.signature.is_some() || !content.docs.is_empty() {
                 egui::Area::new(egui::Id::new("lsp_hover_area"))
                     .fixed_pos(egui::pos2(pos.x + 14.0, pos.y + 22.0))
                     .order(egui::Order::Tooltip)
                     .show(ctx, |ui| {
+                        // VS Code 的 hover：编辑器底色 + 一圈细边框。
                         egui::Frame::popup(ui.style())
-                            .fill(hex(ide_core::theme::BG_SIDEBAR))
+                            .fill(hex("#1e1e1e"))
+                            .stroke(egui::Stroke::new(1.0_f32, hex("#454545")))
                             .show(ui, |ui| {
-                                ui.set_max_width(560.0);
-                                ui.label(
-                                    egui::RichText::new(text)
-                                        .monospace()
-                                        .size(12.0)
-                                        .color(hex("#d4d4d4")),
-                                );
+                                ui.set_max_width(500.0);
+                                if let Some(sig) = &content.signature {
+                                    ui.label(
+                                        egui::RichText::new(sig.clone())
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(hex("#d4d4d4")),
+                                    );
+                                }
+                                if !content.docs.is_empty() {
+                                    if content.signature.is_some() {
+                                        ui.add_space(4.0);
+                                        ui.separator();
+                                        ui.add_space(4.0);
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(content.docs.clone())
+                                            .size(12.0)
+                                            .color(hex("#d4d4d4")),
+                                    );
+                                }
                             });
                     });
             }
@@ -1920,6 +2352,29 @@ impl LiteIdeApp {
 
     // ---- 阶段 4 UI ----
 
+    /// 索引里的相对路径 → 绝对路径（远程是 WSL 里的 POSIX 路径）。
+    fn picker_path_for(&self, rel: &str) -> PathBuf {
+        if self.is_remote() {
+            PathBuf::from(format!("{}/{}", self.workspace_root(), rel))
+        } else {
+            PathBuf::from(self.project_root()).join(rel)
+        }
+    }
+
+    /// 确保工作区文件索引已按当前根建好（后台线程）。
+    fn ensure_file_index(&mut self) {        let (distro, posix_root) = if self.is_remote() {
+            (
+                self.settings.remote_distro.clone(),
+                Some(self.workspace_root()),
+            )
+        } else {
+            (None, None)
+        };
+        let local_root = PathBuf::from(self.project_root());
+        self.file_index
+            .ensure(&local_root, distro.as_deref(), posix_root.as_deref());
+    }
+
     /// 切换文件浏览器的当前目录：重新读取目录项并清空过滤词。
     fn set_file_picker_dir(&mut self, dir: PathBuf) {
         self.file_picker_entries = self.list_dir_entries(&dir);
@@ -1932,6 +2387,10 @@ impl LiteIdeApp {
         self.file_picker_open = true;
         self.file_picker_focus = true;
         self.file_picker_query.clear();
+        // 每次打开都回到「只显示 20 条」。
+        self.file_picker_expanded = false;
+        // 后台建工作区文件索引（Ctrl+P 的模糊搜索要用）。
+        self.ensure_file_index();
         if self.file_picker_dir.as_os_str().is_empty() {
             // 远程工作区：从工作区根开始浏览（用户在 WSL 里工作，不是本地目录）。
             let start = if self.is_remote() {
@@ -1949,12 +2408,15 @@ impl LiteIdeApp {
         }
     }
 
-    /// Ctrl+P / File▸Open…：文件系统浏览窗口（可进入工程以外的目录）。
+    /// Ctrl+P / File▸Open…：工作区文件快速打开（VS Code 风格）。
     ///
-    /// 与旧版「只在工程文件清单里模糊匹配」不同，这里直接浏览磁盘：
     /// - 输入框：输入**存在的**目录/文件路径后回车 → 进入 / 打开；
-    ///   否则当作当前目录的过滤词（打字即过滤）。
-    /// - 列表：目录在前，点击目录进入、点击文件打开；`上一层`回上级目录。
+    ///   否则当作**搜索词**：在整个工作区里做模糊匹配（VS Code 的 "file results"），
+    ///   命中的文件按相关度排序，回车打开第一个。
+    /// - 列表：先显示模糊匹配结果（文件名 + 灰色目录前缀），没有匹配时退回浏览当前目录；
+    ///   目录在前，点击目录进入、点击文件打开；`上一层`回上级目录。
+    /// - 默认只显示 **20 条**（VS Code 的 quick-open 也是这个量级），点「显示更多」
+    ///   才把剩下的全部列出来 —— 列表短、滚动快、视觉干净。
     fn draw_file_picker(&mut self, ctx: &egui::Context) {
         if !self.file_picker_open {
             return;
@@ -1967,13 +2429,42 @@ impl LiteIdeApp {
         let mut go_dir_guess: Option<PathBuf> = None;
         let mut esc = false;
         let mut want_focus = self.file_picker_focus;
+        let mut show_more = false;
+        // 列表的滚动偏移（自己维护，见下面「结果列表」的说明）。
+        let mut picker_scroll = self.file_picker_scroll;
         let dir = self.file_picker_dir.clone();
         let entries = self.file_picker_entries.clone();
+        // 工作区模糊搜索结果（文件名 + 相对路径 + 命中位置）。
+        // 一次最多算 20 条（`PICKER_PAGE`），要更多再点「显示更多」。
+        let limit = if self.file_picker_expanded {
+            PICKER_MAX_RESULTS
+        } else {
+            PICKER_PAGE
+        };
+        // 结果按「查询词 + 条数上限」缓存：Picker 是每帧重绘的，
+        // 不缓存的话每帧都要扫三万多个条目（打字时明显发顿）。
+        if self.file_picker_hits_query != query || self.file_picker_hits_limit != limit {
+            self.file_picker_hits = self.file_index.search(&query, limit);
+            self.file_picker_hits_total = self.file_index.total_matches();
+            self.file_picker_hits_query = query.clone();
+            self.file_picker_hits_limit = limit;
+        }
+        let hits = &self.file_picker_hits;
+        // 「显示更多」只在结果被截断时出现。
+        let total = self.file_picker_hits_total;
+        let has_more = total > hits.len();
+        // 回车打开最匹配的那个（先把路径取出来：后面要改 `self`）。
+        let first_rel = hits.first().map(|h| h.rel.clone());
         let shown = filter_dir_entries(&entries, &query);
         let row_h = 20.0_f32;
         // 窗口尺寸每帧按结果条数算死：内容多时到 360 封顶后滚动，
         // 内容少时窗口自动收窄——这样不会出现「列表很短、窗口却很大」的空洞。
-        let rows_h = ((shown.len().max(1) as f32) * row_h).clamp(row_h, 360.0);
+        let list_rows = if hits.is_empty() {
+            shown.len()
+        } else {
+            hits.len()
+        };
+        let rows_h = ((list_rows.max(1) as f32) * row_h).clamp(row_h, 360.0);
         egui::Window::new("Open File  (Ctrl+P)")
             .open(&mut open)
             .collapsible(false)
@@ -2025,45 +2516,156 @@ impl LiteIdeApp {
                     .selectable(true),
                 );
                 ui.add_space(2.0);
-                // ---- 条目列表：虚拟滚动（大目录也不卡）；条目少时窗口贴合内容高度 ----
-                egui::ScrollArea::vertical()
-                    .max_height(360.0)
-                    .auto_shrink([false, true])
-                    .show_rows(ui, row_h, shown.len(), |ui, range| {
-                        if shown.is_empty() {
-                            ui.label(
-                                RichText::new("(空目录 / 无匹配)")
+                // ---- 结果列表：优先显示工作区模糊匹配（VS Code 的 file results） ----
+                //
+                // 自己画虚拟列表（不用 egui 的 ScrollArea）：
+                // - egui 的 ScrollArea 靠 `smooth_scroll_delta` 滚动，而那个值会被
+                //   **平滑到十几帧**才发完；我们的窗口又是 on-demand 重绘的，
+                //   于是滚轮几乎没反应（实测滚 15 格只动几个像素）。
+                // - 自己维护偏移就能一格滚 3 行（VS Code 的手感），也更好控制对齐。
+                if !hits.is_empty() {
+                    let list_rect = ui.allocate_exact_size(
+                        egui::vec2(row_w, rows_h),
+                        egui::Sense::click(),
+                    ).0;
+                    let clip_painter = ui.painter().with_clip_rect(list_rect);
+                    let painter = &clip_painter;
+                    // 滚轮：直接吃原始事件（不走 egui 的平滑），一格 3 行。
+                    let mut scroll_by = 0.0_f32;
+                    for ev in ui.input(|i| i.events.clone()) {
+                        if let egui::Event::MouseWheel { unit, delta, .. } = ev {
+                            // 方向：**滚轮向下 = 看到更前面的内容**（与编辑器一致，
+                            // 跟用户系统上的方向相同）。
+                            let lines = match unit {
+                                egui::MouseWheelUnit::Line => delta.y * 3.0,
+                                egui::MouseWheelUnit::Point => delta.y / row_h,
+                                egui::MouseWheelUnit::Page => delta.y * 20.0,
+                            };
+                            scroll_by -= lines * row_h;
+                        }
+                    }
+                    let max_scroll = ((hits.len() as f32) * row_h - rows_h).max(0.0);
+                    let scroll = (picker_scroll + scroll_by).clamp(0.0, max_scroll);
+                    if scroll != picker_scroll {
+                        picker_scroll = scroll;
+                    }
+                    // 只画看得见的行（虚拟化）。
+                    let first = (scroll / row_h).floor() as usize;
+                    let visible = (rows_h / row_h).ceil() as usize + 1;
+                    let last = (first + visible).min(hits.len());
+                    for (i, hit) in hits.iter().enumerate().take(last).skip(first) {
+                        let dir_part = match hit.rel.rfind('/') {
+                            Some(p) => format!("{}/", &hit.rel[..p]),
+                            None => String::new(),
+                        };
+                        let y = list_rect.top() + (i as f32) * row_h - scroll;
+                        if picker_hit_row(
+                            painter,
+                            ui,
+                            egui::Rect::from_min_size(
+                                egui::pos2(list_rect.left(), y),
+                                egui::vec2(row_w, row_h),
+                            ),
+                            i,
+                            &PickerRow {
+                                name: &hit.name,
+                                dir_part: &dir_part,
+                                color: file_icon_color(&hit.name),
+                                hits: PickerHits {
+                                    name: &hit.hits,
+                                },
+                            },
+                        ) {
+                            open_path = Some(self.picker_path_for(&hit.rel));
+                        }
+                    }
+                    // 右侧滚动条（VS Code 也有），提示还有多少内容。
+                    if max_scroll > 0.0 {
+                        let track_h = rows_h;
+                        let thumb_h = (track_h * track_h / (hits.len() as f32 * row_h)).max(24.0);
+                        let thumb_y = list_rect.top() + (scroll / max_scroll) * (track_h - thumb_h);
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(list_rect.right() - 4.0, thumb_y),
+                                egui::vec2(3.0, thumb_h),
+                            ),
+                            1.5,
+                            hex("#8a8a8a"),
+                        );
+                    }
+                    // ---- 「显示更多」：默认只给 20 条，想要更多再点开 ----
+                    if has_more {
+                        ui.add_space(2.0);
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new(format!("显示更多结果…（共 {total} 条）"))
+                                    .size(12.0)
+                                    .color(hex("#3794ff")),
+                            ))
+                            .clicked()
+                        {
+                            show_more = true;
+                        }
+                    }
+                } else {
+                    // ---- 没有匹配：退回浏览当前目录 ----
+                    egui::ScrollArea::vertical()
+                        .max_height(360.0)
+                        .auto_shrink([false, true])
+                        .show_rows(ui, row_h, shown.len(), |ui, range| {
+                            if shown.is_empty() {
+                                ui.label(
+                                    RichText::new(if self.file_index.state()
+                                        == &fileindex::IndexState::Building
+                                    {
+                                        "(正在索引工作区…)"
+                                    } else {
+                                        "(空目录 / 无匹配)"
+                                    })
                                     .size(12.0)
                                     .color(hex("#6a6a6a")),
-                            );
-                            return;
-                        }
-                        for &i in &shown[range] {
-                            let (name, is_dir) = &entries[i];
-                            let (icon, color) = if *is_dir {
-                                (Codicon::Folder, hex("#dcb67a"))
-                            } else {
-                                (Codicon::File, file_icon_color(name))
-                            };
-                            if browser_row(ui, row_w, row_h, icon, name, color) {
-                                let p = dir.join(name);
-                                if *is_dir {
-                                    go_dir = Some(p);
+                                );
+                                return;
+                            }
+                            for &i in &shown[range] {
+                                let (name, is_dir) = &entries[i];
+                                let (icon, color) = if *is_dir {
+                                    (Codicon::Folder, hex("#dcb67a"))
                                 } else {
-                                    open_path = Some(p);
+                                    (Codicon::File, file_icon_color(name))
+                                };
+                                if browser_row(ui, row_w, row_h, icon, name, color) {
+                                    let p = dir.join(name);
+                                    if *is_dir {
+                                        go_dir = Some(p);
+                                    } else {
+                                        open_path = Some(p);
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                }
             });
         self.file_picker_open = open && !esc;
         self.file_picker_focus = want_focus;
+        // 查询词变了就重新收起（「显示更多」只对当前查询有效）。
+        if query != self.file_picker_query {
+            self.file_picker_expanded = false;
+            self.file_picker_scroll = 0.0;
+        }
         self.file_picker_query = query;
+        self.file_picker_scroll = picker_scroll;
+        if show_more {
+            self.file_picker_expanded = true;
+        }
         if let Some(p) = go_dir_guess {
             if self.path_is_dir(&p) {
                 go_dir = Some(p);
             } else if self.path_is_file(&p) {
                 open_path = Some(p);
+            } else if let Some(first) = first_rel {
+                // 不是路径 → 当搜索词：打开最匹配的那个（VS Code 的行为）。
+                open_path = Some(self.picker_path_for(&first));
             }
         }
         if let Some(d) = go_dir {
@@ -2918,16 +3520,17 @@ impl LiteIdeApp {
         self.save_settings();
     }
 
-    /// 把当前设置应用到编辑器（字号/主题/minimap）。
+    /// 把当前设置应用到编辑器（字号/主题/minimap/滚轮方向）。
     fn apply_settings_to_ui(&mut self) {
         let kind = ThemeKind::from_name(&self.settings.theme);
         let tokens = theme_tokens(&self.host, kind);
+        let scroll_inverted = self.settings.scroll_reversed();
         if let Some(ed) = &mut self.editor {
             ed.set_typography(self.settings.font_size);
             ed.set_theme(kind, &tokens);
             ed.set_minimap(self.settings.show_minimap);
-        }
-        self.applied_font = self.settings.font_size;
+            ed.set_scroll_inverted(scroll_inverted);
+        }        self.applied_font = self.settings.font_size;
         self.applied_theme = kind;
     }
 
@@ -2943,6 +3546,7 @@ impl LiteIdeApp {
         let mut show_minimap = self.settings.show_minimap;
         let mut show_breadcrumbs = self.settings.show_breadcrumbs;
         let mut show_sidebar = self.settings.show_sidebar;
+        let scroll_dir = self.settings.mouse_scroll_direction.clone();
         let config_path = AppSettings::config_path();
         let theme_kind = ThemeKind::from_name(&theme);
         // 扩展宿主快照（闭包里不再借用 self）。
@@ -3007,6 +3611,15 @@ impl LiteIdeApp {
                 if ui.checkbox(&mut show_sidebar, "Show sidebar").changed() {
                     actions.push(SettingsAction::Sidebar(show_sidebar));
                 }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Mouse wheel:").size(13.0));
+                    for (value, label) in [("normal", "Normal"), ("reversed", "Reversed")] {
+                        if ui.selectable_label(scroll_dir == value, label).clicked() {
+                            actions.push(SettingsAction::ScrollDirection(value.to_string()));
+                        }
+                    }
+                });
                 ui.add_space(6.0);
                 if ui.button("Reset to defaults").clicked() {
                     actions.push(SettingsAction::Reset);
@@ -3081,6 +3694,12 @@ impl LiteIdeApp {
                 }
                 SettingsAction::Sidebar(on) => {
                     self.settings.show_sidebar = on;
+                    self.save_settings();
+                }
+                SettingsAction::ScrollDirection(dir) => {
+                    self.settings.mouse_scroll_direction = dir;
+                    // 立刻生效（编辑器 + 终端都改）。
+                    self.apply_settings_to_ui();
                     self.save_settings();
                 }
                 SettingsAction::Reset => {
@@ -3394,6 +4013,7 @@ impl LiteIdeApp {
             "view.switchTheme" => self.switch_theme(),
             "go.definition" => self.on_goto_definition(),
             "go.back" => self.on_go_back(),
+            "go.forward" => self.on_go_forward(),
             "go.line" => {
                 self.goto_line_open = true;
                 self.goto_line_input.clear();
@@ -5650,6 +6270,12 @@ impl eframe::App for LiteIdeApp {
             ctx.request_repaint();
         }
 
+        // 工作区文件索引（Ctrl+P 的模糊搜索）：第一帧就启动后台构建。
+        if !self.file_index_started {
+            self.file_index_started = true;
+            self.start_file_index();
+        }
+
         // 设置热重载：外部修改 JSON 自动生效
         if self.settings.hot_reload(&mut self.config_mtime) {
             tracing::info!("settings hot-reloaded");
@@ -5790,7 +6416,11 @@ impl eframe::App for LiteIdeApp {
 
         match action {
             Some(EditorAction::GotoDefinition) => self.on_goto_definition(),
+            Some(EditorAction::GotoDefinitionAt(char_idx)) => {
+                self.on_goto_definition_at_char(char_idx)
+            }
             Some(EditorAction::GoBack) => self.on_go_back(),
+            Some(EditorAction::GoForward) => self.on_go_forward(),
             Some(EditorAction::SymbolSearch) => {
                 self.symbol_search_open = !self.symbol_search_open;
                 self.symbol_filter.clear();
@@ -6915,6 +7545,172 @@ fn browser_row(
     resp.clicked()
 }
 
+/// VS Code 的 Quick-Input 配色（Dark+ / Dark Modern，直接取自本机 VS Code 安装目录里的
+/// `themes/dark_vs.json` 和 `themes/dark_modern.json`）。
+///
+/// - 命中部分：`list.highlightForeground` = **#2AAAFF**（VS Code 默认的深蓝，
+///   不是我们之前用的青色 `#4ec9b0`）；
+/// - 普通文字：`foreground` = **#CCCCCC**；
+/// - 目录路径（description）：`descriptionForeground` = **#9D9D9D**。
+mod picker_colors {
+    /// 命中部分（`list.highlightForeground`）。
+    pub const HIGHLIGHT: &str = "#2AAAFF";
+    /// 普通文字（`foreground`）。
+    pub const FOREGROUND: &str = "#CCCCCC";
+    /// 目录路径（`descriptionForeground`）。
+    pub const DESCRIPTION: &str = "#9D9D9D";
+}
+
+/// 一行里的命中位置：文件名里的命中。
+struct PickerHits<'a> {
+    /// 命中字符在文件名里的下标。
+    name: &'a [usize],
+}
+
+/// 结果列表里的一行（画一行的全部素材）。
+struct PickerRow<'a> {
+    /// 文件名。
+    name: &'a str,
+    /// 目录前缀（灰色显示）。
+    dir_part: &'a str,
+    /// 图标颜色。
+    color: egui::Color32,
+    /// 命中位置。
+    hits: PickerHits<'a>,
+}
+
+/// 文件快速打开的一行：文件名（**命中部分高亮**）+ 目录前缀（灰色），像 VS Code 那样。
+///
+/// 图标 / 文件名 / 目录前缀必须落在**同一条基线**上：
+/// - 文件名和目录前缀用同一套字体 → 同一条基线（用 galley 的 `pos.y` 对齐）；
+/// - 图标是另一套字体（codicon），按它的**墨迹中心**（`mesh_bounds`）去对齐，
+///   这样图标不会因为字体度量不同而偏高或偏低 1~2px。
+///
+/// 图标和文件名之间留一段空隙（VS Code 就是这样的，不挤在一起）。
+fn picker_hit_row(
+    painter: &egui::Painter,
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    row_id: usize,
+    row: &PickerRow<'_>,
+) -> bool {
+    let PickerRow {
+        name,
+        dir_part,
+        color,
+        hits,
+    } = row;
+    // 每一行都要有自己的 Id，否则 egui 会报「同一个 Id 用在两处」。
+    let resp = ui.interact(
+        rect,
+        ui.id().with(("picker_row", row_id)),
+        egui::Sense::click(),
+    );
+    if resp.hovered() {
+        painter.rect_filled(rect, 3.0, hex("#2a2d2e"));
+    }
+    // 命中的字符用强调色（VS Code 的 quick-open 就是这么标的）。
+    //
+    // 用 egui 的 LayoutJob 一次排版（而不是一个字符一个字符地画）：
+    // 这样字距完全走 egui 自己的排版结果，和后面的目录前缀不会错位。
+    let font = egui::FontId::monospace(12.0);
+    let layout = |text: &str,
+                  hits: &[usize],
+                  matched_color: egui::Color32,
+                  plain_color: egui::Color32|
+     -> std::sync::Arc<egui::epaint::Galley> {
+        let mut job = egui::text::LayoutJob::default();
+        let mut hit = hits.iter().copied().peekable();
+        let mut buf = String::new();
+        let mut buf_matched = false;
+        let flush = |job: &mut egui::text::LayoutJob, buf: &mut String, matched: bool| {
+            if buf.is_empty() {
+                return;
+            }
+            job.append(
+                buf.as_str(),
+                0.0,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color: if matched {
+                        matched_color
+                    } else {
+                        plain_color
+                    },
+                    ..Default::default()
+                },
+            );
+            buf.clear();
+        };
+        for (i, ch) in text.chars().enumerate() {
+            let matched = hit.peek() == Some(&i);
+            if matched {
+                hit.next();
+            }
+            if matched != buf_matched && !buf.is_empty() {
+                flush(&mut job, &mut buf, buf_matched);
+            }
+            buf_matched = matched;
+            buf.push(ch);
+        }
+        flush(&mut job, &mut buf, buf_matched);
+        ui.fonts(|f| f.layout_job(job))
+    };
+
+    // 图标：按 codicon 自己的墨迹中心对齐到行的中心（字体不同，直接用
+    // 「中心点」画会差 1~2px）。
+    let icon_size = 15.0;
+    let icon_galley = ui.fonts(|f| {
+        f.layout_no_wrap(
+            Codicon::File.glyph().to_string(),
+            codicon_font(icon_size),
+            *color,
+        )
+    });
+    let icon_ink_mid = icon_galley.mesh_bounds.center().y;
+    let icon_x = rect.left() + 10.0;
+    let icon_w = icon_galley.size().x;
+    painter.galley(
+        egui::pos2(icon_x, rect.center().y - icon_ink_mid),
+        icon_galley,
+        *color,
+    );
+
+    // 文件名：命中部分用强调色（VS Code 的 quick-open 就是这么标的）。
+    let galley = layout(
+        name,
+        hits.name,
+        hex(picker_colors::HIGHLIGHT),
+        hex(picker_colors::FOREGROUND),
+    );
+    let name_w = galley.size().x;
+    // 文字的墨迹中心（相对 galley 原点）→ 用来把整行摆到行中心。
+    let name_ink_mid = galley.mesh_bounds.center().y;
+    let name_top = rect.center().y - name_ink_mid;
+    // 图标右侧留 6px 空隙（VS Code 就是这个量级，不挤在一起）。
+    let name_x = icon_x + icon_w + 6.0;
+    painter.galley(
+        egui::pos2(name_x, name_top),
+        galley,
+        hex(picker_colors::FOREGROUND),
+    );
+
+    // 目录前缀：**灰度**（VS Code 的路径就是灰的，不参与命中高亮），
+    // 跟文件名共用同一个顶部位置 → 自然是同一条基线。
+    let dir_galley = layout(
+        dir_part,
+        &[],
+        hex(picker_colors::DESCRIPTION),
+        hex(picker_colors::DESCRIPTION),
+    );
+    painter.galley(
+        egui::pos2(name_x + name_w + 10.0, name_top),
+        dir_galley,
+        hex(picker_colors::DESCRIPTION),
+    );
+    resp.clicked()
+}
+
 fn dap_status_label(s: &DapStatus) -> String {
     match s {
         DapStatus::Off => "DBG: off".to_string(),
@@ -7029,18 +7825,74 @@ fn draw_var_node(
     }
 }
 
-fn clean_markdown(s: &str) -> String {
-    s.lines()
-        .filter(|l| !l.trim_start().starts_with("```"))
+/// 悬浮提示的内容（VS Code 的 hover 布局：上面签名、下面文档）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HoverContent {
+    /// 签名（clangd 给的第一个 ``` 代码块，如 `void foo(int a)`）。
+    signature: Option<String>,
+    /// 文档说明（代码块之外的文字，通常是头文件上的注释）。
+    docs: String,
+}
+
+/// 把 clangd 的 hover markdown 拆成「签名 + 文档」。
+///
+/// clangd 返回的是 markdown：第一段 ```cpp 代码块是符号签名，后面是文档注释。
+/// VS Code 会把签名用等宽字体单独显示、文档用正文字体，我们照着来。
+fn split_hover_markdown(md: &str) -> HoverContent {
+    let mut signature: Option<String> = None;
+    let mut docs: Vec<String> = Vec::new();
+    let mut code: Vec<String> = Vec::new();
+    let mut in_code = false;
+    for line in md.lines() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            if in_code {
+                in_code = false;
+                if signature.is_none() {
+                    signature = Some(code.join("\n").trim().to_string());
+                }
+                code.clear();
+            } else {
+                in_code = true;
+            }
+            continue;
+        }
+        if in_code {
+            code.push(line.to_string());
+        } else {
+            docs.push(t.to_string());
+        }
+    }
+    // 代码块没有闭合（少见）：也当成签名。
+    if signature.is_none() && !code.is_empty() {
+        signature = Some(code.join("\n").trim().to_string());
+    }
+    let docs = docs
+        .into_iter()
         .map(|l| {
-            let l = l.trim().trim_start_matches('>').trim();
-            l.replace("**", "")
+            // clangd 的文档注释带 `///` 前缀，VS Code 渲染 markdown 时不显示它。
+            let l = l.trim_start();
+            let l = l
+                .strip_prefix("///")
+                .or_else(|| l.strip_prefix("//"))
+                .unwrap_or(l);
+            // markdown 标题标记（`### algorithm`）也不显示，只留文字。
+            let l = l.trim_start().trim_start_matches('#').trim_start();
+            decode_html_entities(l.trim().replace("**", ""))
         })
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && l != "-" && l != "—")
         .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+        .join("\n");
+    HoverContent { signature, docs }
+}
+
+/// 解码 clangd markdown 里的基础 HTML 实体（`&amp;` `&lt;` `&gt;` `&quot;`）。
+fn decode_html_entities(s: String) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 fn kind_color(kind: u32) -> egui::Color32 {
@@ -7255,14 +8107,24 @@ mod tests {
         );
     }
 
+    /// hover 内容拆分成「签名 + 文档」（VS Code 的 hover 布局）。
     #[test]
-    fn clean_markdown_strips_fences_and_bold() {
+    fn hover_markdown_splits_signature_and_docs() {
         let md = "```cpp\nint add(int a, int b)\n```\n\n**Adds** two integers.";
-        let out = super::clean_markdown(md);
-        assert!(!out.contains("```"));
-        assert!(!out.contains("**"));
-        assert!(out.contains("int add(int a, int b)"));
-        assert!(out.contains("Adds"));
+        let out = super::split_hover_markdown(md);
+        assert_eq!(out.signature.as_deref(), Some("int add(int a, int b)"));
+        assert!(out.docs.contains("Adds two integers."));
+        assert!(!out.docs.contains("**"));
+        assert!(!out.docs.contains("```"));
+
+        // 没有代码块：整段算文档。
+        let plain = super::split_hover_markdown("just docs");
+        assert!(plain.signature.is_none());
+        assert_eq!(plain.docs, "just docs");
+
+        // markdown 标题标记和空列表项不显示（VS Code 是渲染 markdown，不是显示源码）。
+        let fancy = super::split_hover_markdown("### algorithm\n-\nprovides 'transform'");
+        assert_eq!(fancy.docs, "algorithm\nprovides 'transform'");
     }
 
     #[test]

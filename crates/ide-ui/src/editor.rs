@@ -1,4 +1,4 @@
-//! LiteIDE 编辑器组件：行号栏、当前行高亮、光标、选区、tree-sitter 语法高亮。
+﻿//! LiteIDE 编辑器组件：行号栏、当前行高亮、光标、选区、tree-sitter 语法高亮。
 //!
 //! 渲染策略：手动虚拟滚动——只画可视行，避免为 5000 行每行分配 widget。
 //! 高亮区间来自 `ide_core::Highlighter`（字节偏移），文本脏时重算。
@@ -60,6 +60,8 @@ const BREAKPOINT_CX: f32 = 12.0;
 const TEXT_PAD_LEFT: f32 = 8.0;
 const MINIMAP_WIDTH: f32 = 48.0;
 const INDENT_STEP: usize = 4;
+/// 一格鼠标滚轮滚动多少行（VS Code 默认 `editor.mouseWheelScrollSensitivity` = 3 行）。
+const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
 
@@ -68,8 +70,12 @@ const MAX_FONT_SIZE: f32 = 24.0;
 pub enum EditorAction {
     /// F12：跳转定义。
     GotoDefinition,
+    /// Ctrl+左键：跳到光标下符号的定义（字符下标）。
+    GotoDefinitionAt(usize),
     /// Alt+Left：返回上一位置。
     GoBack,
+    /// Alt+Right：前进到跳转前的位置。
+    GoForward,
     /// Ctrl+T：符号搜索。
     SymbolSearch,
     /// Ctrl+S：保存文件。
@@ -186,6 +192,15 @@ pub struct Editor {
     mouse_char: Option<usize>,
     /// 鼠标悬停位置（绘制 hover 浮窗用）。
     mouse_pos: Option<egui::Pos2>,
+    /// 滚轮方向反转（设置项 `mouse.scrollDirection` = reversed 时为 true）。
+    scroll_inverted: bool,
+    /// 鼠标悬停处的标识符范围（字符下标，含端点）。
+    ///
+    /// VS Code：光标悬停在符号上会给这个词加一条下划线；按住 Ctrl/⌘ 时再叠加
+    /// 一层背景高亮（提示「Ctrl+点击可以跳过去」）。
+    hover_word: Option<(usize, usize)>,
+    /// 悬停时是否按住了 Ctrl/⌘（决定是否画背景高亮）。
+    hover_word_modifier: bool,
     // ---- 阶段 5 ----
     font_size: f32,
     line_height: f32,
@@ -232,6 +247,9 @@ impl Editor {
             edit_seq: 0,
             mouse_char: None,
             mouse_pos: None,
+            scroll_inverted: false,
+            hover_word: None,
+            hover_word_modifier: false,
             font_size: 14.0,
             line_height: 21.0, // 14 * 1.5
             kind: ThemeKind::CppDark,
@@ -298,10 +316,37 @@ impl Editor {
         self.buffer.char_to_line_col(char_idx)
     }
 
+    /// (0-based 行, 列) → 字符索引。
+    pub fn line_col_to_char(&self, line: usize, col: usize) -> usize {
+        self.buffer.line_col_to_char(line, col)
+    }
+
+    /// (0-based 行, 列) 处的标识符（跳转兜底时按名字找符号）。
+    pub fn word_at_line_col(&self, line: usize, col: usize) -> Option<String> {
+        self.word_at(self.line_col_to_char(line, col))
+    }
+
     /// 按 0-based 行列设置光标（越界自动钳制）。
     pub fn set_cursor_line_col(&mut self, line: usize, col: usize) {
         self.cursor = self.buffer.line_col_to_char(line, col);
         self.selection = None;
+    }
+
+    /// 把光标所在行滚到视口**正中**（VS Code 的 Go to Definition 行为）。
+    ///
+    /// 只保证「看得见」不够：目标贴在视口上/下边缘时，用户还得再滚一下才看得到
+    /// 上下文。VS Code 是把目标放在中间。
+    pub fn center_cursor_in_view(&mut self) {
+        if self.viewport_h <= 0.0 {
+            return;
+        }
+        let line = self.buffer.char_to_line_col(self.cursor).0;
+        let y = line as f32 * self.line_height;
+        let target = y + self.line_height * 0.5 - self.viewport_h * 0.5;
+        let max_scroll =
+            (self.buffer.line_count() as f32 * self.line_height).max(self.viewport_h)
+                - self.viewport_h;
+        self.scroll = target.clamp(0.0, max_scroll.max(0.0));
     }
 
     // ---- 阶段 5：排版 / 主题 / minimap ----
@@ -575,9 +620,60 @@ impl Editor {
         }
     }
 
+    /// 指定字符位置所在的标识符（跳转兜底时按名字找符号）。
+    ///
+    /// 严格：字符位置本身必须是标识符字符，否则返回 `None`
+    /// （点到空格/标点上不该跳转）。
+    pub fn word_at(&self, char_idx: usize) -> Option<String> {
+        let (start, end) = self.word_range_at(char_idx)?;
+        let text = self.buffer.text();
+        Some(text.chars().skip(start).take(end - start).collect())
+    }
+
+    /// 指定字符位置所在的标识符范围（**字符**下标，含端点）。
+    pub fn word_range_at(&self, char_idx: usize) -> Option<(usize, usize)> {
+        let text = self.buffer.text();
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let chars: Vec<char> = text.chars().collect();
+        if char_idx >= chars.len() || !is_ident(chars[char_idx]) {
+            return None;
+        }
+        let mut start = char_idx;
+        while start > 0 && is_ident(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = char_idx;
+        while end < chars.len() && is_ident(chars[end]) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// 悬停词在第 `line` 行上的**字符列**范围；该行没有悬停词时 `None`。
+    fn hover_word_cols(&self, line: usize) -> Option<(usize, usize)> {
+        let (ws, we) = self.hover_word?;
+        let (wl, wc0) = self.buffer.char_to_line_col(ws);
+        let (el, wc1) = self.buffer.char_to_line_col(we);
+        if line < wl || line > el {
+            return None;
+        }
+        let line_len = self.buffer.line(line).chars().count();
+        let c0 = if line == wl { wc0 } else { 0 };
+        let c1 = if line == el { wc1 } else { line_len };
+        if c1 <= c0 {
+            return None;
+        }
+        Some((c0, c1))
+    }
+
     /// 鼠标悬停所在字符索引（每帧由 `show` 更新）。
     pub fn mouse_char(&self) -> Option<usize> {
         self.mouse_char
+    }
+
+    /// 设置滚轮方向（`true` = 反向；设置改完立即生效）。
+    pub fn set_scroll_inverted(&mut self, inverted: bool) {
+        self.scroll_inverted = inverted;
     }
 
     /// 鼠标悬停位置。
@@ -626,6 +722,17 @@ impl Editor {
         self.highlights = self.highlighter.highlight(&self.raw_text, edit);
         // 按起点排序：渲染与 minimap 都用"推进游标"扫描高亮，依赖此有序性。
         self.highlights.sort_by_key(|h| h.start);
+        // 区间必须互不重叠：高亮器可能返回嵌套区间（tree-sitter 注入层），
+        // 重叠时渲染游标会倒退（`next_start - cursor_byte` 下溢 → panic）。
+        // 这里直接丢掉重叠的后一段。
+        let mut last_end = 0usize;
+        self.highlights.retain(|h| {
+            if h.start < last_end || h.end <= h.start {
+                return false;
+            }
+            last_end = h.end;
+            true
+        });
         self.dirty = false;
     }
 
@@ -793,18 +900,24 @@ impl Editor {
         }
     }
 
-    /// 把指定字符所在行滚动到视口内（查找跳转用）。
+    /// 把指定字符所在行滚动到视口**正中**（查找跳转用；VS Code 也是居中）。
     pub fn scroll_to_char(&mut self, idx: usize) {
+        if self.viewport_h <= 0.0 {
+            return;
+        }
         let (line, _) = self
             .buffer
             .char_to_line_col(idx.min(self.buffer.len_chars()));
-        let target = line as f32 * self.line_height - self.viewport_h * 0.4;
-        self.scroll = target.max(0.0);
+        let y = line as f32 * self.line_height;
+        let target = y + self.line_height * 0.5 - self.viewport_h * 0.5;
+        let max_scroll =
+            (self.buffer.line_count() as f32 * self.line_height).max(self.viewport_h)
+                - self.viewport_h;
+        self.scroll = target.clamp(0.0, max_scroll.max(0.0));
     }
 
     /// 屏幕纵坐标 → 行号（0-based）。
-    fn line_at_y(&self, y: f32, rect_top: f32) -> Option<usize> {
-        let rel = (y - rect_top + self.scroll) / self.line_height;
+    fn line_at_y(&self, y: f32, rect_top: f32) -> Option<usize> {        let rel = (y - rect_top + self.scroll) / self.line_height;
         if rel < 0.0 {
             return None;
         }
@@ -818,14 +931,14 @@ impl Editor {
 
     /// 鼠标位置 → 字符索引（`rect_min` = 编辑器左上角屏幕坐标）。
     ///
-    /// 按真实字形宽度反查（与 `text_advance` 同一套宽度），否则中文行上点击会偏。
+    /// 按**真实排版位置**反查（与 `text_advance` 同一套宽度），否则中文行上点击会偏。
     fn pos_to_char(
         &self,
         ui: &egui::Ui,
         font_id: &egui::FontId,
         pos: egui::Pos2,
         rect_min: egui::Pos2,
-        space_w: f32,
+        cell_w: f32,
     ) -> usize {
         let line_idx = self
             .line_at_y(pos.y, rect_min.y)
@@ -834,17 +947,8 @@ impl Editor {
         let text_x0 = rect_min.x + GUTTER_WIDTH + TEXT_PAD_LEFT - self.h_scroll;
         let x_rel = (pos.x - text_x0).max(0.0);
         let line = self.buffer.line(line_idx);
-        let tab_w = space_w * INDENT_STEP as f32;
-        // 走一遍真实字形宽度（与绘制时同一套宽度），否则中文行上点击会偏。
-        let col = ui.fonts(|f| {
-            col_at_x(&line, x_rel, |c| {
-                if c == '\t' {
-                    tab_w
-                } else {
-                    f.glyph_width(font_id, c)
-                }
-            })
-        });
+        // 走一遍真实排版位置（与绘制时同一套宽度），否则点击会偏到隔壁字符。
+        let col = col_at_x(ui, font_id, &line, x_rel, cell_w);
         // 点到行尾之后：光标落到行末（行尾换行符之前），而不是跑到下一行行首。
         let max_col = line.chars().count() - usize::from(line.ends_with('\n'));
         line_start_char + col.min(max_col)
@@ -884,7 +988,9 @@ impl Editor {
         }
 
         let font_id = egui::FontId::monospace(self.font_size);
-        let char_width = ui.fonts(|f| f.glyph_width(&font_id, ' ')).max(1.0);
+        // 单元格宽度按**真实排版**量（`cell_metrics`），不是字体的浮点字形宽：
+        // 排版时游标按整像素推进，实际步进比 `glyph_width` 大一点点。
+        let (char_width, _) = ui.fonts(|f| crate::terminal::cell_metrics(f, &font_id));
         let rect = ui.max_rect();
         self.viewport_h = rect.height();
         let visible_lines = (rect.height() / self.line_height).ceil() as usize + 1;
@@ -896,6 +1002,9 @@ impl Editor {
         let sense = egui::Sense::click_and_drag();
         let response = ui.interact(rect, id, sense);
 
+        // 本帧的输入事件（滚轮 + 键盘共用一份）。
+        let events = ui.input(|i| i.events.clone());
+
         let mut action: Option<EditorAction> = None;
         let cursor_before = self.cursor;
 
@@ -904,29 +1013,45 @@ impl Editor {
             .hover_pos()
             .map(|pos| self.pos_to_char(ui, &font_id, pos, rect.min, char_width));
         self.mouse_pos = response.hover_pos();
+        // 悬停的标识符（VS Code：悬停加下划线，按住 Ctrl 叠加背景高亮）。
+        self.hover_word = self.mouse_char.and_then(|c| self.word_range_at(c));
+        self.hover_word_modifier = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
 
-        // 滚轮滚动：方向对齐 VSCode（向下滚 → 看后面的行）。
-        // egui 的 smooth_scroll_delta 表示“内容应移动的方向”，故取负号：内容下移 = 视口上移。
-        // Shift+滚轮：水平滚动。
+        // 滚轮滚动：方向对齐 VS Code（向下滚 → 看后面的行）。
+        // 速度对齐 VS Code：一格滚轮 = **3 行**（`editor.mouseWheelScrollSensitivity`
+        // 的默认值），触控板按像素 1:1 滚。
+        //
+        // 为什么不用 egui 的 `smooth_scroll_delta`：egui 会把一格滚轮的量摊到十几帧里
+        // 慢慢放出来（`unprocessed_scroll_delta` 的指数平滑），滚起来明显比 VS Code 慢。
+        // 这里直接用 `Event::MouseWheel` 自己累加：Windows 滚轮是 `Line` 单位
+        // （一格 = 1.0），触控板是 `Point` 单位（像素）。
         //
         // 注意：滚轮增量是全局输入，不区分控件。必须同时满足
         //   ① 指针确实在编辑区之上（`response.hovered()`，浮层遮挡时为 false）；
         //   ② 指针所在的最上层不是浮层（弹窗 / 菜单 / 工具提示）。
         // 否则在弹出窗口、侧栏、控制台里滚轮会连带滚动背后的编辑器。
         let wheel_here = response.hovered() && !pointer_over_float(ui.ctx());
-        let (dy, dx, shift) = if wheel_here {
-            ui.input(|i| (i.smooth_scroll_delta.y, i.smooth_scroll_delta.x, i.modifiers.shift))
-        } else {
-            (0.0, 0.0, false)
-        };
-        if shift && dy != 0.0 {
-            self.h_scroll = (self.h_scroll - dy).max(0.0);
-        } else {
-            if dy != 0.0 {
-                self.scroll = (self.scroll - dy).max(0.0);
-            }
-            if dx != 0.0 {
-                self.h_scroll = (self.h_scroll - dx).max(0.0);
+
+        if wheel_here {
+            for ev in &events {
+                if let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                } = ev
+                {
+                    let (dy_px, dx_px) =
+                        wheel_pixels(*unit, *delta, self.line_height, char_width, rect.height());
+                    // 方向：**滚轮向下 = 看到更前面的内容**（用户实测系统就是这个方向，
+                    // 与 VS Code 相反）；设置里选 normal 时再翻回来。
+                    let dir = if self.scroll_inverted { 1.0 } else { -1.0 };
+                    if modifiers.shift {
+                        self.h_scroll = (self.h_scroll + dx_px * dir).max(0.0);
+                    } else {
+                        self.scroll = (self.scroll + dy_px * dir).max(0.0);
+                        self.h_scroll = (self.h_scroll + dx_px * dir).max(0.0);
+                    }
+                }
             }
         }
         let max_scroll = (self.buffer.line_count() as f32 * self.line_height).max(rect.height())
@@ -955,7 +1080,12 @@ impl Editor {
                 } else if pos.x >= text_left {
                     let idx = self.pos_to_char(ui, &font_id, pos, rect.min, char_width);
                     if response.clicked() {
+                        // Ctrl/⌘ + 左键 = 跳到定义（VS Code 语义）。
+                        let follow = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
                         self.set_cursor(idx);
+                        if follow {
+                            action = Some(EditorAction::GotoDefinitionAt(idx));
+                        }
                     } else {
                         match &mut self.selection {
                             None => {
@@ -1055,8 +1185,8 @@ impl Editor {
                 if sel.start < line_end_char && sel.end > line_start_char {
                     let s_col = sel.start.saturating_sub(line_start_char);
                     let e_col = sel.end.min(line_end_char) - line_start_char;
-                    let x0 = text_x0 + text_advance(ui, &font_id, &line_str, s_col, char_width);
-                    let x1 = text_x0 + text_advance(ui, &font_id, &line_str, e_col, char_width);
+                    let x0 = text_x0 + text_advance(ui, &font_id, &line_str, s_col);
+                    let x1 = text_x0 + text_advance(ui, &font_id, &line_str, e_col);
                     text_painter.rect_filled(
                         egui::Rect::from_min_max(
                             egui::pos2(x0, y),
@@ -1066,6 +1196,23 @@ impl Editor {
                         self.colors.selection,
                     );
                 }
+            }
+
+            // 悬停的标识符（VS Code 行为）：
+            // - 普通悬停 → 只弹提示框，文字不做任何标记；
+            // - 按住 Ctrl/⌘ → 整个词高亮（+ 下划线），提示「Ctrl+点击跳定义」。
+            let hover_cols = self.hover_word_cols(li);
+            if let (true, Some((c0, c1))) = (self.hover_word_modifier, hover_cols) {
+                let x0 = text_x0 + text_advance(ui, &font_id, &line_str, c0);
+                let x1 = text_x0 + text_advance(ui, &font_id, &line_str, c1);
+                text_painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, y),
+                        egui::pos2(x1, y + self.line_height),
+                    ),
+                    0.0,
+                    self.colors.selection,
+                );
             }
 
             // 语法高亮文本（**去掉行尾换行**，见 `line_span_no_eol`：否则 galley 会多出一行、
@@ -1117,7 +1264,7 @@ impl Editor {
                 }
                 let next_start =
                     seg_iter.peek().map(|(s, _, _)| *s).unwrap_or(line_bytes.len());
-                let take = next_start - cursor_byte;
+                let take = next_start.saturating_sub(cursor_byte);
                 let chunk = &line_bytes[cursor_byte..cursor_byte + take];
                 job.append(
                     chunk,
@@ -1131,6 +1278,23 @@ impl Editor {
             let ty = y + ((self.line_height - galley.size().y) * 0.5).max(0.0);
             text_painter.galley(egui::pos2(text_x0, ty), galley, self.colors.fg_plain);
 
+            // 悬停标识符的下划线（只在按住 Ctrl/⌘ 时画，和 VS Code 一致：
+            // 普通悬停只弹提示框，按住 Ctrl 才把整个词标出来）。
+            if self.hover_word_modifier {
+                if let Some((c0, c1)) = hover_cols {
+                    let x0 = text_x0 + text_advance(ui, &font_id, &line_str, c0);
+                    let x1 = text_x0 + text_advance(ui, &font_id, &line_str, c1);
+                    text_painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x0, y + self.line_height - 2.0),
+                            egui::pos2(x1.max(x0 + 1.0), y + self.line_height - 0.5),
+                        ),
+                        0.0,
+                        self.colors.fg_plain.gamma_multiply(0.75),
+                    );
+                }
+            }
+
             // 输入法组合串加下划线（提示「这段还没落定」，和 VS Code 一致）。
             if !self.ime_preedit.is_empty() {
                 let start = self.ime_preedit_start;
@@ -1140,9 +1304,9 @@ impl Editor {
                 if start < line_end_char && end > line_start_char {
                     let c0 = start.saturating_sub(line_start_char);
                     let c1 = end.min(line_end_char) - line_start_char;
-                    let x0 = text_x0 + text_advance(ui, &font_id, &line_str, c0, char_width);
+                    let x0 = text_x0 + text_advance(ui, &font_id, &line_str, c0);
                     let x1 = text_x0
-                        + text_advance(ui, &font_id, &line_str, c1.max(c0 + 1), char_width);
+                        + text_advance(ui, &font_id, &line_str, c1.max(c0 + 1));
                     text_painter.rect_filled(
                         egui::Rect::from_min_max(
                             egui::pos2(x0, y + self.line_height - 2.0),
@@ -1163,7 +1327,7 @@ impl Editor {
                     continue;
                 }
                 let line_txt = self.buffer.line(l);
-                let x = text_x0 + text_advance(ui, &font_id, &line_txt, c, char_width);
+                let x = text_x0 + text_advance(ui, &font_id, &line_txt, c);
                 let ch = line_txt.chars().nth(c).unwrap_or(' ');
                 let bw = ui.fonts(|f| f.glyph_width(&font_id, ch));
                 let y = rect.min.y + l as f32 * self.line_height - self.scroll;
@@ -1278,7 +1442,7 @@ impl Editor {
         // 按「列数 × 格宽」算会让光标停在汉字中间，打字时光标跟不上字。
         let (cur_line, cur_col) = self.buffer.char_to_line_col(self.cursor);
         let cur_line_text = self.buffer.line(cur_line);
-        let caret_dx = text_advance(ui, &font_id, &cur_line_text, cur_col, char_width);
+        let caret_dx = text_advance(ui, &font_id, &cur_line_text, cur_col);
         let mut cursor_x = text_left + TEXT_PAD_LEFT + caret_dx - self.h_scroll;
         if cursor_x < text_left {
             self.h_scroll -= text_left - cursor_x;
@@ -1320,7 +1484,6 @@ impl Editor {
         }
 
         // 键盘输入（模态窗口打开时不处理，避免快捷键冲突）
-        let events = ui.input(|i| i.events.clone());
         if self.keys_enabled {
             for ev in &events {
                 // 焦点在别的文本框时：只放行全局快捷键，其余（字符输入 / 退格 / 回车 / 方向键…）
@@ -1366,6 +1529,9 @@ impl Editor {
                             // 阶段 2 快捷键（守卫分支优先）
                             (Key::ArrowLeft, _, _) if modifiers.alt => {
                                 action = Some(EditorAction::GoBack);
+                            }
+                            (Key::ArrowRight, _, _) if modifiers.alt => {
+                                action = Some(EditorAction::GoForward);
                             }
                             (Key::F12, _, _) => action = Some(EditorAction::GotoDefinition),
                             (Key::T, true, false) => action = Some(EditorAction::SymbolSearch),
@@ -1483,50 +1649,94 @@ fn indent_columns(line: &str) -> usize {
     col
 }
 
-/// 一行前 `n_chars` 个字符的显示宽度：宽度由 `glyph_w` 提供（便于注入假字体度量做单测）。
+/// [`text_advance`] 的反函数：横向偏移 `x` 落在第几个字符上（落在字符前半段即算该字符）。
 ///
-/// 关键：不能按「字符数 × 等宽格」估算。正文用的等宽字体（Hack）一格约 8.28px，
-/// 而中文回退字体（微软雅黑）一个汉字约 13.64px ≈ 1.65 格 —— 于是中文行上
-/// 「第 n 列 = n 个格子」会把光标画到汉字中间去。
-fn advance_with(line: &str, n_chars: usize, glyph_w: impl Fn(char) -> f32) -> f32 {
-    line.chars().take(n_chars).map(glyph_w).sum()
-}
-
-/// [`advance_with`] 的反函数：横向偏移 `x` 落在第几个字符上（落在字符前半段即算该字符）。
-fn col_at_x(line: &str, x: f32, glyph_w: impl Fn(char) -> f32) -> usize {
-    let mut acc = 0.0f32;
-    let mut col = 0usize;
-    for c in line.chars() {
-        let w = glyph_w(c);
-        if x < acc + w * 0.5 {
+/// 先用等宽格粗估位置（ASCII 行上就是精确的），再用**真实排版**修正，
+/// 这样中文/tab 也不会偏，同时每帧只需要一两次排版。
+fn col_at_x(
+    ui: &egui::Ui,
+    font_id: &egui::FontId,
+    line: &str,
+    x: f32,
+    cell_w: f32,
+) -> usize {
+    let n = line.chars().count();
+    if n == 0 {
+        return 0;
+    }
+    let mut col = ((x / cell_w).floor().max(0.0) as usize).min(n);
+    // 粗估可能偏几个字符（中文/tab），用真实排版收敛。
+    let mut guard = 0;
+    while col > 0 && guard < 8 {
+        let prev = text_advance(ui, font_id, line, col - 1);
+        if x >= prev {
             break;
         }
-        acc += w;
+        col -= 1;
+        guard += 1;
+    }
+    while col < n && guard < 16 {
+        let next = text_advance(ui, font_id, line, col + 1);
+        if x < next {
+            break;
+        }
         col += 1;
+        guard += 1;
     }
     col
 }
 
-/// 一行前 `n_chars` 个字符在屏幕上占的**像素**宽度（真实字形宽度）。
+/// 滚轮增量 → 像素位移（VS Code 语义）。
 ///
-/// 光标 / 选区 / 组合串下划线 / 点击定位全部走这条路径，中文与 ASCII 都对得上。
-/// tab 记作 `space_w * INDENT_STEP`：与 epaint 的 `TAB_SIZE`（也是 4）和 `indent_columns` 一致。
+/// - 鼠标滚轮（`Line` 单位，一格 = 1.0）：一格滚 **3 行 / 3 列**
+///   （VS Code 的 `editor.mouseWheelScrollSensitivity` 默认值）；
+/// - 触控板（`Point` 单位）：像素 1:1，跟手；
+/// - Page 单位：一整页。
+fn wheel_pixels(
+    unit: egui::MouseWheelUnit,
+    delta: egui::Vec2,
+    line_height: f32,
+    char_width: f32,
+    view_h: f32,
+) -> (f32, f32) {
+    match unit {
+        egui::MouseWheelUnit::Line => (
+            delta.y * WHEEL_LINES_PER_NOTCH * line_height,
+            delta.x * WHEEL_LINES_PER_NOTCH * char_width,
+        ),
+        egui::MouseWheelUnit::Point => (delta.y, delta.x),
+        egui::MouseWheelUnit::Page => (delta.y * view_h, delta.x * char_width),
+    }
+}
+
+/// 一行前 `n_chars` 个字符在屏幕上占的**像素**宽度。
+///
+/// **必须用 egui 自己的排版结果**，不能拿字形宽度求和：
+/// 字体报告的字形宽是浮点数（Hack 一格 7.758px），而排版时每个字形都会把游标
+/// **取整到像素**（实际步进 8.0px）。每字符差 0.24px，一行 60 个字符就差 14px
+/// （将近两个字符）——光标、选区、悬停下划线就会整体偏移。
+///
+/// 这里直接排版前缀，得到的宽度和正文绘制**完全一致**（同样按整像素推进）。
 fn text_advance(
     ui: &egui::Ui,
     font_id: &egui::FontId,
     line: &str,
     n_chars: usize,
-    space_w: f32,
 ) -> f32 {
-    let tab_w = space_w * INDENT_STEP as f32;
+    let total = line.chars().count();
+    let n = n_chars.min(total);
+    if n == 0 {
+        return 0.0;
+    }
+    let prefix: String = if n == total {
+        line.to_owned()
+    } else {
+        line.chars().take(n).collect()
+    };
     ui.fonts(|f| {
-        advance_with(line, n_chars, |c| {
-            if c == '\t' {
-                tab_w
-            } else {
-                f.glyph_width(font_id, c)
-            }
-        })
+        f.layout_no_wrap(prefix, font_id.clone(), egui::Color32::WHITE)
+            .size()
+            .x
     })
 }
 
@@ -1708,6 +1918,121 @@ fn find_matching_bracket(chars: &[char], idx: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 高亮区间重叠（tree-sitter 注入层）时不能崩。
+    ///
+    /// 实测：跳转到 spdlog 的头文件时，高亮器给出嵌套区间，渲染游标倒退，
+    /// `next_start - cursor_byte` 下溢 → panic（整个 IDE 崩掉）。
+    #[test]
+    fn overlapping_highlight_ranges_do_not_panic() {
+        struct Overlap;
+        impl ide_ext::LanguageHighlighter for Overlap {
+            fn highlight(
+                &mut self,
+                _text: &str,
+                _edit: Option<ide_ext::TextEdit>,
+            ) -> Vec<ide_core::Highlight> {
+                // 两个区间重叠（第二个的 start 在第一个内部）。
+                vec![
+                    ide_core::Highlight::new(0, 10, HighlightGroup::Keyword),
+                    ide_core::Highlight::new(5, 15, HighlightGroup::Comment),
+                    ide_core::Highlight::new(20, 25, HighlightGroup::Plain),
+                ]
+            }
+            fn reset(&mut self) {}
+        }
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let mut ed = Editor::new("int main() { return 0; }\nsecond line here\n");
+        ed.open_document("int main() { return 0; }\nsecond line here\n", Box::new(Overlap));
+        let _ = ctx.run(Default::default(), |ctx| {
+            let mut ui = egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ed.show(ui);
+            });
+            let _ = &mut ui;
+        });
+        // 重叠的区间被丢掉，剩下的是合法的不重叠区间。
+        assert!(ed.highlights.iter().all(|h| h.end > h.start));
+        let mut prev_end = 0usize;
+        for h in &ed.highlights {
+            assert!(h.start >= prev_end, "高亮区间不能重叠: {h:?}");
+            prev_end = h.end;
+        }
+    }
+
+    /// 跳转后目标要落在视口**正中**（VS Code 行为）。
+    #[test]
+    fn center_cursor_in_view_puts_target_in_middle() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let text = (0..60)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut ed = Editor::new(&text);
+        ed.viewport_h = 210.0; // 10 行
+        ed.set_cursor_line_col(30, 0);
+        ed.center_cursor_in_view();
+        let target_y = 30.0 * ed.line_height + ed.line_height * 0.5;
+        let view_center = ed.scroll + ed.viewport_h * 0.5;
+        assert!(
+            (target_y - view_center).abs() < 1.0,
+            "目标行应在视口正中：target_y={target_y} center={view_center} scroll={}",
+            ed.scroll
+        );
+    }
+
+    /// 悬停的标识符要能算出所在行的列范围（画下划线/高亮用）。
+    #[test]
+    fn hover_word_cols_covers_the_hovered_word() {
+        let mut ed = Editor::new("int foo = 1;\nfoo(bar);\n");
+        let idx = ed.line_col_to_char(0, 4);
+        ed.hover_word = ed.word_range_at(idx);
+        assert_eq!(ed.hover_word_cols(0), Some((4, 7)));
+        // 第二行没有这个悬停词。
+        assert_eq!(ed.hover_word_cols(1), None);
+    }
+
+    /// 一格滚轮 = 3 行（VS Code 默认；egui 的 smooth delta 会慢好几倍）。
+    #[test]
+    fn wheel_notch_scrolls_three_lines() {
+        // 鼠标滚轮：一格 = 3 行。
+        let (dy, dx) = wheel_pixels(
+            egui::MouseWheelUnit::Line,
+            egui::vec2(0.0, 1.0),
+            21.0,
+            8.0,
+            600.0,
+        );
+        assert!((dy - 63.0).abs() < 0.01, "一格滚轮应滚 3 行（63px），实际 {dy}");
+        assert!((dx - 0.0).abs() < 0.01);
+        // 触控板：像素 1:1。
+        let (dy, dx) = wheel_pixels(
+            egui::MouseWheelUnit::Point,
+            egui::vec2(0.0, 40.0),
+            21.0,
+            8.0,
+            600.0,
+        );
+        assert!((dy - 40.0).abs() < 0.01, "触控板应 1:1，实际 {dy}");
+        assert!((dx - 0.0).abs() < 0.01);
+    }
+
+    /// 标识符查找：Ctrl+左键跳转时按名字找符号。
+    #[test]
+    fn word_at_finds_identifier_around_index() {
+        let ed = Editor::new("int foo = 1;\nfoo(bar);\n");
+        // "foo" 在第 0 行第 4 列。
+        let idx = ed.line_col_to_char(0, 4);
+        assert_eq!(ed.word_at(idx).as_deref(), Some("foo"));
+        // 词中间也算同一个词。
+        assert_eq!(ed.word_at(idx + 1).as_deref(), Some("foo"));
+        // 第 1 行的 foo。
+        let idx2 = ed.line_col_to_char(1, 1);
+        assert_eq!(ed.word_at(idx2).as_deref(), Some("foo"));
+        // 空白/标点上没有词。
+        assert_eq!(ed.word_at(ed.line_col_to_char(0, 3)), None);
+    }
 
     #[test]
     fn select_all_covers_document() {
@@ -2045,49 +2370,117 @@ mod tests {
     // 按「列数 × 格宽」定位会让光标 / 选区停在汉字中间。下面用假字体度量把这条契约钉死。
 
     /// 假字体：ASCII 一格 `10.0`，汉字 `16.5`（≈ 真实字体里的 1.65 倍）。
-    fn fake_glyph_w(c: char) -> f32 {
-        if is_wide_char(c) {
-            16.5
-        } else {
-            10.0
-        }
+    /// 光标必须正好落在最后一个字符的右边（用真实排版宽度核对）。
+    ///
+    /// 用户截图：跳转到长行里的符号后，光标偏到符号中间——根因是光标位置用
+    /// 「字形宽度求和」算，而正文是按整像素排版的（每字符差 0.24px，行尾差十几像素）。
+    #[test]
+    fn editor_caret_sits_right_of_the_last_glyph() {
+        let ctx = egui::Context::default();
+        crate::apply_fonts(&ctx, "Default");
+        // 预热一帧：字体是异步加载的，第一帧还没有字形宽度。
+        let _ = ctx.run(Default::default(), |_| {});
+        let line = "    auto p2Angle = MTEdgeAlgo::calcCornerAngle(edge->p2()), edge->prev.lock());";
+        let mut ed = Editor::new(line);
+        // 光标停在最后一个字符上（不是换行符）。
+        ed.goto_char(line.chars().count() - 1);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ed.show(ui);
+            });
+        });
+        let caret_x = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Rect(r) if r.rect.width() <= 2.5 && r.rect.height() > 5.0 => {
+                    Some(r.rect.left())
+                }
+                _ => None,
+            })
+            .expect("应画出光标竖线");
+        // 真实排版出来的「光标列之前」那段宽度。
+        let (_cur_line, cur_col) = ed.cursor_line_col();
+        let line_text = line.to_owned();
+        let expect = ctx.fonts(|f| {
+            let prefix: String = line_text.chars().take(cur_col).collect();
+            f.layout_no_wrap(
+                prefix,
+                egui::FontId::monospace(ed_font_size(&ed)),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+        });        // 文本起点 = 面板左边 + 行号栏宽 + 左内边距。
+        let text_x0 = 8.0 + GUTTER_WIDTH + TEXT_PAD_LEFT;
+        assert!(
+            (caret_x - text_x0 - expect).abs() < 1.0,
+            "光标应贴着最后一个字符：caret_x={caret_x} 期望={} (text_x0={text_x0})",
+            text_x0 + expect
+        );
     }
 
-    #[test]
-    fn advance_uses_real_glyph_widths_not_char_cells() {
-        let line = "ab中中";
-        assert_eq!(advance_with(line, 0, fake_glyph_w), 0.0);
-        assert_eq!(advance_with(line, 2, fake_glyph_w), 20.0);
-        assert_eq!(advance_with(line, 3, fake_glyph_w), 36.5);
-        // 关键：中文行尾的光标位置是真实宽度之和，而不是「4 个字 × 一格」。
-        assert_eq!(advance_with(line, 4, fake_glyph_w), 53.0);
-        assert_ne!(advance_with(line, 4, fake_glyph_w), 40.0);
+    /// 跑一帧并拿到一个 `Ui`（排版相关的测试用）。
+    fn ed_font_size(ed: &Editor) -> f32 {
+        ed.font_size
+    }
+    fn with_ui<R>(f: impl FnOnce(&egui::Ui) -> R) -> R {
+        let ctx = egui::Context::default();
+        let mut out = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                out = Some(f(ui));
+            });
+        });
+        out.expect("应执行到闭包")
     }
 
+    /// 文字位置必须用**真实排版**：字形宽度求和会随行长线性漂移
+    /// （Hack 13px：字形宽 7.758px，排版按整像素推进 8.0px → 每字符差 0.24px，
+    ///  一行 60 个字符就差 14px），光标/选区/下划线会整体偏出去。
     #[test]
-    fn click_column_is_inverse_of_advance() {
-        let line = "中ab";
-        // 汉字中点（8.25）之前算汉字前，之后算汉字后。
-        assert_eq!(col_at_x(line, 0.0, fake_glyph_w), 0);
-        assert_eq!(col_at_x(line, 8.0, fake_glyph_w), 0);
-        assert_eq!(col_at_x(line, 9.0, fake_glyph_w), 1);
-        assert_eq!(col_at_x(line, 26.4, fake_glyph_w), 2);
-        assert_eq!(col_at_x(line, 26.5, fake_glyph_w), 2);
-        assert_eq!(col_at_x(line, 31.5, fake_glyph_w), 3);
-        // 点到行尾之后：光标落在最后一个字符后面（与 VSCode 一致），而不是钉在倒数第二个字符上。
-        assert_eq!(col_at_x(line, 9999.0, fake_glyph_w), 3);
+    fn advance_matches_real_layout_not_glyph_sum() {
+        let font = egui::FontId::monospace(13.0);
+        let line = "    auto p2Angle = MTEdgeAlgo::calcCornerAngle(edge->p2()), edge->prev.lock());";
+        with_ui(|ui| {
+            let n = line.chars().count();
+            let whole = text_advance(ui, &font, line, n);
+            let sum: f32 = ui.fonts(|f| line.chars().map(|c| f.glyph_width(&font, c)).sum());
+            assert!(
+                whole - sum > 5.0,
+                "字形宽度求和应明显小于真实排版宽度：{whole} vs {sum}"
+            );
+            // 前缀宽度必须单调递增，且不超过整行。
+            let mut prev = 0.0;
+            for k in 0..=n {
+                let w = text_advance(ui, &font, line, k);
+                assert!(w >= prev - 0.01, "k={k} 宽度回退了：{w} < {prev}");
+                assert!(w <= whole + 0.01);
+                prev = w;
+            }
+        });
     }
 
+    /// 点击位置 → 字符：必须与真实排版一致（否则点到隔壁字符，Ctrl+点击就跳错地方）。
     #[test]
-    fn col_at_x_round_trips_advance_on_cjk_line() {
-        let line = "// 中文abc";
-        for n in 0..=line.chars().count() {
-            let x = advance_with(line, n, fake_glyph_w);
-            // 每个字符的前半段都归属自己 → 从该字符的起点稍偏右点回去，仍回到同一个字符。
-            let probe = x + 1.0;
-            let col = col_at_x(line, probe, fake_glyph_w);
-            assert_eq!(col, n, "偏移 {x} 应落在第 {n} 个字符上，实际 {col}");
-        }
+    fn click_column_uses_real_layout() {
+        let font = egui::FontId::monospace(13.0);
+        let line = "    auto p2Angle = MTEdgeAlgo::calcCornerAngle(edge->p2()));";
+        with_ui(|ui| {
+            let cell_w = ui.fonts(|f| crate::terminal::cell_metrics(f, &font)).0;
+            for k in 0..line.chars().count() {
+                let x = text_advance(ui, &font, line, k) + cell_w * 0.25;
+                let col = col_at_x(ui, &font, line, x, cell_w);
+                assert_eq!(col, k, "偏移 {x} 应落在第 {k} 个字符上，实际 {col}");
+            }
+        });
     }
 
     #[test]
@@ -2143,8 +2536,9 @@ mod tests {
         let x_cjk = caret_x(&mut ed);
         let delta = x_cjk - x_ascii;
         // 两个汉字 = 2 × 真实汉字宽（不是 2 × 等宽格）。
+        // 容差 1.5px：排版按整像素推进，位移是取整后的值（这里 28 vs 27.28）。
         assert!(
-            (delta - 2.0 * cjk).abs() < 0.5,
+            (delta - 2.0 * cjk).abs() < 1.5,
             "汉字宽度没被算进去：位移 {delta}，期望 {}",
             2.0 * cjk
         );
