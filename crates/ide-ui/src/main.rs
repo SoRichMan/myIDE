@@ -9346,6 +9346,44 @@ mod tests {
         assert!(collapsed.contains("repo"), "折叠后仍应显示仓库名");
     }
 
+    /// 自绘标签后，点击仍然要能切换标签（`allocate_exact_size` 不做交互，
+    /// 必须 `ui.interact` 一次）。
+    #[test]
+    fn clicking_a_tab_switches_to_it() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.tabs.open_untitled();
+        assert_eq!(app.tabs.active(), 1);
+        // 第一个标签的中心（用第一帧的标题位置反推）
+        let out = ctx.run(probe_raw_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_bar(ui));
+        });
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) => Some(t.pos + egui::vec2(t.galley.size().x * 0.5, 8.0)),
+                _ => None,
+            })
+            .expect("应画出标签标题");
+        // 点击第一个标签
+        for pressed in [true, false] {
+            let mut input = probe_raw_input();
+            input.events.push(egui::Event::PointerMoved(pos));
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            });
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_bar(ui));
+            });
+        }
+        assert_eq!(app.tabs.active(), 0, "点击标签应切换到该标签");
+    }
+
     /// 标签标题不能被关闭按钮压住（VS Code：右侧给叉叉预留位置）。
     #[test]
     fn tab_title_does_not_overlap_close_button() {
