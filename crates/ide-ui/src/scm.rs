@@ -90,6 +90,8 @@ pub struct RepoState {
     pub expanded_staged: bool,
     /// 「更改」是否展开。
     pub expanded_unstaged: bool,
+    /// CHANGES 里这个仓库分组是否展开（点仓库名前的箭头折叠）。
+    pub expanded: bool,
     /// GRAPH 列表是否展开。
     pub expanded_graph: bool,
     /// 当前选中的提交（短 SHA）。
@@ -105,6 +107,7 @@ impl RepoState {
             expanded_staged: true,
             expanded_unstaged: true,
             expanded_graph: true,
+            expanded: true,
             ..Default::default()
         }
     }
@@ -153,6 +156,8 @@ pub struct HoverCard {
     pub repo: usize,
     /// 短 SHA。
     pub hash: String,
+    /// 完整 SHA（复制时用这个）。
+    pub full_hash: String,
     /// 作者。
     pub author: String,
     /// 提交时间（ISO）。
@@ -170,6 +175,7 @@ impl Default for HoverCard {
         Self {
             repo: 0,
             hash: String::new(),
+            full_hash: String::new(),
             author: String::new(),
             date: String::new(),
             subject: String::new(),
@@ -436,9 +442,28 @@ impl ScmPanel {
     ) {
         let branch = repos[idx].branch().unwrap_or("").to_string();
 
-        // ---- 仓库标题行：名字 + 分支 + 动作按钮 ----
+        // ---- 仓库标题行：折叠箭头 + 名字 + 分支 + 动作按钮 ----
+        let expanded = repos[idx].expanded;
         ui.horizontal(|ui| {
             ui.add_space(2.0);
+            // 折叠箭头（VS Code：点它收起/展开这个仓库分组）
+            let (twisty_rect, twisty) =
+                ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::click());
+            draw_codicon(
+                ui.painter(),
+                twisty_rect.center(),
+                13.0,
+                if expanded {
+                    Codicon::ChevronDown
+                } else {
+                    Codicon::ChevronRight
+                },
+                hex(FG),
+            );
+            if twisty.clicked() {
+                repos[idx].expanded = !expanded;
+            }
+            twisty.on_hover_text(if expanded { "折叠该仓库" } else { "展开该仓库" });
             // 仓库图标（VS Code 用「仓库」图标，分支图标在分支 chip 里）
             let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 18.0), egui::Sense::hover());
             draw_codicon(
@@ -448,12 +473,25 @@ impl ScmPanel {
                 Codicon::Repo,
                 hex(FG),
             );
-            ui.label(
-                RichText::new(repos[idx].name.clone())
-                    .size(12.5)
-                    .strong()
-                    .color(hex(FG)),
+            let name_resp = ui.add(
+                egui::Label::new(
+                    RichText::new(repos[idx].name.clone())
+                        .size(12.5)
+                        .strong()
+                        .color(hex(FG)),
+                )
+                .sense(egui::Sense::click()),
             );
+            if name_resp.clicked() {
+                repos[idx].expanded = !expanded;
+            }
+            // 侧栏窄的时候优先保证「仓库名 + 分支」看得全，
+            // 操作图标按优先级从左往右省略（VS Code 也是这么做的）。
+            let name_w = measure(ui, &repos[idx].name, &egui::FontId::proportional(12.5));
+            let room = ui.available_width();
+            // ⋯ 刷新 提交 = 3 个图标；完整的一组 = 7 个
+            let full_actions = room >= name_w + 40.0 + 3.0 * 20.0 + 80.0;
+            let mid_actions = room >= name_w + 40.0 + 3.0 * 20.0 + 30.0;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // ⋯
                 let (more_rect, more) =
@@ -514,6 +552,7 @@ impl ScmPanel {
 
 
                 // 拉取请求（VS Code 的 ⑂ 位置）
+                if mid_actions {
                 let (pr_rect, pr) =
                     ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                 if pr.hovered() {
@@ -531,8 +570,10 @@ impl ScmPanel {
                     actions.push(Action::Pull(idx));
                 }
                 pr.on_hover_text("拉取");
+                }
 
                 // 提交并推送（VS Code 的 ⬆ 位置）
+                if full_actions {
                 let (push_rect, push) =
                     ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                 if push.hovered() {
@@ -550,7 +591,9 @@ impl ScmPanel {
                     actions.push(Action::Push(idx));
                 }
                 push.on_hover_text("推送");
+                }
                 // 暂存全部
+                if full_actions {
                 let (stage_rect, stage_all) =
                     ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                 if stage_all.hovered() {
@@ -562,8 +605,10 @@ impl ScmPanel {
                     actions.push(Action::StageAll(idx));
                 }
                 stage_all.on_hover_text("暂存所有更改");
+                }
 
                 // 丢弃全部
+                if full_actions {
                 let (discard_rect, discard) =
                     ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                 if discard.hovered() {
@@ -581,6 +626,7 @@ impl ScmPanel {
                     actions.push(Action::DiscardAll(idx));
                 }
                 discard.on_hover_text("丢弃所有更改");
+                }
 
                 // 分支名（VS Code 里的分支 chip）
                 let chip = egui::Frame::none()
@@ -619,6 +665,12 @@ impl ScmPanel {
         }
         if self.new_branch == Some(idx) {
             self.draw_new_branch(ui, idx, actions);
+        }
+
+        // 折叠了：只留标题行
+        if !repos[idx].expanded {
+            ui.add_space(4.0);
+            return;
         }
 
         // ---- 提交信息输入框 ----
@@ -944,9 +996,14 @@ impl ScmPanel {
         actions: &mut Vec<Action>,
     ) {
         let row_h = 22.0_f32;
+        let clip = ui.clip_rect();
         for e in files {
             let (rect, resp) =
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
+            // 滚出可视区的行不画（只占位）——文件多时这是主要的提速点。
+            if !clip.intersects(rect) {
+                continue;
+            }
             if resp.hovered() {
                 ui.painter().rect_filled(rect, 0.0, hex(HOVER_BG));
             }
@@ -1111,8 +1168,27 @@ impl ScmPanel {
         actions: &mut Vec<Action>,
     ) {
         // 仓库行 + 图形工具栏
+        let graph_open = repos[idx].expanded_graph;
         ui.horizontal(|ui| {
             ui.add_space(2.0);
+            // 折叠箭头
+            let (twisty_rect, twisty) =
+                ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::click());
+            draw_codicon(
+                ui.painter(),
+                twisty_rect.center(),
+                13.0,
+                if graph_open {
+                    Codicon::ChevronDown
+                } else {
+                    Codicon::ChevronRight
+                },
+                hex(FG),
+            );
+            if twisty.clicked() {
+                repos[idx].expanded_graph = !graph_open;
+            }
+            twisty.on_hover_text(if graph_open { "折叠提交记录" } else { "展开提交记录" });
             let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 18.0), egui::Sense::hover());
             draw_codicon(
                 ui.painter(),
@@ -1131,7 +1207,7 @@ impl ScmPanel {
                 .sense(egui::Sense::click()),
             );
             if name_resp.clicked() {
-                repos[idx].expanded_graph = !repos[idx].expanded_graph;
+                repos[idx].expanded_graph = !graph_open;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (more_rect, more) =
@@ -1175,6 +1251,7 @@ impl ScmPanel {
                     actions.push(Action::Sync(idx));
                 }
                 fetch.on_hover_text("同步（拉取 + 变基）");
+                // 推送
                 let (push_rect, push) =
                     ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                 draw_codicon(
@@ -1188,37 +1265,7 @@ impl ScmPanel {
                     actions.push(Action::Push(idx));
                 }
                 push.on_hover_text("推送");
-                // 暂存全部
-                let (stage_rect, stage_all) =
-                    ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-                if stage_all.hovered() {
-                    ui.painter()
-                        .rect_filled(stage_rect, 3.0, hex("#ffffff").gamma_multiply(0.08));
-                }
-                draw_codicon(ui.painter(), stage_rect.center(), 15.0, Codicon::Add, hex(FG_DIM));
-                if stage_all.clicked() {
-                    actions.push(Action::StageAll(idx));
-                }
-                stage_all.on_hover_text("暂存所有更改");
-
-                // 丢弃全部
-                let (discard_rect, discard) =
-                    ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-                if discard.hovered() {
-                    ui.painter()
-                        .rect_filled(discard_rect, 3.0, hex("#ffffff").gamma_multiply(0.08));
-                }
-                draw_codicon(
-                    ui.painter(),
-                    discard_rect.center(),
-                    15.0,
-                    Codicon::Discard,
-                    hex(FG_DIM),
-                );
-                if discard.clicked() {
-                    actions.push(Action::DiscardAll(idx));
-                }
-                discard.on_hover_text("丢弃所有更改");
+                // 拉取
                 let (pull_rect, pull) =
                     ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                 draw_codicon(
@@ -1393,6 +1440,7 @@ impl ScmPanel {
                                 self.frame_hover = Some(HoverCard {
                                     repo: idx,
                                     hash: c.hash.clone(),
+                                    full_hash: c.full.clone(),
                                     author: c.author.clone(),
                                     date: c.date.clone(),
                                     subject: c.subject.clone(),
@@ -1717,24 +1765,31 @@ impl ScmPanel {
                                 ui.painter()
                                     .rect_filled(btn_rect, 3.0, hex("#ffffff").gamma_multiply(0.1));
                             }
-                            draw_codicon(
+                            // VS Code 的「复制」图标：两张叠在一起的纸
+                            // （codicon 1.85 里没有 copy 字形，这里自己画）。
+                            draw_copy_icon(
                                 ui.painter(),
                                 btn_rect.center(),
                                 14.0,
-                                Codicon::Clippy,
                                 if btn.hovered() { hex(FG) } else { hex(FG_DIM) },
                             );
                             if btn.clicked() {
                                 copy = true;
                             }
-                            btn.on_hover_text("复制提交 ID");
+                            btn.on_hover_text("复制完整提交 ID");
                         });
                     });
             });
         // 记录卡片矩形（下一帧算「保持显示」范围用）。
         self.card_rect = Some(resp.response.rect);
         if copy {
-            actions.push(Action::CopyHash(card.hash.clone()));
+            // 复制**完整**的 commit id（卡片上显示的是短 SHA）。
+            let full = if card.full_hash.is_empty() {
+                card.hash.clone()
+            } else {
+                card.full_hash.clone()
+            };
+            actions.push(Action::CopyHash(full));
         }
     }
 }
@@ -1811,13 +1866,37 @@ fn menu_item(ui: &mut egui::Ui, label: &str) -> bool {
     resp.clicked()
 }
 
+/// VS Code 的「复制」图标（两张叠在一起的纸）。
+///
+/// codicon 1.85 里没有 `copy` 字形，这里用 painter 自己画，形状和 VS Code 一致。
+fn draw_copy_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let w = size * 0.56;
+    let h = size * 0.66;
+    let stroke = egui::Stroke::new(1.2_f32, color);
+    // 后面那张纸
+    let back = egui::Rect::from_center_size(
+        center + egui::vec2(size * 0.16, -size * 0.14),
+        egui::vec2(w, h),
+    );
+    painter.rect_stroke(back, 1.5, stroke);
+    // 前面那张纸
+    let front = egui::Rect::from_center_size(
+        center + egui::vec2(-size * 0.14, size * 0.10),
+        egui::vec2(w, h),
+    );
+    painter.rect_filled(front, 1.5, color.gamma_multiply(0.18));
+    painter.rect_stroke(front, 1.5, stroke);
+}
+
 /// 文本宽度（egui 0.28 的 `Painter` 没有 `text_size`）。
+///
+/// 一次 `fonts()` 调用里把整串的字宽加起来：比逐字符调用（每次都要进一次
+/// 闭包 + 分配临时 String）快一个数量级，SCM 面板里每帧要测很多次。
 fn measure(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
-    ui.fonts(|f| {
-        text.chars()
-            .map(|c| f.glyph_width(font, c))
-            .sum::<f32>()
-    })
+    if text.is_empty() {
+        return 0.0;
+    }
+    ui.fonts(|f| text.chars().map(|c| f.glyph_width(font, c)).sum::<f32>())
 }
 
 /// 按像素宽度截断文本（超出加省略号）。
@@ -1825,20 +1904,23 @@ fn truncate_to_width(ui: &egui::Ui, text: &str, font: &egui::FontId, max_w: f32)
     if max_w <= 0.0 {
         return String::new();
     }
-    if measure(ui, text, font) <= max_w {
+    // 一次拿到所有字宽（O(n)，只进一次 fonts 闭包），后面都是 O(1) 的累加。
+    let widths: Vec<f32> = ui.fonts(|f| text.chars().map(|c| f.glyph_width(font, c)).collect());
+    let total: f32 = widths.iter().sum();
+    if total <= max_w {
         return text.to_string();
     }
-    let mut out = String::new();
-    let mut w = 0.0;
-    let ellipsis_w = measure(ui, "…", font);
-    for c in text.chars() {
-        let cw = measure(ui, &c.to_string(), font);
-        if w + cw + ellipsis_w > max_w {
+    let ellipsis_w = ui.fonts(|f| f.glyph_width(font, '…'));
+    let mut acc = 0.0;
+    let mut n = 0;
+    for (i, w) in widths.iter().enumerate() {
+        if acc + w + ellipsis_w > max_w {
             break;
         }
-        out.push(c);
-        w += cw;
+        acc += w;
+        n = i + 1;
     }
+    let mut out: String = text.chars().take(n).collect();
     out.push('…');
     out
 }

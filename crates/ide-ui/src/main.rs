@@ -52,7 +52,9 @@ const PICKER_PAGE: usize = 20;
 const PICKER_MAX_RESULTS: usize = 200;
 /// 侧栏（Explorer/Outline）宽度范围与默认值。
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
-const SIDEBAR_MAX_WIDTH: f32 = 520.0;
+/// 侧栏最大宽度：SCM 面板里要能完整显示「文件名 + 完整路径」，
+/// 520 太窄（长路径会被截断），放到 1000。
+const SIDEBAR_MAX_WIDTH: f32 = 1000.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 260.0;
 /// 侧栏展开/收起动画时长（秒）。
 const SIDEBAR_ANIM_TIME: f32 = 0.16;
@@ -6724,7 +6726,6 @@ enum Codicon {
     History,        // ea82 history（时钟）
     GitCommit,      // eafc git-commit
     GitPullRequest, // ea64 git-pull-request
-    Clippy,         // eac0 clippy（当「复制」按钮用：形似剪贴板）
     Dot,            // ea71 circle-filled（分支标签前的圆点）
     Cloud,          // ebaa cloud（远程分支标签）
 }
@@ -6774,7 +6775,6 @@ impl Codicon {
         Codicon::History,
         Codicon::GitCommit,
         Codicon::GitPullRequest,
-        Codicon::Clippy,
         Codicon::Dot,
         Codicon::Cloud,
     ];
@@ -6823,7 +6823,6 @@ impl Codicon {
             Codicon::History => 0xea82,
             Codicon::GitCommit => 0xeafc,
             Codicon::GitPullRequest => 0xea64,
-            Codicon::Clippy => 0xeac0,
             Codicon::Dot => 0xea71,
             Codicon::Cloud => 0xebaa,
         };
@@ -9221,6 +9220,31 @@ mod tests {
         assert!(all.contains("M"), "展开的文件应带状态字母");
     }
 
+    /// 仓库分组可以折叠：折叠后只留标题行（message 框 / 提交按钮 / 文件列表都不画）。
+    #[test]
+    fn repo_group_can_be_collapsed() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        app.scm.set_repos(vec![scm_repo()]);
+        app.sidebar_content = SidebarContent::SourceControl;
+        app.settings.show_sidebar = true;
+
+        // 展开：能看到 message 框和文件
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        let expanded = frame_texts(&out).join("\n");
+        assert!(expanded.contains("Ctrl+Enter to commit on"), "展开时应显示 message 框");
+        assert!(expanded.contains("main.cpp"), "展开时应显示改动的文件");
+
+        // 折叠：只剩标题行
+        app.scm.repos[0].expanded = false;
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        let collapsed = frame_texts(&out).join("\n");
+        assert!(!collapsed.contains("Ctrl+Enter to commit on"), "折叠后不应有 message 框");
+        assert!(!collapsed.contains("main.cpp"), "折叠后不应有文件列表");
+        assert!(collapsed.contains("repo"), "折叠后仍应显示仓库名");
+    }
+
     /// 悬停 GRAPH 里的某条提交 → 弹出信息卡片（作者 / 时间 / 标题 / 统计 / SHA + 复制按钮）。
     #[test]
     fn hovering_a_commit_shows_info_card() {
@@ -9229,6 +9253,7 @@ mod tests {
         let mut app = test_app();
         let mut repo = scm_repo();
         repo.commits[0].author = "HOVERCARD".into();
+        repo.commits[0].full = "abc1234def5678901234567890abcdef".into();
         app.scm.set_repos(vec![repo]);
         app.sidebar_content = SidebarContent::SourceControl;
         app.settings.show_sidebar = true;
@@ -9279,6 +9304,48 @@ mod tests {
         assert!(all.contains("70 insertions(+)"), "卡片应显示新增行数");
         assert!(all.contains("61 deletions(-)"), "卡片应显示删除行数");
         assert!(all.contains("abc1234"), "卡片应显示提交 ID");
+    }
+
+    /// 复制按钮复制的是**完整**的 commit id（卡片上显示的是短 SHA）。
+    #[test]
+    fn copy_button_uses_full_commit_id() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        let mut repo = scm_repo();
+        repo.commits[0].hash = "abc1234".into();
+        repo.commits[0].full = "abc1234def5678901234567890abcdef".into();
+        app.scm.set_repos(vec![repo]);
+        app.sidebar_content = SidebarContent::SourceControl;
+        app.settings.show_sidebar = true;
+        // 第一帧：找到提交标题的位置
+        let out = ctx.run(probe_raw_input(), |ctx| app.draw_sidebar(ctx));
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("fix broken edge API") => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("应画出提交标题");
+        // 悬停到那一行 → 卡片出现
+        let mut input = probe_raw_input();
+        input.events.push(egui::Event::PointerMoved(pos));
+        let _ = ctx.run(input.clone(), |ctx| app.draw_sidebar(ctx));
+        let out = ctx.run(input, |ctx| app.draw_sidebar(ctx));
+        let card_hash = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().starts_with("abc1234") => {
+                    Some(t.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .next();
+        assert_eq!(card_hash.as_deref(), Some("abc1234"), "卡片上显示短 SHA");
     }
 
     /// 活动栏的源代码管理图标切到 Source Control 视图。
