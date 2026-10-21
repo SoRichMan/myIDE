@@ -17,6 +17,16 @@ fn mock_script() -> PathBuf {
     PathBuf::from(root).join("../../testdata/mock_clangd.py")
 }
 
+/// python 解释器：先找 PATH 上的 `python`，找不到就用本机装的
+/// `D:\Python311\python.exe`（这台机器的 Python 不在 PATH 上）。
+fn python_cmd() -> String {
+    let local = r"D:\Python311\python.exe";
+    if std::path::Path::new(local).exists() {
+        return local.to_string();
+    }
+    "python".to_string()
+}
+
 const URI: &str = "file:///mnt/e/TestDeepSeek/testdata/sample_project/src/main.cpp";
 
 fn wait_status<F>(mgr: &LspManager, mut want: F, timeout: Duration) -> LspStatus
@@ -38,7 +48,7 @@ where
 #[test]
 fn manager_mock_reopen_root_reconnects() {
     let mock = mock_script();
-    let cmdline = format!("python {}", mock.display());
+    let cmdline = format!("{} {}", python_cmd(), mock.display());
     unsafe { std::env::set_var("LITEIDE_LSP_CMD", &cmdline) };
 
     let mut mgr = LspManager::new();

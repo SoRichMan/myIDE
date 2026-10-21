@@ -22,10 +22,20 @@ fn mock_script() -> PathBuf {
     PathBuf::from(root).join("../../testdata/mock_clangd.py")
 }
 
+/// python 解释器：先找 PATH 上的 `python`，找不到就用本机装的
+/// `D:\Python311\python.exe`（这台机器的 Python 不在 PATH 上）。
+pub fn python_cmd() -> String {
+    let local = r"D:\Python311\python.exe";
+    if std::path::Path::new(local).exists() {
+        return local.to_string();
+    }
+    "python".to_string()
+}
+
 const URI: &str = "file:///mnt/e/TestDeepSeek/testdata/sample_project/src/main.cpp";
 
 async fn spawn_mock() -> tokio::process::Child {
-    let mut cmd = TokioCommand::new("python");
+    let mut cmd = TokioCommand::new(python_cmd());
     cmd.arg(mock_script());
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -243,7 +253,7 @@ fn wait_ready(mgr: &LspManager, timeout: Duration) {
 fn manager_mock_crash_then_restart() {
     // 用 mock 替换真实 clangd（进程级环境变量，本测试独占该变量）
     let mock = mock_script();
-    let cmdline = format!("python {}", mock.display());
+    let cmdline = format!("{} {}", python_cmd(), mock.display());
     unsafe { std::env::set_var("LITEIDE_LSP_CMD", &cmdline) };
 
     let mut mgr = LspManager::new();

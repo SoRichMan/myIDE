@@ -191,6 +191,15 @@ const CJK_FONT_CANDIDATES: &[&str] = &[
     "C:\\Windows\\Fonts\\msyh.ttf",
 ];
 
+/// 界面字体（Proportional 家族的第一顺位）。
+///
+/// egui 自带的 Ubuntu-Light 太细，11~13px 的界面文字（侧栏、SCM 面板）看着发虚；
+/// VS Code 在 Windows 上用的就是 Segoe UI，这里对齐它。
+const UI_FONT_CANDIDATES: &[&str] = &[
+    "C:\\Windows\\Fonts\\segoeui.ttf",
+    "C:\\Windows\\Fonts\\tahoma.ttf",
+];
+
 /// 内置 codicon 图标字体的 egui 字体族名。
 ///
 /// VS Code 官方图标字体（MIT，见 `assets/codicon.LICENSE.txt`）随二进制一起编译进来：
@@ -202,6 +211,16 @@ const CODICON_FAMILY: &str = "codicon";
 fn apply_fonts(ctx: &egui::Context, family: &str) {
     let mut fonts = egui::FontDefinitions::default();
     let no_cjk = std::env::var("LITEIDE_NO_CJK").map(|v| v == "1").unwrap_or(false);
+    // 界面字体：Segoe UI（Windows 自带，VS Code 同款）——小字号更清晰。
+    for path in UI_FONT_CANDIDATES {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert("ui".to_owned(), egui::FontData::from_owned(bytes));
+            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                list.insert(0, "ui".to_owned());
+            }
+            break;
+        }
+    }
     if !no_cjk {
         for path in CJK_FONT_CANDIDATES {
             if let Ok(bytes) = std::fs::read(path) {
@@ -6703,6 +6722,8 @@ enum Codicon {
     GitCommit,      // eafc git-commit
     GitPullRequest, // ea64 git-pull-request
     Clippy,         // eac0 clippy（当「复制」按钮用：形似剪贴板）
+    Dot,            // ea71 circle-filled（分支标签前的圆点）
+    Cloud,          // ebaa cloud（远程分支标签）
 }
 
 impl Codicon {
@@ -6752,6 +6773,8 @@ impl Codicon {
         Codicon::GitCommit,
         Codicon::GitPullRequest,
         Codicon::Clippy,
+        Codicon::Dot,
+        Codicon::Cloud,
     ];
 
     /// 字体里的码位（U+Exxx）。
@@ -6800,6 +6823,8 @@ impl Codicon {
             Codicon::GitCommit => 0xeafc,
             Codicon::GitPullRequest => 0xea64,
             Codicon::Clippy => 0xeac0,
+            Codicon::Dot => 0xea71,
+            Codicon::Cloud => 0xebaa,
         };
         char::from_u32(cp).unwrap_or(' ')
     }

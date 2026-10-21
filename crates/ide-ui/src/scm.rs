@@ -152,6 +152,8 @@ pub struct HoverCard {
     pub date: String,
     /// 标题。
     pub subject: String,
+    /// 引用标签（分支名）。
+    pub refs: Vec<String>,
     /// 该行在屏幕上的位置（卡片贴着它弹）。
     pub anchor: egui::Rect,
 }
@@ -164,6 +166,7 @@ impl Default for HoverCard {
             author: String::new(),
             date: String::new(),
             subject: String::new(),
+            refs: Vec::new(),
             anchor: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::ZERO),
         }
     }
@@ -580,7 +583,7 @@ impl ScmPanel {
                                 Codicon::SourceControl,
                                 hex(FG),
                             );
-                            ui.label(RichText::new(ellipsize(&branch, 16)).size(11.5).color(hex(FG)));
+                            ui.label(RichText::new(ellipsize(&branch, 16)).size(12.0).color(hex(FG)));
                         });
                     })
                     .response;
@@ -635,7 +638,7 @@ impl ScmPanel {
         if staged.is_empty() && unstaged.is_empty() {
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
-                ui.label(RichText::new("工作区干净").size(11.5).color(hex(FG_DIM)));
+                ui.label(RichText::new("工作区干净").size(12.0).color(hex(FG_DIM)));
             });
         }
         ui.add_space(6.0);
@@ -643,9 +646,9 @@ impl ScmPanel {
 
     /// 提交信息输入框（VS Code 的 `input.background` 单行框，约 26 px 高）。
     ///
-    /// egui 的 `TextEdit::multiline` 即使 `desired_rows(1)` 也会按行高把文字画到框外，
-    /// 所以这里改成「单行 TextEdit + 上下内边距」：框高 = 行高 + 2×3px ≈ 26px，
-    /// 占位提示垂直居中，和 VS Code 一致。
+    /// egui 的 `TextEdit` 自带边框 + 固定行高，小字号时占位提示会画到框外
+    /// （看着像「文字压在边框上」）。这里改成：自己画输入框（`input.background`），
+    /// 里面放一个**无边框**的单行 TextEdit，字号和提示文字一致、垂直居中。
     fn draw_message_input(
         &mut self,
         ui: &mut egui::Ui,
@@ -659,27 +662,30 @@ impl ScmPanel {
             ui.add_space(10.0);
             let width = ui.available_width() - 14.0;
             let mut msg = repos[idx].message.clone();
-            // VS Code：输入框背景 = `input.background`，边框 = `input.border`。
-            let old_visuals = ui.visuals().clone();
-            let mut visuals = old_visuals.clone();
-            visuals.extreme_bg_color = hex("#3c3c3c");
-            visuals.widgets.inactive.bg_fill = hex("#3c3c3c");
-            visuals.widgets.inactive.weak_bg_fill = hex("#3c3c3c");
-            visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, hex("#3c3c3c"));
-            visuals.widgets.inactive.rounding = egui::Rounding::same(2.0);
-            *ui.visuals_mut() = visuals;
-            let edit = egui::Frame::none()
-                .inner_margin(egui::Margin::symmetric(0.0, 5.0))
+            let font = egui::FontId::proportional(13.0);
+            let resp = egui::Frame::none()
+                .fill(hex("#3c3c3c"))
+                .inner_margin(egui::Margin::symmetric(5.0, 5.0))
+                .rounding(2.0)
                 .show(ui, |ui| {
                     egui::TextEdit::singleline(&mut msg)
-                        .desired_width(width)
-                        .hint_text(RichText::new(hint).size(11.5).color(hex(FG_DIM)))
-                        .font(egui::TextStyle::Small)
+                        .desired_width(width - 10.0)
+                        .frame(false)
+                        // 提示文字不单独指定字号：跟着输入框走，避免画到框外。
+                        .hint_text(RichText::new(hint).color(hex(FG_DIM)))
+                        .font(font)
                         .show(ui)
                 });
-            *ui.visuals_mut() = old_visuals;
+            // 聚焦时给一圈蓝色边框（VS Code `focusBorder`）。
+            if resp.response.has_focus() {
+                ui.painter().rect_stroke(
+                    resp.response.rect,
+                    2.0,
+                    egui::Stroke::new(1.0_f32, hex("#0078d4")),
+                );
+            }
             let ctrl_enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl);
-            if edit.response.changed() {
+            if resp.response.changed() {
                 repos[idx].message = msg.clone();
             }
             if ctrl_enter {
@@ -865,7 +871,7 @@ impl ScmPanel {
                 if branches.is_empty() {
                     ui.label(
                         RichText::new(format!("(当前分支: {current})"))
-                            .size(11.5)
+                            .size(12.0)
                             .color(hex(FG_DIM)),
                     );
                 }
@@ -952,10 +958,13 @@ impl ScmPanel {
             );
             // 文件名在前（正常色，突出），路径在后（灰色）
             let (name, dir) = split_path(&e.path);
-            let font = egui::FontId::proportional(12.0);
+            let font = egui::FontId::proportional(12.5);
             let name_w = measure(ui, name, &font);
             let text_x = icon_x + 16.0;
-            let avail = rect.right() - badge_w - 8.0 - text_x - name_w;
+            // 悬停时右侧要留给操作按钮：把路径截短，条目不会和按钮叠在一起
+            // （VS Code 的做法：按钮浮在右边，文字缩成「…」）。
+            let buttons_w = if resp.hovered() { 42.0 } else { 0.0 };
+            let avail = rect.right() - badge_w - 8.0 - buttons_w - text_x - name_w;
             let dir_text = if dir.is_empty() {
                 String::new()
             } else {
@@ -971,8 +980,9 @@ impl ScmPanel {
                 hex(FG),
             );
             if !dir_text.is_empty() {
+                // 文件名和路径之间留 6px 空隙（VS Code 用一个空格，视觉上更清楚）。
                 ui.painter().text(
-                    egui::pos2(text_x + name_w + 4.0, cy),
+                    egui::pos2(text_x + name_w + 6.0, cy),
                     egui::Align2::LEFT_CENTER,
                     &dir_text,
                     font.clone(),
@@ -984,25 +994,48 @@ impl ScmPanel {
                 egui::pos2(rect.right() - badge_w, cy),
                 egui::Align2::LEFT_CENTER,
                 badge.to_string(),
-                egui::FontId::proportional(12.0),
+                egui::FontId::proportional(12.5),
                 color,
             );
-            // 悬停操作
+            // 悬停操作（按钮在右侧独立位置，文字已截短，不会叠在一起）
             if resp.hovered() {
                 let right = rect.right() - badge_w - 6.0;
-                if staged {
-                    // 取消暂存
-                    let r = egui::Rect::from_center_size(
-                        egui::pos2(right - 10.0, cy),
-                        egui::vec2(18.0, 18.0),
-                    );
-                    draw_codicon(ui.painter(), r.center(), 14.0, Codicon::Remove, hex(FG_DIM));
-                    let hit = ui.interact(
-                        r,
-                        egui::Id::new(("scm_unstage", idx, &e.path)),
-                        egui::Sense::click(),
+                let action_button = |ui: &mut egui::Ui,
+                                         center: egui::Pos2,
+                                         icon: Codicon,
+                                         tip: &str,
+                                         id: egui::Id,
+                                         out: &mut Option<()>| {
+                    let r = egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0));
+                    let hit = ui.interact(r, id, egui::Sense::click());
+                    if hit.hovered() {
+                        ui.painter()
+                            .rect_filled(r, 3.0, hex("#ffffff").gamma_multiply(0.12));
+                    }
+                    draw_codicon(
+                        ui.painter(),
+                        r.center(),
+                        15.0,
+                        icon,
+                        if hit.hovered() { hex(FG) } else { hex("#c8c8c8") },
                     );
                     if hit.clicked() {
+                        *out = Some(());
+                    }
+                    hit.on_hover_text(tip)
+                };
+                if staged {
+                    // 取消暂存
+                    let mut clicked = None;
+                    action_button(
+                        ui,
+                        egui::pos2(right - 10.0, cy),
+                        Codicon::Remove,
+                        "取消暂存",
+                        egui::Id::new(("scm_unstage", idx, &e.path)),
+                        &mut clicked,
+                    );
+                    if clicked.is_some() {
                         actions.push(Action::Unstage {
                             repo: idx,
                             path: e.path.clone(),
@@ -1010,34 +1043,32 @@ impl ScmPanel {
                     }
                 } else {
                     // 丢弃
-                    let r = egui::Rect::from_center_size(
+                    let mut clicked = None;
+                    action_button(
+                        ui,
                         egui::pos2(right - 10.0, cy),
-                        egui::vec2(18.0, 18.0),
-                    );
-                    draw_codicon(ui.painter(), r.center(), 14.0, Codicon::Discard, hex(FG_DIM));
-                    let hit = ui.interact(
-                        r,
+                        Codicon::Discard,
+                        "丢弃修改",
                         egui::Id::new(("scm_discard", idx, &e.path)),
-                        egui::Sense::click(),
+                        &mut clicked,
                     );
-                    if hit.clicked() {
+                    if clicked.is_some() {
                         actions.push(Action::Discard {
                             repo: idx,
                             path: e.path.clone(),
                         });
                     }
                     // 暂存
-                    let r2 = egui::Rect::from_center_size(
-                        egui::pos2(right - 30.0, cy),
-                        egui::vec2(18.0, 18.0),
-                    );
-                    draw_codicon(ui.painter(), r2.center(), 14.0, Codicon::Add, hex(FG_DIM));
-                    let hit = ui.interact(
-                        r2,
+                    let mut clicked = None;
+                    action_button(
+                        ui,
+                        egui::pos2(right - 32.0, cy),
+                        Codicon::Add,
+                        "暂存更改",
                         egui::Id::new(("scm_stage", idx, &e.path)),
-                        egui::Sense::click(),
+                        &mut clicked,
                     );
-                    if hit.clicked() {
+                    if clicked.is_some() {
                         actions.push(Action::Stage {
                             repo: idx,
                             path: e.path.clone(),
@@ -1208,7 +1239,7 @@ impl ScmPanel {
                 ui.add_space(14.0);
                 ui.label(
                     RichText::new("(没有提交记录)")
-                        .size(11.5)
+                        .size(12.0)
                         .color(hex(FG_DIM)),
                 );
             });
@@ -1334,6 +1365,13 @@ impl ScmPanel {
                             author: c.author.clone(),
                             date: c.date.clone(),
                             subject: c.subject.clone(),
+                            refs: c
+                                .refs
+                                .iter()
+                                .map(|r| r.replace("HEAD -> ", ""))
+                                .filter(|r| !r.is_empty())
+                                .take(3)
+                                .collect(),
                             anchor: rect,
                         });
                     }
@@ -1393,32 +1431,32 @@ impl ScmPanel {
                         // 第一行：作者 + 时间
                         ui.horizontal(|ui| {
                             let (icon_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
                             draw_codicon(
                                 ui.painter(),
                                 icon_rect.center(),
-                                13.0,
+                                14.0,
                                 Codicon::Account,
                                 hex(FG_DIM),
                             );
-                            ui.add_space(2.0);
+                            ui.add_space(3.0);
                             ui.label(
                                 RichText::new(card.author.clone())
-                                    .size(12.0)
+                                    .size(12.5)
                                     .strong()
                                     .color(hex(REF_FG)),
                             );
-                            ui.add_space(8.0);
+                            ui.add_space(12.0);
                             let (icon_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
                             draw_codicon(
                                 ui.painter(),
                                 icon_rect.center(),
-                                13.0,
+                                14.0,
                                 Codicon::History,
                                 hex(FG_DIM),
                             );
-                            ui.add_space(2.0);
+                            ui.add_space(3.0);
                             let abs = format_absolute_time(&card.date);
                             ui.label(
                                 RichText::new(if abs.is_empty() {
@@ -1426,19 +1464,19 @@ impl ScmPanel {
                                 } else {
                                     format!("{} ({abs})", relative_time(&card.date))
                                 })
-                                .size(11.5)
+                                .size(12.0)
                                 .color(hex(FG_DIM)),
                             );
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(10.0);
                         // 第二行：标题
                         ui.label(
                             RichText::new(card.subject.clone())
-                                .size(13.0)
+                                .size(13.5)
                                 .strong()
                                 .color(hex(FG)),
                         );
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
                         // 第三行：改动统计
                         if let Some(d) = &detail {
                             if d.hash.starts_with(&card.hash) {
@@ -1449,14 +1487,14 @@ impl ScmPanel {
                                     ui.spacing_mut().item_spacing.x = 0.0;
                                     ui.label(
                                         RichText::new(format!("{n} {file_word} changed"))
-                                            .size(12.0)
+                                            .size(12.5)
                                             .color(hex(FG)),
                                     );
                                     let ins = d.insertions();
                                     if ins > 0 {
                                         ui.label(
                                             RichText::new(format!(", {ins} insertions(+)"))
-                                                .size(12.0)
+                                                .size(12.5)
                                                 .color(hex(CHANGED_ADDED)),
                                         );
                                     }
@@ -1464,32 +1502,87 @@ impl ScmPanel {
                                     if del > 0 {
                                         ui.label(
                                             RichText::new(format!(", {del} deletions(-)"))
-                                                .size(12.0)
+                                                .size(12.5)
                                                 .color(hex(CHANGED_DELETED)),
                                         );
                                     }
                                 });
-                                ui.add_space(8.0);
                             }
                         }
-                        // 第四行：短 SHA + 复制按钮
+                        // 第四行：分支标签（当前分支蓝色，远程分支紫色）
+                        if !card.refs.is_empty() {
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for (i, r) in card.refs.iter().enumerate() {
+                                    let is_local = !r.contains('/');
+                                    let (fg, bg, border, icon) = if is_local {
+                                        (
+                                            hex("#9cdcfe"),
+                                            hex("#1b3b5c"),
+                                            hex("#2f5f96"),
+                                            Codicon::Dot,
+                                        )
+                                    } else {
+                                        (
+                                            hex("#c586c0"),
+                                            hex("#372a45"),
+                                            hex("#5d4473"),
+                                            Codicon::Cloud,
+                                        )
+                                    };
+                                    let label = r.replace("HEAD -> ", "");
+                                    let chip = egui::Frame::none()
+                                        .fill(bg)
+                                        .stroke(egui::Stroke::new(1.0_f32, border))
+                                        .inner_margin(egui::Margin::symmetric(7.0, 3.0))
+                                        .rounding(10.0)
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                let (icon_rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(13.0, 13.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                draw_codicon(
+                                                    ui.painter(),
+                                                    icon_rect.center(),
+                                                    12.0,
+                                                    icon,
+                                                    fg,
+                                                );
+                                                ui.label(
+                                                    RichText::new(label.clone())
+                                                        .size(12.0)
+                                                        .color(fg),
+                                                );
+                                            });
+                                        });
+                                    let _ = chip;
+                                    if i + 1 < card.refs.len() {
+                                        ui.add_space(2.0);
+                                    }
+                                }
+                            });
+                        }
+                        // 第五行：短 SHA + 复制按钮
+                        ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             let (icon_rect, _) =
-                                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
                             draw_codicon(
                                 ui.painter(),
                                 icon_rect.center(),
-                                13.0,
+                                14.0,
                                 Codicon::GitCommit,
                                 hex(REF_FG),
                             );
                             ui.add_space(4.0);
                             ui.label(
                                 RichText::new(card.hash.clone())
-                                    .size(12.0)
+                                    .size(12.5)
                                     .color(hex(REF_FG)),
                             );
-                            ui.add_space(8.0);
+                            ui.add_space(10.0);
                             let (btn_rect, btn) =
                                 ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                             if btn.hovered() {
@@ -1580,14 +1673,14 @@ impl ScmPanel {
             ui.label(RichText::new(detail.subject.clone()).size(12.5).color(hex(FG)));
             if !detail.body.is_empty() {
                 ui.add_space(2.0);
-                ui.label(RichText::new(detail.body.clone()).size(11.5).color(hex(FG_DIM)));
+                ui.label(RichText::new(detail.body.clone()).size(12.0).color(hex(FG_DIM)));
             }
             ui.add_space(4.0);
-            ui.label(RichText::new(detail.summary()).size(11.5).color(hex(FG_DIM)));
+            ui.label(RichText::new(detail.summary()).size(12.0).color(hex(FG_DIM)));
             ui.add_space(4.0);
             for f in &detail.files {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(f.path.clone()).size(11.5).color(hex(FG)));
+                    ui.label(RichText::new(f.path.clone()).size(12.0).color(hex(FG)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if f.deletions > 0 {
                             ui.label(
@@ -1612,7 +1705,7 @@ impl ScmPanel {
                     .add(
                         egui::Label::new(
                             RichText::new("显示差异")
-                                .size(11.5)
+                                .size(12.0)
                                 .color(hex(ACCENT_TEXT))
                                 .underline(),
                         )
@@ -1708,7 +1801,7 @@ fn group_header(ui: &mut egui::Ui, title: &str, count: usize, open: bool) -> (bo
         }
         ui.label(
             RichText::new(format!("{title} ({count})"))
-                .size(11.5)
+                .size(12.0)
                 .color(hex(FG)),
         );
     });
