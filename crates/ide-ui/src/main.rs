@@ -379,6 +379,17 @@ enum SidebarContent {
     SourceControl,
 }
 
+/// 「关闭未保存文件」对话框的选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAnswer {
+    /// 保存后关闭。
+    Save,
+    /// 放弃修改并关闭。
+    Discard,
+    /// 取消，标签留着。
+    Cancel,
+}
+
 /// 设置面板收集的动作（渲染闭包外应用）。
 enum SettingsAction {
     FontSize(f32),
@@ -1321,6 +1332,41 @@ impl LiteIdeApp {
             return;
         }
         self.load_tab_into_editor(self.tabs.active());
+    }
+
+    /// 保存指定标签（给「未保存」对话框的「保存」按钮用）。
+    ///
+    /// 活动标签的文本以编辑器里的为准（用户可能刚改完还没回写标签）；
+    /// 远程文件走 `write_text_file`（写到远端真实文件，不是 9P 视图）。
+    fn save_tab(&mut self, idx: usize) -> Result<(), String> {
+        let Some(tab) = self.tabs.get(idx).cloned() else {
+            return Err("标签已不存在".to_string());
+        };
+        let Some(path) = tab.path.clone() else {
+            return Err("未命名文件无法保存，请先「另存为」".to_string());
+        };
+        let text = if idx == self.tabs.active() {
+            self.editor
+                .as_ref()
+                .map(|e| e.text())
+                .unwrap_or_else(|| tab.text.clone())
+        } else {
+            tab.text.clone()
+        };
+        self.write_text_file(&path, &text)?;
+        if let Some(t) = self.tabs.get_mut(idx) {
+            t.text = text;
+            t.dirty = false;
+        }
+        if idx == self.tabs.active() {
+            self.editor_clean_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
+            if self.lsp_status.is_ready() {
+                if let Some(uri) = self.current_uri.clone() {
+                    self.lsp.save_document(uri);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 关闭指定标签（脏标签弹确认，返回是否真正关闭）。
@@ -7187,52 +7233,139 @@ impl LiteIdeApp {
     }
 
     /// 关闭标签确认弹窗（脏标签）。
+    ///
+    /// VS Code 风格的模态对话框：背景压暗、卡片居中、右下角一排按钮
+    /// （主按钮「保存」在最右，其次「取消」「不保存」）。
+    ///
+    /// 遮罩、卡片、按钮都放在**同一个 `Area`**（全屏）里：egui 命中测试时
+    /// 「同一层里最后注册的控件」赢，全屏遮罩如果单独一层会把按钮的点击吃掉。
     fn draw_close_confirm(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.confirm_close else { return };
-        let title = self
-            .tabs
-            .get(idx)
-            .map(|t| t.title.clone())
-            .unwrap_or_default();
-        let mut answer: Option<bool> = None;
+        let Some(tab) = self.tabs.get(idx).cloned() else {
+            self.confirm_close = None;
+            return;
+        };
+        let p = palette(self.applied_theme);
+        let accent = hex(p.tab_active_border);
+        let mut answer: Option<CloseAnswer> = None;
+
+        let screen = ctx.screen_rect();
         egui::Area::new(egui::Id::new("close_confirm"))
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .fill(hex("#3c3c3c"))
-                    .show(ui, |ui| {
-                        ui.set_width(360.0);
-                        ui.label(
-                            RichText::new(format!("「{title}」有未保存的修改。"))
-                                .size(13.0)
-                                .color(hex("#d4d4d4")),
-                        );
-                        ui.label(
-                            RichText::new("确定关闭吗？")
-                                .size(13.0)
-                                .color(hex("#d4d4d4")),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("放弃修改并关闭").clicked() {
-                                answer = Some(true);
-                            }
-                            if ui.button("取消").clicked() {
-                                answer = Some(false);
-                            }
+                // 遮罩：压暗背景并吃掉底下的点击（真正的模态）。
+                let (full, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(full, 0.0, egui::Color32::from_black_alpha(90));
+                // 点遮罩 = 取消（和 VS Code 一致：点外面关掉弹窗，标签留着）。
+                if resp.clicked() {
+                    answer = Some(CloseAnswer::Cancel);
+                }
+
+                // 卡片
+                let card =
+                    egui::Rect::from_center_size(full.center(), egui::vec2(440.0, 152.0));
+                // 阴影（用两层淡黑代替模糊阴影）
+                ui.painter().rect_filled(
+                    card.translate(egui::vec2(0.0, 4.0)).expand(4.0),
+                    9.0,
+                    egui::Color32::from_black_alpha(60),
+                );
+                ui.painter().rect_filled(card, 6.0, hex(p.bg_menu));
+                ui.painter()
+                    .rect_stroke(card, 6.0, egui::Stroke::new(1.0_f32, hex(p.border_menu)));
+                // 卡片本身也吃掉点击：点卡片空白处不该关掉弹窗。
+                ui.interact(card, egui::Id::new("close_confirm_card"), egui::Sense::click());
+
+                // 文本
+                let left = card.left() + 22.0;
+                let text_w = card.width() - 44.0;
+                let mut y = card.top() + 18.0;
+                y = paint_dialog_text(
+                    ui,
+                    "保存更改？",
+                    15.0,
+                    hex("#ffffff"),
+                    egui::pos2(left, y),
+                    text_w,
+                );
+                y += 8.0;
+                y = paint_dialog_text(
+                    ui,
+                    &format!("「{}」有未保存的修改。", tab.title),
+                    13.0,
+                    hex(p.fg_editor),
+                    egui::pos2(left, y),
+                    text_w,
+                );
+                paint_dialog_text(
+                    ui,
+                    "要保存后再关闭这个标签吗？",
+                    13.0,
+                    hex(p.fg_editor),
+                    egui::pos2(left, y),
+                    text_w,
+                );
+
+                // 按钮（从右往左：保存 / 取消 / 不保存）
+                let btn_h = 28.0;
+                let gap = 8.0;
+                let mut right = card.right() - 22.0;
+                for (label, primary) in [("保存", true), ("取消", false), ("不保存", false)] {
+                    let w = measure_dialog_text(ui, label, 13.0) + 28.0;
+                    right -= w;
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(right, card.bottom() - 18.0 - btn_h),
+                        egui::vec2(w, btn_h),
+                    );
+                    right -= gap;
+                    if dialog_button_at(ui, rect, label, primary, accent) {
+                        answer = Some(match label {
+                            "保存" => CloseAnswer::Save,
+                            "取消" => CloseAnswer::Cancel,
+                            _ => CloseAnswer::Discard,
                         });
-                    });
+                    }
+                }
             });
-        if let Some(confirm) = answer {
-            if confirm {
+
+        // Esc = 取消
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            answer = Some(CloseAnswer::Cancel);
+        }
+
+        match answer {
+            None => {}
+            Some(CloseAnswer::Cancel) => {
+                self.confirm_close = None;
+            }
+            Some(CloseAnswer::Discard) => {
                 // 强制关闭：先清脏标记
                 if let Some(t) = self.tabs.get_mut(idx) {
                     t.dirty = false;
                 }
                 self.close_tab_at(idx);
+                self.confirm_close = None;
             }
-            self.confirm_close = None;
+            Some(CloseAnswer::Save) => {
+                match self.save_tab(idx) {
+                    Ok(()) => {
+                        let shown = tab
+                            .path
+                            .as_ref()
+                            .map(|p| self.display_path(p))
+                            .unwrap_or_else(|| tab.title.clone());
+                        self.flash(format!("已保存 {shown}"));
+                        self.close_tab_at(idx);
+                        self.confirm_close = None;
+                    }
+                    Err(e) => {
+                        // 保存失败：留着弹窗，用户可以改成「不保存」或「取消」。
+                        self.flash(format!("保存失败: {e}"));
+                    }
+                }
+            }
         }
     }
 }
@@ -7849,6 +7982,113 @@ fn draw_codicon(
         codicon_font(size),
         color,
     );
+}
+
+/// 对话框按钮（VS Code 风格）：主按钮是强调蓝底白字，次按钮是透明底 + 描边。
+///
+/// 自绘而不用 `ui.button`，是为了拿到和 VS Code 一致的圆角/描边/悬停色。
+/// 返回是否被点击。
+fn dialog_button_at(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    primary: bool,
+    accent: egui::Color32,
+) -> bool {
+    let font = egui::FontId::proportional(13.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, egui::Color32::WHITE);
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("close_confirm_btn", label)),
+        egui::Sense::click(),
+    );
+    let (bg, border, text) = if primary {
+        (accent, egui::Stroke::NONE, egui::Color32::WHITE)
+    } else {
+        (
+            egui::Color32::TRANSPARENT,
+            egui::Stroke::new(1.0_f32, hex("#5a5a5a")),
+            hex("#d4d4d4"),
+        )
+    };
+    let bg = if resp.hovered() {
+        if primary {
+            // 悬停：强调色提亮一点（gamma_multiply 只能变暗，这里直接加通道值）
+            egui::Color32::from_rgb(
+                accent.r().saturating_add(24),
+                accent.g().saturating_add(24),
+                accent.b().saturating_add(24),
+            )
+        } else {
+            hex("#3a3a3a")
+        }
+    } else {
+        bg
+    };
+    if bg != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 3.0, bg);
+    }
+    if border != egui::Stroke::NONE {
+        ui.painter().rect_stroke(rect, 3.0, border);
+    }
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, text);
+    resp.clicked()
+}
+
+/// 画一行文字（对话框用），太宽就截断加省略号；返回下一行的 y 坐标。
+fn paint_dialog_text(
+    ui: &egui::Ui,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+    pos: egui::Pos2,
+    max_w: f32,
+) -> f32 {
+    let font = egui::FontId::proportional(size);
+    let mut label = text.to_string();
+    if ui
+        .painter()
+        .layout_no_wrap(label.clone(), font.clone(), color)
+        .size()
+        .x
+        > max_w
+    {
+        let mut n = label.chars().count();
+        while n > 1 {
+            n -= 1;
+            let mut s: String = label.chars().take(n).collect();
+            s.push('…');
+            if ui
+                .painter()
+                .layout_no_wrap(s.clone(), font.clone(), color)
+                .size()
+                .x
+                <= max_w
+            {
+                label = s;
+                break;
+            }
+        }
+    }
+    let galley = ui.painter().layout_no_wrap(label, font, color);
+    let h = galley.size().y;
+    ui.painter().galley(pos, galley, color);
+    pos.y + h + 3.0
+}
+
+/// 量一段文字的宽度（对话框按钮排版用）。
+fn measure_dialog_text(ui: &egui::Ui, text: &str, size: f32) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            text.to_string(),
+            egui::FontId::proportional(size),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x
 }
 
 /// 展开/折叠箭头（资源管理器 / 搜索结果树）：VS Code 用 codicon 的 chevron。
@@ -10587,6 +10827,106 @@ mod tests {
         out.shapes.iter().any(|cs| {
             matches!(&cs.shape, egui::Shape::Text(t) if t.galley.text() == "\u{ea76}")
         })
+    }
+
+    /// 「未保存」确认对话框：保存 / 不保存 / 取消 / 点遮罩 四个出口的行为。
+    #[test]
+    fn close_confirm_dialog_actions() {
+        /// 造一个只有一个「脏」标签的应用（真实文件，方便验证「保存」）。
+        fn dirty_app(dir: &std::path::Path) -> (LiteIdeApp, std::path::PathBuf) {
+            let path = dir.join("dirty.cpp");
+            std::fs::write(&path, "old\n").unwrap();
+            let mut app = test_app();
+            while !app.tabs.is_empty() {
+                app.tabs.close(0);
+            }
+            app.open_file(path.clone(), "new\n".to_string(), false);
+            app.tabs.get_mut(0).unwrap().dirty = true;
+            app.confirm_close = Some(0);
+            (app, path)
+        }
+        /// 画一帧对话框，返回某个按钮文字的中心。
+        ///
+        /// egui 的 `Area` 第一帧是「量尺寸」帧（不画内容），所以这里先画一帧再取第二帧。
+        fn button_at(ctx: &egui::Context, app: &mut LiteIdeApp, label: &str) -> egui::Pos2 {
+            let _ = ctx.run(probe_raw_input(), |ctx| app.draw_close_confirm(ctx));
+            let out = ctx.run(probe_raw_input(), |ctx| app.draw_close_confirm(ctx));
+            out.shapes
+                .iter()
+                .find_map(|cs| match &cs.shape {
+                    egui::Shape::Text(t) if t.galley.text() == label => {
+                        Some(t.pos + t.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("对话框里应能找到按钮「{label}」"))
+        }
+        fn click(ctx: &egui::Context, app: &mut LiteIdeApp, pos: egui::Pos2) {
+            for pressed in [true, false] {
+                let mut input = probe_raw_input();
+                input.events.push(egui::Event::PointerMoved(pos));
+                input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                });
+                let _ = ctx.run(input, |ctx| app.draw_close_confirm(ctx));
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("liteide-close-confirm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 对话框全是中文，egui 默认字体没有汉字 → 这里用应用自己的字体表（含 CJK）。
+        let ctx = egui::Context::default();
+        apply_fonts(&ctx, "default");
+        let _ = ctx.run(probe_raw_input(), |_| {});
+
+        // 1) 「不保存」：标签关掉，文件保持原样
+        {
+            let (mut app, path) = dirty_app(&dir);
+            let at = button_at(&ctx, &mut app, "不保存");
+            click(&ctx, &mut app, at);
+            assert_eq!(app.tabs.len(), 0, "「不保存」应关掉标签");
+            assert_eq!(app.confirm_close, None);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n", "不该写盘");
+        }
+
+        // 2) 「取消」：标签留着
+        {
+            let (mut app, path) = dirty_app(&dir);
+            let at = button_at(&ctx, &mut app, "取消");
+            click(&ctx, &mut app, at);
+            assert_eq!(app.tabs.len(), 1, "「取消」应保留标签");
+            assert_eq!(app.confirm_close, None);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n", "不该写盘");
+        }
+
+        // 3) 点遮罩：等同取消
+        {
+            let (mut app, path) = dirty_app(&dir);
+            let _ = button_at(&ctx, &mut app, "取消");
+            click(&ctx, &mut app, egui::pos2(20.0, 20.0));
+            assert_eq!(app.tabs.len(), 1, "点遮罩应保留标签");
+            assert_eq!(app.confirm_close, None);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n", "不该写盘");
+        }
+
+        // 4) 「保存」：写盘后关掉标签
+        {
+            let (mut app, path) = dirty_app(&dir);
+            let at = button_at(&ctx, &mut app, "保存");
+            click(&ctx, &mut app, at);
+            assert_eq!(app.tabs.len(), 0, "「保存」应关掉标签");
+            assert_eq!(app.confirm_close, None);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "new\n",
+                "「保存」应把新内容写进文件"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 标签宽度：短标题自己窄、长标题更宽；放不下时等比压缩，但不低于下限。
