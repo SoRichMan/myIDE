@@ -28,6 +28,8 @@ pub use ide_core::remote::{
 mod terminal;
 pub use terminal::{RemoteTerminal, TermOutput};
 
+pub mod toolchain;
+
 /// 单次请求的等待上限：bash 会话卡住（例如被杀）时不能让 UI 无限等。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 

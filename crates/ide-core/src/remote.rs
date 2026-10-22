@@ -213,6 +213,116 @@ impl RemoteTarget {
     }
 }
 
+/// IDE 自带的远端工具链目录（免 root 自动安装的便携工具放这里）。
+///
+/// 布局：
+/// - `bin/<tool>`：可执行文件的符号链接（自动加进 PATH）；
+/// - `<tool>/usr/bin/<tool>`：RPM 解包出来的真实前缀；
+/// - `<tool>/usr/lib64`：该工具的共享库（解析器按需放进 `LD_LIBRARY_PATH`）。
+pub const REMOTE_TOOLS_PATH: &str = "$HOME/.liteide/tools";
+
+/// IDE 支持探测 / 自动安装的远端工具。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemoteTool {
+    Clangd,
+    Rg,
+    Gdb,
+}
+
+impl RemoteTool {
+    /// 全部工具（探测顺序 = 这里）。
+    pub const ALL: [Self; 3] = [Self::Clangd, Self::Rg, Self::Gdb];
+
+    /// 可执行文件名（也是 [`RemoteTool::id`]）。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Clangd => "clangd",
+            Self::Rg => "rg",
+            Self::Gdb => "gdb",
+        }
+    }
+
+    /// 解析脚本里装结果的 shell 变量名。
+    pub fn var(self) -> &'static str {
+        match self {
+            Self::Clangd => "CLANGD",
+            Self::Rg => "RG",
+            Self::Gdb => "GDB",
+        }
+    }
+
+    /// 面向用户的作用说明（对话框里显示）。
+    pub fn purpose(self) -> &'static str {
+        match self {
+            Self::Clangd => "代码跳转 / 补全 / 悬停",
+            Self::Rg => "全文搜索",
+            Self::Gdb => "调试（F5）",
+        }
+    }
+
+    /// 能否由 IDE 免 root 自动安装。
+    ///
+    /// clangd 走 GitHub 官方预编译包（必要时自带 glibc 运行时），rg 走发行版 RPM；
+    /// gdb 依赖系统库太多，只提示用户自己装。
+    pub fn auto_installable(self) -> bool {
+        !matches!(self, Self::Gdb)
+    }
+
+    /// 走 RPM 方式安装时的包名（clangd 用预编译包，不用这个）。
+    pub fn rpm_package(self) -> Option<&'static str> {
+        match self {
+            Self::Clangd => None,
+            Self::Rg => Some("ripgrep"),
+            Self::Gdb => None,
+        }
+    }
+
+    /// 额外的搜索目录（有些开发机把工具装在 PATH 之外）。
+    fn extra_dirs(self) -> &'static str {
+        match self {
+            Self::Clangd => concat!(
+                "/usr/lib/llvm-*/bin/clangd /usr/local/bin/clangd \"$HOME/.local/bin/clangd\" ",
+                "/opt/rh/llvm-toolset-*/root/usr/bin/clangd \"$HOME/opt/llvm/bin/clangd\""
+            ),
+            Self::Rg => concat!(
+                "\"$HOME/.cache/opencode/bin/rg\" \"$HOME/.local/bin/rg\" ",
+                "/usr/local/bin/rg /usr/bin/rg \"$HOME/opt/rg/bin/rg\""
+            ),
+            Self::Gdb => {
+                "/opt/rh/devtoolset-*/root/usr/bin/gdb /usr/local/bin/gdb \"$HOME/.local/bin/gdb\""
+            }
+        }
+    }
+
+    /// 解析工具的 shell 片段。
+    ///
+    /// 执行后 `$<VAR>` 是绝对路径；找不到时往 stderr 写原因并 `exit 127`。
+    /// 顺序：`~/.liteide/tools/bin`（IDE 自动安装）→ `command -v` → 常见目录。
+    /// 命中自动安装目录时把 `<tool>/usr/lib64` 放进 `LD_LIBRARY_PATH`
+    /// （clangd 的 `libLLVM` 等库就在那里）。
+    pub fn resolver_shell(self) -> String {
+        // 用占位符替换而不是 `format!`：片段里 `${VAR:+...}` 的花括号太多。
+        RESOLVER_TEMPLATE
+            .replace("@VAR@", self.var())
+            .replace("@BIN@", self.id())
+            .replace("@DIRS@", self.extra_dirs())
+    }
+}
+
+/// 解析模板：`@VAR@` / `@BIN@` / `@DIRS@` 由 [`RemoteTool::resolver_shell`] 填。
+const RESOLVER_TEMPLATE: &str = concat!(
+    "export PATH=\"$HOME/.liteide/tools/bin:$PATH\"; ",
+    "@VAR@=$(command -v @BIN@ 2>/dev/null); ",
+    "if [ -z \"$@VAR@\" ]; then ",
+    "for c in @DIRS@; do [ -x \"$c\" ] && { @VAR@=$c; break; }; done; fi; ",
+    "if [ -z \"$@VAR@\" ]; then echo '@BIN@ 不在远端 PATH 中' >&2; exit 127; fi; ",
+    "R=$(readlink -f \"$@VAR@\" 2>/dev/null || echo \"$@VAR@\"); ",
+    "case \"$R\" in \"$HOME/.liteide/tools/\"*) ",
+    "L=$(dirname \"$(dirname \"$R\")\")/lib64; ",
+    "[ -d \"$L\" ] && export LD_LIBRARY_PATH=\"$L${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\";; ",
+    "esac; "
+);
+
 /// `wsl.exe` 可执行文件名（测试/自定义部署可覆盖）。
 pub fn wsl_exe() -> String {
     std::env::var("LITEIDE_WSL_EXE")
@@ -370,6 +480,35 @@ mod tests {
         set_current_target(Some(RemoteTarget::wsl("Ubuntu2404")));
         assert!(ssh_target_for_path("/home/u/proj").is_none());
         set_current_target(prev);
+    }
+
+    #[test]
+    fn remote_tool_resolver_prefers_installed_toolchain() {
+        for tool in RemoteTool::ALL {
+            let s = tool.resolver_shell();
+            assert!(
+                s.contains("$HOME/.liteide/tools/bin"),
+                "{} 的解析器要优先用 IDE 自带的工具: {s}",
+                tool.id()
+            );
+            assert!(
+                s.contains(&format!("{}=$(command -v {}", tool.var(), tool.id())),
+                "{} 的解析器要先查 PATH: {s}",
+                tool.id()
+            );
+            assert!(!s.contains("@VAR@") && !s.contains("@BIN@") && !s.contains("@DIRS@"));
+            // 自动安装的布局需要把同前缀的 lib64 加进 LD_LIBRARY_PATH。
+            assert!(s.contains("LD_LIBRARY_PATH"));
+            assert!(s.contains("exit 127"));
+        }
+        assert!(RemoteTool::Clangd
+            .resolver_shell()
+            .contains("/usr/lib/llvm-*/bin/clangd"));
+        assert!(RemoteTool::Clangd.auto_installable());
+        assert!(RemoteTool::Rg.auto_installable());
+        // gdb 依赖系统库太多，只提示用户自己装。
+        assert!(!RemoteTool::Gdb.auto_installable());
+        assert_eq!(RemoteTool::Rg.rpm_package(), Some("ripgrep"));
     }
 
     #[test]

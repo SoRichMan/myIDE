@@ -389,8 +389,11 @@ async fn session_loop(
         // ---- 启动 clangd 并握手 ----
         set_status(&st, LspStatus::Connecting);
         let spawned = match &transport {
-            Transport::Ssh(t) => spawn_clangd_remote(t),
-            Transport::Wsl(d) => spawn_clangd(d.as_deref().unwrap_or("mock")),
+            Transport::Ssh(t) => spawn_clangd_remote(t, st.root_uri.as_deref().unwrap_or("")),
+            Transport::Wsl(d) => spawn_clangd(
+                d.as_deref().unwrap_or("mock"),
+                st.root_uri.as_deref().unwrap_or(""),
+            ),
         };
         let child = match spawned {
             Ok(c) => c,

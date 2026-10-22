@@ -168,6 +168,23 @@ fn remote_menu_entries() -> [(&'static str, &'static str, RemoteAction); 5] {
     ]
 }
 
+/// 远程工具链后台任务（探测 / 安装）发回 UI 的消息。
+enum ToolchainEvent {
+    /// 探测完成（三个工具都查一遍）。
+    Probe(Result<ide_remote::toolchain::ToolchainProbe, String>),
+    /// 安装过程中的一行输出（下载 / 解包 / 自检）。
+    Progress(String),
+    /// 某个工具装好了。
+    Installed(ide_core::remote::RemoteTool),
+    /// 某个工具装失败。
+    Failed {
+        tool: ide_core::remote::RemoteTool,
+        error: String,
+    },
+    /// 任务结束（成功失败都会发，界面据此清掉 busy）。
+    Done,
+}
+
 /// 启动时装配的内置扩展（顺序 = 注册顺序，先注册者优先认领后缀）。
 ///
 /// 新增功能 = 新增一个 `Extension` 实现 + 在这里（或运行时的插件目录）登记，
@@ -584,6 +601,27 @@ struct LiteIdeApp {
     remote: RemoteFs,
     /// 已经生效的远程目标（热重载设置时判断要不要重连）。
     applied_remote: Option<RemoteTarget>,
+    // ---- 远程工具链（clangd / rg / gdb 探测 + 免 root 自动安装） ----
+    /// 「远程工具链」对话框是否展开。
+    toolchain_dialog_open: bool,
+    /// 最近一次探测结果（`None` = 还没探测过）。
+    toolchain_probe: Option<ide_remote::toolchain::ToolchainProbe>,
+    /// 探测失败原因（连不上 / 输出看不懂）。
+    toolchain_error: Option<String>,
+    /// 后台任务（探测 / 安装）发回 UI 的事件。
+    toolchain_rx: Option<std::sync::mpsc::Receiver<ToolchainEvent>>,
+    /// 正在做的事（`None` = 空闲）：显示成对话框里的 spinner 文案。
+    toolchain_busy: Option<String>,
+    /// 安装日志（对话框里滚动显示）。
+    toolchain_log: Vec<String>,
+    /// 本次安装已经成功的工具（装载完成后据此重启 LSP）。
+    toolchain_installed: Vec<ide_core::remote::RemoteTool>,
+    /// 用户点了「暂不安装」：本次连接不再自动弹窗。
+    toolchain_skipped: bool,
+    /// 已经自动探测过的目标（连接变化时重置）。
+    toolchain_probed_for: Option<RemoteTarget>,
+    /// 探测完要不要自动弹窗（连接成功 / 手动打开时为 true）。
+    toolchain_auto_open: bool,
     /// 集成终端（远端 PTY，编辑器下方 Split 面板）。
     terminal: TerminalSet,
 }
@@ -780,6 +818,16 @@ impl LiteIdeApp {
             remote_item_rect: None,
             remote: RemoteFs::new(),
             applied_remote: None,
+            toolchain_dialog_open: false,
+            toolchain_probe: None,
+            toolchain_error: None,
+            toolchain_rx: None,
+            toolchain_busy: None,
+            toolchain_log: Vec::new(),
+            toolchain_installed: Vec::new(),
+            toolchain_skipped: false,
+            toolchain_probed_for: None,
+            toolchain_auto_open: true,
             terminal: TerminalSet::new(),
         };
         // 启动就把设置应用上（字号 / 主题 / 滚轮方向等）。
@@ -1034,6 +1082,16 @@ impl LiteIdeApp {
         self.sync_remote_targets();
         self.save_settings();
         self.apply_workspace_switch();
+        // 新连接：重新探测远端工具链（缺 clangd 时弹提示）。
+        self.toolchain_rx = None;
+        self.toolchain_probed_for = None;
+        self.toolchain_probe = None;
+        self.toolchain_error = None;
+        self.toolchain_busy = None;
+        self.toolchain_log.clear();
+        self.toolchain_installed.clear();
+        self.toolchain_skipped = false;
+        self.toolchain_auto_open = true;
         self.flash(format!("已连接到 {} · {posix}", target.label()));
         tracing::info!(
             "remote workspace: {}:{posix}（远端内部 POSIX 根）",
@@ -1066,6 +1124,10 @@ impl LiteIdeApp {
         self.save_settings();
         // 断开后不再需要远端文件会话（下次连接会重新拉起）。
         self.remote.shutdown();
+        self.toolchain_rx = None;
+        self.toolchain_probed_for = None;
+        self.toolchain_probe = None;
+        self.toolchain_dialog_open = false;
         self.sync_remote_targets();
         self.applied_remote = None;
         self.apply_workspace_switch();
@@ -2197,10 +2259,25 @@ impl LiteIdeApp {
         }
         // LSP 没就绪：直接走按名字找的路���。
         if name.is_empty() {
-            self.flash("LSP 未就绪，无法跳转".to_string());
+            if self.remote_missing_clangd() {
+                self.flash("远端没有 clangd，无法跳转（可自动安装）".to_string());
+                self.open_toolchain_dialog();
+            } else {
+                self.flash("LSP 未就绪，无法跳转".to_string());
+            }
             return;
         }
         self.lookup_symbol_by_name(name);
+    }
+
+    /// 远端连接且探测确认缺 clangd（跳转/补全不可用的根因）。
+    fn remote_missing_clangd(&self) -> bool {
+        self.is_remote()
+            && self
+                .toolchain_probe
+                .as_ref()
+                .map(|p| p.missing.contains(&ide_core::remote::RemoteTool::Clangd))
+                .unwrap_or(false)
     }
 
     /// 压入跳转历史（后退栈），并清空前进栈。
@@ -2242,7 +2319,14 @@ impl LiteIdeApp {
             }
         }
         if !self.lsp_status.is_ready() {
-            self.flash(format!("未找到 `{name}` 的定义（LSP 未就绪）"));
+            if self.remote_missing_clangd() {
+                self.flash(format!(
+                    "未找到 `{name}` 的定义：远端没有 clangd（可在「远程工具链」里自动安装）"
+                ));
+                self.open_toolchain_dialog();
+            } else {
+                self.flash(format!("未找到 `{name}` 的定义（LSP 未就绪）"));
+            }
             return;
         }
         let seq = self.lsp.request_workspace_symbol(name.clone());
@@ -2479,6 +2563,7 @@ impl LiteIdeApp {
             || self.save_as_open
             || self.remote_dialog_open
             || self.ssh_dialog_open
+            || self.toolchain_dialog_open
             || self.confirm_close.is_some()
     }
 
@@ -6072,6 +6157,7 @@ impl LiteIdeApp {
         let connected = self.remote_target().map(|t| t.label());
         let mut keep_open = true;
         let mut want: Option<RemoteAction> = None;
+        let mut want_toolchain = false;
         egui::Area::new(egui::Id::new("remote_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(anchor.left(), anchor.top() - 4.0))
@@ -6092,6 +6178,14 @@ impl LiteIdeApp {
                             );
                             if ui.button("Close Remote Connection").clicked() {
                                 want = Some(RemoteAction::Disconnect);
+                                keep_open = false;
+                            }
+                            if ui
+                                .button("Remote Toolchain… (clangd / rg / gdb)")
+                                .on_hover_text("检测远端缺少的工具，可免 root 自动安装")
+                                .clicked()
+                            {
+                                want_toolchain = true;
                                 keep_open = false;
                             }
                             ui.separator();
@@ -6132,6 +6226,9 @@ impl LiteIdeApp {
                 | RemoteAction::CloneRepository
                 | RemoteAction::OpenOnRemote => {}
             }
+        }
+        if want_toolchain {
+            self.open_toolchain_dialog();
         }
         self.remote_menu_open = keep_open;
     }
@@ -6575,6 +6672,370 @@ impl LiteIdeApp {
         }
     }
 
+    // ================= 远程工具链（clangd / rg / gdb） =================
+
+    /// 新连接（或启动时恢复的远程工作区）自动探测一次工具链。
+    ///
+    /// 探测是后台线程（一次 SSH/WSL 往返），不阻塞界面；结果回到
+    /// [`LiteIdeApp::poll_toolchain`]，缺工具时自动弹对话框。
+    fn maybe_auto_probe_toolchain(&mut self) {
+        let Some(target) = self.remote_target() else {
+            // 回到本地：清掉状态，下次连远端重新探测。
+            self.toolchain_probed_for = None;
+            self.toolchain_skipped = false;
+            self.toolchain_probe = None;
+            self.toolchain_dialog_open = false;
+            return;
+        };
+        if self.toolchain_probed_for.as_ref() == Some(&target) || self.toolchain_rx.is_some() {
+            return;
+        }
+        self.toolchain_probed_for = Some(target);
+        self.toolchain_skipped = false;
+        self.start_toolchain_probe(true);
+    }
+
+    /// 后台探测远端工具链。
+    fn start_toolchain_probe(&mut self, auto_open: bool) {
+        let Some(target) = self.remote_target() else {
+            return;
+        };
+        if self.toolchain_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.toolchain_rx = Some(rx);
+        self.toolchain_busy = Some("正在探测远端工具链…".to_string());
+        self.toolchain_error = None;
+        self.toolchain_probe = None;
+        self.toolchain_auto_open = auto_open;
+        let spawned = std::thread::Builder::new()
+            .name("toolchain-probe".to_string())
+            .spawn(move || {
+                let result = ide_remote::toolchain::probe(&target);
+                let _ = tx.send(ToolchainEvent::Probe(result));
+                let _ = tx.send(ToolchainEvent::Done);
+            });
+        if let Err(e) = spawned {
+            self.toolchain_rx = None;
+            self.toolchain_busy = None;
+            self.toolchain_error = Some(format!("启动探测线程失败: {e}"));
+        }
+    }
+
+    /// 自动安装缺的工具（只装能免 root 安装的：clangd / rg）。
+    fn start_toolchain_install(&mut self) {
+        let Some(target) = self.remote_target() else {
+            return;
+        };
+        let Some(probe) = self.toolchain_probe.as_ref() else {
+            return;
+        };
+        let tools: Vec<ide_core::remote::RemoteTool> = probe
+            .missing
+            .iter()
+            .copied()
+            .filter(|t| t.auto_installable())
+            .collect();
+        if tools.is_empty() || self.toolchain_rx.is_some() {
+            return;
+        }
+        let names: Vec<&str> = tools.iter().map(|t| t.id()).collect();
+        self.toolchain_installed.clear();
+        self.toolchain_log.clear();
+        self.toolchain_busy = Some(format!("正在安装 {}…", names.join("、")));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.toolchain_rx = Some(rx);
+        let spawned = std::thread::Builder::new()
+            .name("toolchain-install".to_string())
+            .spawn(move || {
+                for tool in tools {
+                    let tx_line = tx.clone();
+                    let result = ide_remote::toolchain::install(&target, tool, &mut |line| {
+                        let _ = tx_line.send(ToolchainEvent::Progress(line.to_string()));
+                    });
+                    match result {
+                        Ok(_) => {
+                            let _ = tx.send(ToolchainEvent::Installed(tool));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(ToolchainEvent::Failed { tool, error });
+                        }
+                    }
+                }
+                let _ = tx.send(ToolchainEvent::Done);
+            });
+        if let Err(e) = spawned {
+            self.toolchain_rx = None;
+            self.toolchain_busy = None;
+            self.flash(format!("启动安装线程失败: {e}"));
+        }
+    }
+
+    /// 处理后台任务的事件（每帧调用）。
+    fn poll_toolchain(&mut self, ctx: &egui::Context) {
+        let events: Vec<ToolchainEvent> = match self.toolchain_rx.as_ref() {
+            Some(rx) => rx.try_iter().collect(),
+            None => return,
+        };
+        let mut done = false;
+        for ev in events {
+            match ev {
+                ToolchainEvent::Probe(Ok(probe)) => {
+                    let auto_open =
+                        self.toolchain_auto_open && !probe.is_complete() && !self.toolchain_skipped;
+                    tracing::info!(
+                        "远端工具链：{}（找到 {} 个）",
+                        probe.summary(),
+                        probe.found.len()
+                    );
+                    self.toolchain_probe = Some(probe);
+                    self.toolchain_error = None;
+                    self.toolchain_busy = None;
+                    if auto_open {
+                        self.toolchain_dialog_open = true;
+                    }
+                }
+                ToolchainEvent::Probe(Err(e)) => {
+                    tracing::warn!("远端工具链探测失败: {e}");
+                    self.toolchain_error = Some(e);
+                    self.toolchain_busy = None;
+                    if self.toolchain_auto_open && !self.toolchain_skipped {
+                        self.toolchain_dialog_open = true;
+                    }
+                }
+                ToolchainEvent::Progress(line) => {
+                    self.toolchain_log.push(line);
+                    if self.toolchain_log.len() > 200 {
+                        self.toolchain_log.remove(0);
+                    }
+                }
+                ToolchainEvent::Installed(tool) => {
+                    self.toolchain_installed.push(tool);
+                    self.toolchain_log
+                        .push(format!("✔ {} 安装完成", tool.id()));
+                }
+                ToolchainEvent::Failed { tool, error } => {
+                    tracing::warn!("{} 自动安装失败: {error}", tool.id());
+                    self.toolchain_log
+                        .push(format!("✘ {} 安装失败：{error}", tool.id()));
+                    self.flash(format!("{} 自动安装失败：{error}", tool.id()));
+                }
+                ToolchainEvent::Done => done = true,
+            }
+        }
+        if done {
+            self.toolchain_rx = None;
+            self.toolchain_busy = None;
+            if !self.toolchain_installed.is_empty() {
+                let names: Vec<&str> = self.toolchain_installed.iter().map(|t| t.id()).collect();
+                self.flash(format!("已安装 {}，正在重启 clangd…", names.join("、")));
+                // clangd 以旧 PATH 起的进程不会自己发现新装的二进制：重开根。
+                let uri = self.workspace_uri();
+                self.lsp.reopen_root(uri);
+                self.start_toolchain_probe(false);
+            }
+        }
+        if self.toolchain_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+    }
+
+    /// 手动打开「远程工具链」对话框（菜单 / 跳转失败时）。
+    fn open_toolchain_dialog(&mut self) {
+        if !self.is_remote() {
+            self.flash("当前没有远程连接".to_string());
+            return;
+        }
+        self.toolchain_dialog_open = true;
+        self.toolchain_auto_open = false;
+        if self.toolchain_rx.is_none() {
+            self.start_toolchain_probe(false);
+        }
+    }
+
+    /// 「远程工具链」对话框：缺什么、为什么、自动装 / 重新检测 / 暂不安装。
+    fn draw_toolchain_dialog(&mut self, ctx: &egui::Context) {
+        if !self.toolchain_dialog_open {
+            return;
+        }
+        let mut open = true;
+        let mut install = false;
+        let mut recheck = false;
+        let mut skip = false;
+        let target = self
+            .remote_target()
+            .map(|t| t.label())
+            .unwrap_or_else(|| "（未连接）".to_string());
+        let probe = self.toolchain_probe.clone();
+        let error = self.toolchain_error.clone();
+        let busy = self.toolchain_busy.clone();
+        let log = self.toolchain_log.clone();
+        let can_auto: Vec<ide_core::remote::RemoteTool> = probe
+            .as_ref()
+            .map(|p| {
+                p.missing
+                    .iter()
+                    .copied()
+                    .filter(|t| t.auto_installable())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let manual_only = probe
+            .as_ref()
+            .map(|p| p.missing.iter().any(|t| !t.auto_installable()))
+            .unwrap_or(false);
+
+        egui::Window::new("Remote Toolchain")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(580.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -30.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("目标：{target}")).size(12.5));
+                ui.add_space(4.0);
+                if let Some(err) = &error {
+                    ui.label(
+                        RichText::new(err)
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(0xf4, 0x87, 0x71)),
+                    );
+                    ui.add_space(4.0);
+                }
+                if let Some(p) = &probe {
+                    for tool in ide_core::remote::RemoteTool::ALL {
+                        match p.path_of(tool) {
+                            Some(path) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "✔ {} —— {}：{path}",
+                                        tool.id(),
+                                        tool.purpose()
+                                    ))
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(0x7e, 0xc6, 0x99)),
+                                );
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "✘ {} —— {}：未安装",
+                                        tool.id(),
+                                        tool.purpose()
+                                    ))
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(0xf4, 0x87, 0x71)),
+                                );
+                                if !tool.auto_installable() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "    {}",
+                                            ide_remote::toolchain::manual_hint(tool)
+                                        ))
+                                        .size(10.5)
+                                        .color(hex("#8c8c8c")),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else if busy.is_none() && error.is_none() {
+                    ui.label(RichText::new("（还没有探测结果）").size(12.0).color(hex("#8c8c8c")));
+                }
+                ui.separator();
+                ui.label(
+                    RichText::new(
+                        "自动安装不需要 root：clangd 下载官方预编译包（旧系统自带 glibc 运行时），\
+                         rg 从软件源解包到 ~/.liteide/tools；装完自动接入 PATH，无需手改配置。",
+                    )
+                    .size(10.5)
+                    .color(hex("#8c8c8c")),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let auto_label = if can_auto.is_empty() {
+                        "自动安装（无可自动安装的）".to_string()
+                    } else {
+                        format!(
+                            "自动安装 {}",
+                            can_auto
+                                .iter()
+                                .map(|t| t.id())
+                                .collect::<Vec<_>>()
+                                .join(" + ")
+                        )
+                    };
+                    if ui
+                        .add_enabled(
+                            busy.is_none() && !can_auto.is_empty(),
+                            egui::Button::new(auto_label),
+                        )
+                        .on_hover_text("下载并解包到 ~/.liteide/tools，不需要 root")
+                        .clicked()
+                    {
+                        install = true;
+                    }
+                    if ui
+                        .add_enabled(busy.is_none(), egui::Button::new("我已安装，重新检测"))
+                        .clicked()
+                    {
+                        recheck = true;
+                    }
+                    if ui
+                        .add_enabled(busy.is_none(), egui::Button::new("暂不安装"))
+                        .on_hover_text("暂时没有跳转/补全；以后可从「远程」菜单再打开")
+                        .clicked()
+                    {
+                        skip = true;
+                    }
+                });
+                if manual_only && can_auto.is_empty() {
+                    ui.label(
+                        RichText::new("剩下的工具需要系统包管理器（见上面的命令）。")
+                            .size(10.5)
+                            .color(hex("#8c8c8c")),
+                    );
+                }
+                if let Some(busy) = &busy {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(busy).size(12.0));
+                    });
+                }
+                if !log.is_empty() {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in &log {
+                                ui.label(RichText::new(line).size(10.5).color(hex("#9a9a9a")));
+                            }
+                        });
+                }
+            });
+
+        if install {
+            self.start_toolchain_install();
+        }
+        if recheck {
+            self.start_toolchain_probe(false);
+        }
+        if skip {
+            self.toolchain_skipped = true;
+            self.toolchain_dialog_open = false;
+            self.flash(
+                "已跳过：远端代码跳转/补全仍不可用（可从「远程」菜单重新打开工具链）"
+                    .to_string(),
+            );
+        }
+        if !open {
+            self.toolchain_dialog_open = false;
+        }
+    }
+
     fn draw_symbol_search(&mut self, ctx: &egui::Context) {
         if !self.symbol_search_open {
             return;
@@ -6961,6 +7422,8 @@ impl eframe::App for LiteIdeApp {
 
         self.maybe_start_lsp();
         self.poll_lsp();
+        self.maybe_auto_probe_toolchain();
+        self.poll_toolchain(ctx);
         self.sync_document();
         self.poll_dap();
         self.poll_search();
@@ -6982,6 +7445,7 @@ impl eframe::App for LiteIdeApp {
         self.draw_remote_menu(ctx);
         self.draw_remote_dialog(ctx);
         self.draw_ssh_dialog(ctx);
+        self.draw_toolchain_dialog(ctx);
         self.draw_title_bar(ctx);
         self.draw_activity_bar(ctx);
         self.draw_sidebar(ctx);

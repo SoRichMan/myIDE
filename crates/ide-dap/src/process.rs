@@ -16,13 +16,9 @@ use tokio::process::{Child, Command};
 pub const WSL_EXE: &str = "wsl.exe";
 
 /// 远端解析 gdb 的 shell 片段（devtoolset 等非 PATH 安装也能找到）。
-const GDB_RESOLVER: &str = concat!(
-    "GDB=$(command -v gdb 2>/dev/null); ",
-    "if [ -z \"$GDB\" ]; then ",
-    "for c in /opt/rh/devtoolset-*/root/usr/bin/gdb /usr/local/bin/gdb \"$HOME/.local/bin/gdb\"; do ",
-    "[ -x \"$c\" ] && { GDB=$c; break; }; done; fi; ",
-    "if [ -z \"$GDB\" ]; then echo 'gdb 不在远端 PATH 中' >&2; exit 127; fi; "
-);
+fn gdb_resolver() -> String {
+    ide_core::remote::RemoteTool::Gdb.resolver_shell()
+}
 
 /// 优先探测的发行版名（实际安装名 > 文档名 > 泛名）。
 pub const PREFERRED_DISTROS: &[&str] = &["Ubuntu2404", "Ubuntu-24.04", "Ubuntu"];
@@ -216,7 +212,7 @@ pub fn spawn_gdb(wsl_distro: &str) -> std::io::Result<Child> {
 
 /// 检查 gdb 是否在 SSH 主机的 PATH（或常见安装位置）中。返回其路径。
 pub async fn probe_gdb_remote(target: &RemoteTarget) -> Result<String, String> {
-    let script = format!("{}printf '%s' \"$GDB\"", GDB_RESOLVER);
+    let script = format!("{}printf '%s' \"$GDB\"", gdb_resolver());
     let (program, argv) = target.shell_argv(&script);
     let mut c = Command::new(&program);
     c.args(&argv);
@@ -254,7 +250,7 @@ pub async fn probe_gdb_remote(target: &RemoteTarget) -> Result<String, String> {
 /// 通过 SSH 启动 gdb（MI2 解释器）。
 pub fn spawn_gdb_remote(target: &RemoteTarget) -> std::io::Result<Child> {
     // -q 不打印版本横幅；-nx 不加载 .gdbinit（确定性）。
-    let script = format!("{}exec \"$GDB\" -q -nx --interpreter=mi2", GDB_RESOLVER);
+    let script = format!("{}exec \"$GDB\" -q -nx --interpreter=mi2", gdb_resolver());
     let (program, argv) = target.shell_argv(&script);
     let mut cmd = Command::new(&program);
     cmd.args(&argv)
@@ -315,7 +311,7 @@ mod tests {
         assert!(program.ends_with("ssh"));
         assert!(argv.contains(&"fubin@192.168.77.6".to_string()));
         assert!(argv.last().unwrap().contains("-nx"));
-        assert!(GDB_RESOLVER.contains("devtoolset"));
+        assert!(gdb_resolver().contains("devtoolset"));
     }
 
     /// 真实 SSH 验收：远端解析 gdb（devtoolset 等非 PATH 安装也能找到）。

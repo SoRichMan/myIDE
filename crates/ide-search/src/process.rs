@@ -12,19 +12,6 @@ pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// 远端解析 rg 的 shell 片段。
-///
-/// 有些机器（比如 CentOS 7 上的开发机）把 rg 装在 `~/.cache/opencode/bin` 这类
-/// 不在登录 PATH 里的位置，所以 PATH 找不到时再试几个常见安装目录。
-const RG_RESOLVER: &str = concat!(
-    "RG=$(command -v rg 2>/dev/null); ",
-    "if [ -z \"$RG\" ]; then ",
-    "for c in \"$HOME/.cache/opencode/bin/rg\" \"$HOME/.local/bin/rg\" ",
-    "/usr/local/bin/rg /usr/bin/rg \"$HOME/opt/rg/bin/rg\"; do ",
-    "[ -x \"$c\" ] && { RG=$c; break; }; done; fi; ",
-    "if [ -z \"$RG\" ]; then echo 'rg 不在远端 PATH 中' >&2; exit 127; fi; "
-);
-
 /// 解析 rg 的前缀（`LITEIDE_RG_REMOTE` 可指定远端绝对路径，跳过探测）。
 fn rg_prefix() -> String {
     if let Ok(p) = std::env::var("LITEIDE_RG_REMOTE") {
@@ -33,7 +20,9 @@ fn rg_prefix() -> String {
             return format!("RG={}; ", shell_quote(p));
         }
     }
-    RG_RESOLVER.to_string()
+    // 有些机器（比如 CentOS 7 上的开发机）把 rg 装在 `~/.cache/opencode/bin` 这类
+    // 不在登录 PATH 里的位置；IDE 自动安装的工具在 `~/.liteide/tools/bin`，优先级最高。
+    ide_core::remote::RemoteTool::Rg.resolver_shell()
 }
 
 /// Windows 路径 → WSL 视角路径。

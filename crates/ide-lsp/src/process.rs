@@ -13,22 +13,32 @@ use tokio::process::{Child, Command};
 /// `wsl.exe` 可执行文件名（Windows 侧）。
 pub const WSL_EXE: &str = "wsl.exe";
 
-/// 远端解析 clangd 的 shell 片段。
+/// 远端解析 clangd 的 shell 片段（`~/.liteide/tools/bin` 优先，见 [`RemoteTool`]）。
 ///
 /// 不少开发机把 LLVM 装在 `/opt/rh/llvm-toolset-*` 或 `/usr/lib/llvm-*/bin`，
 /// 并不在登录 PATH 里，所以 PATH 找不到时再扫一遍常见目录。
-const CLANGD_RESOLVER: &str = concat!(
-    "CLANGD=$(command -v clangd 2>/dev/null); ",
-    "if [ -z \"$CLANGD\" ]; then ",
-    "for c in /usr/lib/llvm-*/bin/clangd /usr/local/bin/clangd \"$HOME/.local/bin/clangd\" ",
-    "/opt/rh/llvm-toolset-*/root/usr/bin/clangd \"$HOME/opt/llvm/bin/clangd\"; do ",
-    "[ -x \"$c\" ] && { CLANGD=$c; break; }; done; fi; ",
-    "if [ -z \"$CLANGD\" ]; then echo 'clangd 不在远端 PATH 中' >&2; exit 127; fi; "
-);
+fn clangd_resolver() -> String {
+    ide_core::remote::RemoteTool::Clangd.resolver_shell()
+}
 
 /// clangd 启动参数（与原来 WSL 分支保持一致）。
 const CLANGD_ARGS: &str = "--log=error --background-index --pch-storage=memory \
 --header-insertion=never --function-arg-placeholders=0";
+
+/// 参数自适应：clangd 5（CentOS 7 SCL 能装到的版本）不认识 `--background-index` 等新参数，
+/// 传进去会直接「Unknown command line argument」退出。远端 `--help` 里有没有这个开关，
+/// 决定用完整参数还是留空（旧版默认就是 stdio + 自动找 compile_commands.json）。
+///
+/// 新版再加 `--query-driver`：工程用 devtoolset 的 g++（`/opt/rh/...`），
+/// 不白名单的话 clangd 不会去问它，连 `iostream` 都找不到。
+fn clangd_args_shell() -> String {
+    format!(
+        "H=$(\"$CLANGD\" --help 2>&1); \
+         if printf '%s' \"$H\" | grep -q -- '--background-index'; then A='{CLANGD_ARGS}'; else A=''; fi; \
+         if printf '%s' \"$H\" | grep -q -- '--query-driver'; then \
+         A=\"$A --query-driver=/usr/bin/*,/usr/local/bin/*,/opt/*\"; fi; "
+    )
+}
 
 /// Windows 下隐藏控制台窗口（GUI 程序不得弹出黑框）。
 #[cfg(windows)]
@@ -223,8 +233,9 @@ pub fn using_custom_command() -> bool {
 ///
 /// 若设置了 `LITEIDE_LSP_CMD`（如 `python E:\...\mock_clangd.py`），直接按空白
 /// 拆分成程序+参数执行（集成测试、原生 Linux 部署用）；否则通过
-/// `wsl.exe -d <distro> -- clangd ...` 桥接。
-pub fn spawn_clangd(wsl_distro: &str) -> std::io::Result<Child> {
+/// `wsl.exe -d <distro> --exec bash -l -c '...'` 桥接，和 SSH 分支共用同一套
+/// 工具解析 / 参数自适应（WSL 里也可能是旧版 clangd，或 IDE 自动安装的版本）。
+pub fn spawn_clangd(wsl_distro: &str, root_uri: &str) -> std::io::Result<Child> {
     if let Ok(cmdline) = std::env::var("LITEIDE_LSP_CMD") {
         let mut parts = cmdline.split_whitespace();
         let Some(program) = parts.next() else {
@@ -251,18 +262,16 @@ pub fn spawn_clangd(wsl_distro: &str) -> std::io::Result<Child> {
         return cmd.spawn();
     }
 
-    let mut cmd = Command::new(WSL_EXE);
-    cmd.args([
-        "-d",
-        wsl_distro,
-        "--",
-        "clangd",
-        "--log=error",
-        "--background-index",
-        "--pch-storage=memory",
-        "--header-insertion=never",
-        "--function-arg-placeholders=0",
-    ]);
+    let target = RemoteTarget::wsl(wsl_distro);
+    let script = format!(
+        "{}{}{}exec \"$CLANGD\" $A",
+        clangd_resolver(),
+        clangd_workdir_shell(root_uri),
+        clangd_args_shell()
+    );
+    let (program, args) = target.shell_argv(&script);
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -273,9 +282,23 @@ pub fn spawn_clangd(wsl_distro: &str) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
+/// 选 clangd 的工作目录：clangd 5 没有 `-compile-commands-dir`，只从当前目录读
+/// `compile_commands.json`；新版用当前目录也最稳。优先 `build/`，其次工程根。
+fn clangd_workdir_shell(root_uri: &str) -> String {
+    let root = crate::path_map::uri_to_posix(root_uri).unwrap_or_default();
+    if root.is_empty() {
+        return String::new();
+    }
+    format!(
+        "R={}; if [ -f \"$R/build/compile_commands.json\" ]; then cd \"$R/build\" 2>/dev/null || true; \
+         elif [ -f \"$R/compile_commands.json\" ]; then cd \"$R\" 2>/dev/null || true; fi; ",
+        ide_core::remote::shell_quote(&root)
+    )
+}
+
 /// 检查 clangd 是否在 SSH 主机的 PATH（或常见 LLVM 安装目录）中。返回其路径。
 pub async fn probe_clangd_remote(target: &RemoteTarget) -> Result<String, String> {
-    let script = format!("{}printf '%s' \"$CLANGD\"", CLANGD_RESOLVER);
+    let script = format!("{}printf '%s' \"$CLANGD\"", clangd_resolver());
     let (program, argv) = target.shell_argv(&script);
     let mut c = Command::new(&program);
     c.args(&argv);
@@ -311,8 +334,17 @@ pub async fn probe_clangd_remote(target: &RemoteTarget) -> Result<String, String
 }
 
 /// 通过 SSH 启动 clangd（stdio 即 LSP 通道）。
-pub fn spawn_clangd_remote(target: &RemoteTarget) -> std::io::Result<Child> {
-    let script = format!("{}exec \"$CLANGD\" {CLANGD_ARGS}", CLANGD_RESOLVER);
+///
+/// `root_uri` 只用来选工作目录：clangd 5（CentOS 7 SCL 能装到的版本）**没有**
+/// `-compile-commands-dir`，只从当前目录读 `compile_commands.json`；
+/// 新版本用当前目录也最稳。优先 `build/`（CMake 默认产物位置），其次工程根。
+pub fn spawn_clangd_remote(target: &RemoteTarget, root_uri: &str) -> std::io::Result<Child> {
+    let script = format!(
+        "{}{}{}exec \"$CLANGD\" $A",
+        clangd_resolver(),
+        clangd_workdir_shell(root_uri),
+        clangd_args_shell()
+    );
     let (program, argv) = target.shell_argv(&script);
     let mut cmd = Command::new(&program);
     cmd.args(&argv)
@@ -389,7 +421,13 @@ mod tests {
         assert!(last.starts_with("bash -l -c '"));
         assert!(last.contains("clangd"));
         // 解析器要在 PATH 之外也找得到常见 LLVM 安装位置。
-        assert!(CLANGD_RESOLVER.contains("/usr/lib/llvm-*/bin/clangd"));
+        assert!(clangd_resolver().contains("/usr/lib/llvm-*/bin/clangd"));
+        // 旧版 clangd（CentOS SCL 5.0）不认识新参数：必须按 --help 自适应。
+        let gate = clangd_args_shell();
+        assert!(gate.contains("--background-index"));
+        assert!(gate.contains("A=''"), "旧版要能退回空参数: {gate}");
+        // devtoolset 的 g++ 不在 /usr/bin：必须白名单，否则系统头文件都找不到。
+        assert!(gate.contains("--query-driver=/usr/bin/*,/usr/local/bin/*,/opt/*"));
     }
 
     /// 真实 SSH 验收：探测不会挂住，且结果要么给出 clangd 路径、要么给出明确原因。

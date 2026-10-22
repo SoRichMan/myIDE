@@ -1874,6 +1874,92 @@ clangd、gdb、Ctrl+P 索引全部共用同一套上层逻辑（**没有**给 SS
 
 ---
 
+## 第二十五轮：远端缺工具时的提示 + 免 root 自动安装（clangd / rg）（2026-10-22）
+
+真机验收第二十四轮时留下的最大缺口：远端没 clangd → 跳转/补全全废，状态栏只说「没装」，
+用户还得自己想办法在 CentOS 7 上装一个**能跑**的 clangd。这一轮把它做成「缺什么 → 说清楚 → 一键装好」。
+
+### 1. 探测 + 提示（`crates/ide-remote/src/toolchain.rs`）
+
+- `RemoteTool::{Clangd, Rg, Gdb}`（`ide-core/src/remote.rs`）：`id` / `purpose` / `auto_installable` /
+  `rpm_package` / `extra_dirs` / `resolver_shell`，**所有**解析逻辑只有这一份；
+- `probe()` 用一条脚本把三个工具各查一遍（`command -v` → `~/.liteide/tools/bin` → `/usr/lib/llvm-*/bin`
+  → devtoolset 等），一次 SSH/WSL 往返出结果，`ToolchainProbe { found, missing }`；
+- 连接成功、热重载换根、手动点菜单都会探测；缺任何工具就自动弹「Remote Toolchain」对话框：
+  ✔/✘ 每项状态 + 用途 + 为什么跳转不能用，按钮是 **自动安装 / 我已安装，重新检测 / 暂不安装**；
+  点「暂不安装」本次连接不再自动弹（菜单里还能再打开）；
+- 跳转失败也接上了：远端缺 clangd 时提示语从「LSP 未就绪」改成「远端没有 clangd（可自动安装）」并直接打开对话框；
+- 文案全是 target-aware 的（SSH 不再出现 WSL / `setup-wsl.sh` 字样）。
+
+### 2. clangd：为什么只能「自带运行时」
+
+CentOS 7 是 glibc 2.17，这一轮把坑全踩了一遍：
+
+| 方案 | 结果 |
+|---|---|
+| SCL `llvm-toolset-7` 的 clangd 5.0.1 | ❌ 缺 `iostream` / `filesystem`，无 `documentSymbol` / `hover`，definition 恒为 `[]` |
+| clangd 官方 prebuilt 10 / 12 / 13 / 18 | ❌ 全部要求 **GLIBC 2.18+**（`GLIBC_2.18 not found`） |
+| 源码编译 LLVM | ❌ 几小时 + 大内存，不适合「点一下就好」 |
+| **clangd 18.1.3 zip + Ubuntu 18.04 的 glibc 2.27 运行时** | ✅ 实测可用 |
+
+最终安装脚本（全程无 root）：
+
+1. 从 GitHub 预编译包下载 `clangd-linux-18.1.3.zip`，镜像回退顺序
+   `ghfast.top` → `gh-proxy.com` → `ghproxy.net` → 直连（真机上直连不通，`ghfast.top` ~2 MB/s，80 MB 约 41 s）；
+2. 解包（有 `unzip` 用 `unzip`，否则用 `python`/`python3` 的 `zipfile`；CentOS 7 上没有 `unzip`）；
+3. 整个 `bin/` + `lib/clang/18` 装到 `~/.liteide/tools/clangd/`，**先 `rm -f` 旧的 `bin/clangd`**（上一轮留下的是指向 SCL 的符号链接，
+   不摘掉 `cat >` 会顺着断链失败）；
+4. 系统 glibc 跑不起来时，再下 `libc6_2.27-3ubuntu1_amd64.deb`（aliyun 镜像），`ar x` + `tar xf` 解出
+   `ld-2.27.so` 与同目录的 libc/libm/... 放到 `~/.liteide/tools/clangd/glibc/`；
+5. `~/.liteide/tools/bin/clangd` 写成 wrapper 脚本：
+   `exec .../glibc/lib/x86_64-linux-gnu/ld-2.27.so --library-path ... .../clangd/bin/clangd "$@"`
+   —— 只影响这一个进程，不动系统库、不需要 root；
+6. 自检用**退出码**判断（`if ! OUT=$(... --version); then OUT=""; fi`），失败就报错而不是把 stderr 当版本号打印。
+
+验证：`clangd version 18.1.3 ... Platform: x86_64-unknown-linux-gnu`，装到
+`/home/fubin/.liteide/tools/bin/clangd`，`ssh_install_clangd` 48 s 通过。
+
+### 3. clangd 参数自适应（`crates/ide-lsp/src/process.rs`）
+
+- 旧版 clangd 不认识新参数（直接 `Unknown command line argument` 退出）：启动前 `--help` 里
+  有没有 `--background-index` 决定用完整参数还是空参数；
+- 新版再加 `--query-driver=/usr/bin/*,/usr/local/bin/*,/opt/*`：工程用 devtoolset 的 `g++`
+  （`/opt/rh/devtoolset-9/root/usr/bin/g++`），不在白名单里 clangd 就不会去问它，连 `iostream` 都找不到；
+- 工作目录：clangd 5 没有 `-compile-commands-dir`，只从 cwd 读 `compile_commands.json`，
+  统一 `cd` 到 `<root>/build`（没有则 `<root>`）；这段逻辑抽成 `clangd_workdir_shell()`，SSH / WSL 共用；
+- **WSL 也改成走同一套**（`wsl.exe -d <distro> --exec bash -l -c ...`，和探测一致）：
+  否则在 WSL 里自动装好的 clangd（`~/.liteide/tools/bin`，登录 PATH 里没有）永远起不来，
+  会出现「对话框说装好了、LSP 还是 Unavailable」的自相矛盾。`LITEIDE_LSP_CMD` 分支不变。
+
+### 4. rg / gdb
+
+- rg：`yumdownloader --resolve` 只下载，`rpm2cpio | cpio -idmu` 解到 `~/.liteide/tools/rg`，
+  符号链接 `~/.liteide/tools/bin/rg`；Debian/Ubuntu 明确提示「自动安装需要 sudo，请手动 apt 装」；
+- gdb：`auto_installable() == false`（依赖太多，装坏了更难查），只按发行版给命令提示。
+
+### 验收（真机，CentOS 7.9 / glibc 2.17 / 192.168.77.6 / 非 root）
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --workspace` | ✅ 全绿（含新增 toolchain / resolver / 参数自适应用例） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 warning |
+| 探测 | ✅ `ssh_probe_toolchain`：clangd `~/.liteide/tools/bin/clangd`、rg `~/.cache/opencode/bin/rg`、gdb `/opt/rh/devtoolset-9/root/usr/bin/gdb` |
+| 自动安装 | ✅ `ssh_install_clangd` 48 s，装完 `--version` 自检通过 |
+| 端到端跳转 | ✅ `clangd_ssh_real`：Ready → `document symbols: 7` → hover `GetInstance`（来自 `ToolClass.hpp`）→ definition `ToolClass.hpp:34`，8.3 s |
+| 单元用例 | ✅ `install_script` 断言「不调用 sudo / 落盘 `~/.liteide/tools` / 镜像回退 / glibc 加载器 / rg 用 RPM」 |
+
+测试默认只挑 `compile_commands.json` 覆盖的文件（`src/old/interpreter.cpp` 这类没编译命令的文件
+clangd 只能猜参数，跳转不靠谱，第一版就栽在这）；可用 `LITEIDE_SSH_TEST_FILE` / `LITEIDE_SSH_TEST_SYMBOL` 覆盖。
+
+### 本轮踩过的坑
+
+- 不能用 PowerShell `Get-Content/Set-Content` 改含中文的 `main.rs`：一次「顺手替换」把整份文件写成 GBK，
+  diff 里 2700 行全变；靠 `git checkout -- crates/ide-ui/src/main.rs` 恢复后**用 edit 工具重做**了全部 UI 改动；
+- 安装脚本里的自检不能 `... | head -n 1`：管道的退出码是 `head` 的，永远成功，会把错误信息当版本号打出来；
+- 旧符号链接没清掉时 `cat >` 会「写进不存在的目标」而报 `chmod: 无法创建符号链接`，先 `rm -f` 再写。
+
+---
+
 ## 下一步任务：项目主体已完成
 
 myIDE.md 阶段 0-6 全部交付。后续仅按需处理技术债清单，不主动开工。
