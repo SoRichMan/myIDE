@@ -55,10 +55,11 @@ impl RemoteTerminal {
         Self::spawn_with_args(target, posix_cwd, cols, rows, &[])
     }
 
-    /// 同 [`spawn`](Self::spawn)，但给最终 shell 追加参数。
+    /// 同 [`spawn`](Self::spawn)，但可以换掉最终 shell 的参数。
     ///
-    /// 默认启动登录 shell（会加载 `.bashrc` 等）；测试或未来的自定义终端配置
-    /// 可以用它换成 `--noprofile --norc -i` 这类干净 shell。
+    /// `extra_args` 为空：启动登录 shell（会加载 `.bashrc` 等，默认行为）；
+    /// 非空：**替换**那组默认参数，用来跑干净 shell（测试里的
+    /// `--noprofile --norc -i`）或以后给用户配的自定义启动参数。
     pub fn spawn_with_args(
         target: &RemoteTarget,
         posix_cwd: &str,
@@ -77,27 +78,32 @@ impl RemoteTerminal {
 
         let (program, args) = match target {
             RemoteTarget::Wsl { distro } => {
-                // `--cd` 由 wsl.exe 自己切目录，不经过 shell。
+                // `--cd` 由 wsl.exe 自己切目录，不经过 shell；`--exec` 之后的参数
+                // 原样交给 bash（`--noprofile` 这类不能直接给 wsl.exe）。
                 let mut a: Vec<String> = vec![
                     "-d".into(),
                     distro.clone(),
                     "--cd".into(),
                     cwd.clone(),
+                    "--exec".into(),
+                    "bash".into(),
                 ];
-                a.extend(extra_args.iter().map(|s| s.to_string()));
+                if extra_args.is_empty() {
+                    a.push("-l".into());
+                } else {
+                    a.extend(extra_args.iter().map(|s| s.to_string()));
+                }
                 (wsl_exe(), a)
             }
             RemoteTarget::Ssh { .. } => {
-                let mut script = format!("cd {} && exec bash -l", shell_quote(&cwd));
-                if !extra_args.is_empty() {
-                    script.push(' ');
-                    script.push_str(
-                        &extra_args
-                            .iter()
-                            .map(|a| shell_quote(a))
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    );
+                let mut script = format!("cd {} && exec bash", shell_quote(&cwd));
+                if extra_args.is_empty() {
+                    script.push_str(" -l");
+                } else {
+                    for a in extra_args {
+                        script.push(' ');
+                        script.push_str(&shell_quote(a));
+                    }
                 }
                 target.interactive_argv(&script)
             }
