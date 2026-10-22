@@ -62,6 +62,30 @@ const SIDEBAR_DEFAULT_WIDTH: f32 = 260.0;
 const SIDEBAR_ANIM_TIME: f32 = 0.16;
 /// 激活标签顶部蓝色标识条的高度（VS Code active tab indicator）。
 const TAB_ACTIVE_INDICATOR_H: f32 = 2.0;
+/// 标签页尺寸（egui points）。宽度按各自标题的**自然宽度**算（VS Code 就是这样），
+/// 只有整行放不下时才等比压缩 —— 之前是「所有标签等宽 = 最长标题」，
+/// 短标题（large.cpp）会白占一大片。
+const TAB_X_SLOT: f32 = 24.0; // 右侧给叉叉预留
+const TAB_PAD_X: f32 = 9.0; // 标题左右内边距
+const TAB_MIN_W: f32 = 80.0;
+const TAB_MAX_W: f32 = 340.0;
+/// 右侧 "N tabs" 计数的大致占位（先给标签算宽度时扣掉）。
+const TAB_BADGE_W: f32 = 110.0;
+
+/// 每个标签的宽度：自然宽度（标题 + 叉叉位 + 内边距）夹在 `[TAB_MIN_W, TAB_MAX_W]`；
+/// 整行放不下时等比压缩，但不低于 `TAB_MIN_W`（再不够就溢出，由裁剪处理）。
+fn tab_widths(label_widths: &[f32], avail: f32) -> Vec<f32> {
+    let natural: Vec<f32> = label_widths
+        .iter()
+        .map(|w| (w + TAB_X_SLOT + TAB_PAD_X * 2.0).clamp(TAB_MIN_W, TAB_MAX_W))
+        .collect();
+    let total: f32 = natural.iter().sum();
+    if total <= avail || total <= 0.0 {
+        return natural;
+    }
+    let scale = (avail / total).max(0.0);
+    natural.iter().map(|w| (w * scale).max(TAB_MIN_W)).collect()
+}
 /// 双击识别窗口（秒）。Windows 默认双击间隔 500ms，而 egui 内置判定只有 300ms，
 /// 慢一点的双击会漏判；这里自实现识别并放宽到 Windows 的语义。
 const DOUBLE_CLICK_SECS: f64 = 0.55;
@@ -5181,11 +5205,7 @@ impl LiteIdeApp {
         let mut close: Option<usize> = None;
         let mut pin: Option<usize> = None;
         let mut last_tab_click = self.tab_last_click;
-        // VS Code：所有标签**等宽**（按最长的那个算），右侧**预留叉叉的位置**，
-        // 叉叉默认不画、鼠标移到标签上才出现 —— 这样叉叉不会压住标题。
-        const TAB_X_SLOT: f32 = 24.0;
-        const TAB_PAD_X: f32 = 9.0;
-        const TAB_MAX_W: f32 = 340.0;
+        // 右侧给叉叉预留位置；叉叉默认不画、鼠标移到标签上才出现（不压标题）。
         let mono = egui::FontId::monospace(12.0);
         // 标签标题（含「未保存」标记）
         let label_text = |t: &Tab| -> String {
@@ -5210,18 +5230,22 @@ impl LiteIdeApp {
             );
             ui.painter().layout_job(job)
         };
-        // 所有标签等宽：按最长的标题算宽度
-        let mut max_label_w: f32 = 0.0;
-        for (i, t) in self.tabs.iter().enumerate() {
-            let preview = self.tabs.is_preview(i);
-            let w = layout_label(ui, &label_text(t), hex("#ffffff"), preview).size().x;
-            max_label_w = max_label_w.max(w);
-        }
-        let tab_w = (max_label_w + TAB_X_SLOT + TAB_PAD_X * 2.0).min(TAB_MAX_W);
-        let text_w = (tab_w - TAB_X_SLOT - TAB_PAD_X * 2.0).max(20.0);
+        // 每个标签按自己标题的自然宽度排（VS Code 语义）。
+        let label_ws: Vec<f32> = (0..n)
+            .map(|i| {
+                let text = self.tabs.get(i).map(label_text).unwrap_or_default();
+                let preview = self.tabs.is_preview(i);
+                layout_label(ui, &text, hex("#ffffff"), preview).size().x
+            })
+            .collect();
         ui.horizontal(|ui| {
             ui.set_min_height(34.0);
+            // 右侧要给 "N tabs" 留位置；总宽不够时标签等比压缩（不低于 TAB_MIN_W）。
+            let avail = (ui.available_width() - TAB_BADGE_W).max(TAB_MIN_W);
+            let widths = tab_widths(&label_ws, avail);
             for i in 0..n {
+                let tab_w = widths.get(i).copied().unwrap_or(TAB_MIN_W);
+                let text_w = (tab_w - TAB_X_SLOT - TAB_PAD_X * 2.0).max(20.0);
                 let (dirty, active, preview) = {
                     let Some(t) = self.tabs.get(i) else { continue };
                     let preview = self.tabs.is_preview(i);
@@ -10469,6 +10493,34 @@ mod tests {
             ]);
         }
         assert_eq!(app.tabs.len(), 0, "点击叉叉应关闭标签");
+    }
+
+    /// 标签宽度：短标题自己窄、长标题更宽；放不下时等比压缩，但不低于下限。
+    #[test]
+    fn tab_widths_follow_each_title() {
+        // 自然宽度 = 标题 + 叉叉位 + 左右内边距
+        let w = tab_widths(&[60.0, 140.0], 2000.0);
+        assert!((w[0] - (60.0 + TAB_X_SLOT + TAB_PAD_X * 2.0)).abs() < 0.01);
+        assert!((w[1] - (140.0 + TAB_X_SLOT + TAB_PAD_X * 2.0)).abs() < 0.01);
+        assert!(
+            w[0] < w[1],
+            "短标题不应跟着最长标题一起变宽：{w:?}"
+        );
+        // 极短标题有下限、超长标题有上限
+        assert!((tab_widths(&[1.0], 2000.0)[0] - TAB_MIN_W).abs() < 0.01);
+        assert!((tab_widths(&[5000.0], 2000.0)[0] - TAB_MAX_W).abs() < 0.01);
+        // 放不下：等比压缩（3 × 242 = 726 → 450，每格 150）
+        let shrunk = tab_widths(&[200.0, 200.0, 200.0], 450.0);
+        assert!(
+            shrunk.iter().all(|w| (w - 150.0).abs() < 0.01),
+            "{shrunk:?}"
+        );
+        // 再窄也不低于下限（宁可溢出，也不把标题压没）
+        let floor = tab_widths(&[200.0; 10], 300.0);
+        assert!(
+            floor.iter().all(|w| (w - TAB_MIN_W).abs() < 0.01),
+            "{floor:?}"
+        );
     }
 
     /// 悬停同一条提交时，详情请求只发一次（否则每帧都发 git 请求会拖垮整个队列）。
