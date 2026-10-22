@@ -75,6 +75,8 @@ const TAB_X_SLOT: f32 = TAB_GAP_X + TAB_CLOSE_W + TAB_CLOSE_MARGIN;
 const TAB_PAD_X: f32 = 9.0; // 标题左内边距
 const TAB_MIN_W: f32 = 80.0;
 const TAB_MAX_W: f32 = 340.0;
+/// 「未保存」圆点：琥珀色，和 × 明确区分（暗色/亮色主题都看得清）。
+const TAB_DIRTY_DOT: &str = "#e2a03f";
 /// 右侧 "N tabs" 计数的大致占位（先给标签算宽度时扣掉）。
 const TAB_BADGE_W: f32 = 110.0;
 
@@ -5213,14 +5215,6 @@ impl LiteIdeApp {
         let mut last_tab_click = self.tab_last_click;
         // 右侧给叉叉预留位置；叉叉默认不画、鼠标移到标签上才出现（不压标题）。
         let mono = egui::FontId::monospace(12.0);
-        // 标签标题（含「未保存」标记）
-        let label_text = |t: &Tab| -> String {
-            let mut s = t.title.clone();
-            if t.dirty {
-                s.push_str(" — ");
-            }
-            s
-        };
         // 标题排版（和下面画的时候用同一套，保证宽度一致）
         let layout_label = |ui: &egui::Ui, text: &str, color: egui::Color32, italic: bool| {
             let mut job = egui::text::LayoutJob::default();
@@ -5239,7 +5233,7 @@ impl LiteIdeApp {
         // 每个标签按自己标题的自然宽度排（VS Code 语义）。
         let label_ws: Vec<f32> = (0..n)
             .map(|i| {
-                let text = self.tabs.get(i).map(label_text).unwrap_or_default();
+                let text = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
                 let preview = self.tabs.is_preview(i);
                 layout_label(ui, &text, hex("#ffffff"), preview).size().x
             })
@@ -5260,10 +5254,8 @@ impl LiteIdeApp {
                 let text_color = if active { hex("#ffffff") } else { hex("#999999") };
                 let bg = if active { hex(p.bg_editor) } else { egui::Color32::TRANSPARENT };
                 let title = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
+                // 「未保存」不再往标题里拼字符（那会挤占标题宽度），改成叉叉位上的圆点。
                 let mut label = title.clone();
-                if dirty {
-                    label.push_str(" — ");
-                }
                 // 太长就截断（标题不能被叉叉压住）
                 if layout_label(ui, &label, text_color, preview).size().x > text_w {
                     let mut n = label.chars().count();
@@ -5348,7 +5340,12 @@ impl LiteIdeApp {
                 // 可见性保持原样（只有悬停标签时才画），但交互永远在：
                 // 指针移到叉叉上时 `resp.hovered()` 会变成 false，靠 `hit.hovered()` 兜住，
                 // 否则叉叉会自己「闪没」，点击就丢了。
-                if resp.hovered() || hit.hovered() {
+                if dirty && !hit.hovered() {
+                    // 未保存：叉叉位常驻一个圆点（VS Code 的做法）。
+                    // 注意不能只在 hover 时画 —— 未保存标记要能一眼扫到。
+                    ui.painter()
+                        .circle_filled(x.center(), 4.5, hex(TAB_DIRTY_DOT));
+                } else if resp.hovered() || hit.hovered() {
                     if hit.hovered() {
                         ui.painter()
                             .rect_filled(x, 3.0, hex("#ffffff").gamma_multiply(0.1));
@@ -5364,17 +5361,23 @@ impl LiteIdeApp {
                 if hit.clicked() {
                     close = Some(i);
                 }
-                hit.on_hover_text("关闭标签");
+                if dirty {
+                    hit.on_hover_text("未保存，点击关闭会先确认");
+                } else {
+                    hit.on_hover_text("关闭标签");
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let dirty = self.tabs.dirty_count();
-                let badge = if dirty > 0 {
-                    format!("{} tabs · {} dirty", n, dirty)
-                } else {
-                    format!("{} tabs", n)
-                };
+                if dirty > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("· {dirty} dirty"))
+                            .size(10.5)
+                            .color(hex(TAB_DIRTY_DOT)),
+                    );
+                }
                 ui.label(
-                    egui::RichText::new(badge)
+                    egui::RichText::new(format!("{n} tabs"))
                         .size(10.5)
                         .color(hex("#6a6a6a")),
                 );
@@ -10502,6 +10505,88 @@ mod tests {
             ]);
         }
         assert_eq!(app.tabs.len(), 0, "点击叉叉应关闭标签");
+    }
+
+    /// 未保存标签的标记：叉叉位常驻一个琥珀色圆点（不再往标题里拼 " — "）；
+    /// 悬停在圆点上才变成叉叉，点击会走「确认关闭」。
+    #[test]
+    fn dirty_tab_shows_dot_marker() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        while !app.tabs.is_empty() {
+            app.tabs.close(0);
+        }
+        app.open_file(
+            std::path::PathBuf::from("a.cpp"),
+            "int a;\n".to_string(),
+            false,
+        );
+        app.tabs.get_mut(0).unwrap().dirty = true;
+
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut input = probe_raw_input();
+            input.events = events;
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_bar(ui));
+            })
+        };
+        let dot_of = |out: &egui::FullOutput| {
+            out.shapes.iter().find_map(|cs| match &cs.shape {
+                egui::Shape::Circle(c) if c.radius >= 3.0 => Some(*c),
+                _ => None,
+            })
+        };
+        // 不悬停：圆点常驻
+        let out = frame(vec![]);
+        let dot = dot_of(&out).expect("未保存的标签应画圆点");
+        assert_eq!(dot.fill, hex(TAB_DIRTY_DOT));
+        let title = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .expect("应画出标签标题");
+        assert_eq!(title, "a.cpp", "标题里不应再拼未保存标记");
+
+        // 悬停标签正文：圆点仍在（未保存状态不能因为 hover 就消失）
+        let out = frame(vec![egui::Event::PointerMoved(egui::pos2(40.0, 17.0))]);
+        assert!(dot_of(&out).is_some(), "悬停标签时圆点也应保留");
+        assert!(
+            !has_close_icon(&out),
+            "没悬停到圆点上时不该画叉叉"
+        );
+
+        // 悬停圆点：变成叉叉
+        let out = frame(vec![egui::Event::PointerMoved(dot.center)]);
+        assert!(has_close_icon(&out), "悬停圆点应变成叉叉");
+        assert!(
+            dot_of(&out).is_none(),
+            "悬停圆点时圆点应让位给叉叉"
+        );
+
+        // 点圆点 = 关闭脏标签 → 弹确认，标签先不关
+        for pressed in [true, false] {
+            let _ = frame(vec![
+                egui::Event::PointerMoved(dot.center),
+                egui::Event::PointerButton {
+                    pos: dot.center,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ]);
+        }
+        assert_eq!(app.tabs.len(), 1, "脏标签不应直接关掉");
+        assert_eq!(app.confirm_close, Some(0), "应弹「未保存」确认");
+    }
+
+    fn has_close_icon(out: &egui::FullOutput) -> bool {
+        out.shapes.iter().any(|cs| {
+            matches!(&cs.shape, egui::Shape::Text(t) if t.galley.text() == "\u{ea76}")
+        })
     }
 
     /// 标签宽度：短标题自己窄、长标题更宽；放不下时等比压缩，但不低于下限。
