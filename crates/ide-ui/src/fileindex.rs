@@ -3,12 +3,13 @@
 //! 之前 Ctrl+P 只是个目录浏览器：输入文件名只在**当前目录**里过滤，
 //! 工程深处的文件根本找不到（VS Code 能按文件名模糊命中整个工作区）。
 //!
-//! 这里在后台线程把工作区的文件列出来（本地目录直接遍历，WSL 远程工作区用
-//! `wsl.exe -- find`），再做 VS Code 风格的模糊匹配（子序列 + 打分排序）。
+//! 这里在后台线程把工作区的文件列出来（本地目录直接遍历，远程工作区用
+//! `wsl.exe` / `ssh` 在远端跑 `find`），再做 VS Code 风格的模糊匹配（子序列 + 打分排序）。
 //!
 //! 索引是**快照**：建好之后一直用；文件变了不会自动更新（VS Code 靠文件监视，
 //! 我们还没有），但重新打开 Ctrl+P 时会按根重建一次。
 
+use ide_remote::RemoteTarget;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
@@ -104,10 +105,10 @@ impl FileIndex {
 
     /// 确保索引已按当前根建好（没有就在后台线程建）。
     ///
-    /// `local_root`：本地工作区根；`distro` + `posix_root`：远程（WSL）工作区。
-    pub fn ensure(&mut self, local_root: &Path, distro: Option<&str>, posix_root: Option<&str>) {
-        let key = match (distro, posix_root) {
-            (Some(d), Some(r)) => format!("wsl:{d}:{r}"),
+    /// `local_root`：本地工作区根；`target` + `posix_root`：远程（WSL / SSH）工作区。
+    pub fn ensure(&mut self, local_root: &Path, target: Option<&RemoteTarget>, posix_root: Option<&str>) {
+        let key = match (target, posix_root) {
+            (Some(t), Some(r)) => format!("{}:{r}", t.label()),
             _ => format!("local:{}", local_root.display()),
         };
         if key == self.root_key && (self.building || !self.entries.is_empty()) {
@@ -118,13 +119,13 @@ impl FileIndex {
         self.state = IndexState::Building;
         let tx = self.tx.clone();
         let local_root = local_root.to_path_buf();
-        let distro = distro.map(str::to_string);
+        let target = target.cloned();
         let posix_root = posix_root.map(str::to_string);
         let _ = std::thread::Builder::new()
             .name("file-index".to_string())
             .spawn(move || {
-                let entries = match (&distro, &posix_root) {
-                    (Some(d), Some(r)) => list_remote(d, r),
+                let entries = match (&target, &posix_root) {
+                    (Some(t), Some(r)) => list_remote(t, r),
                     _ => list_local(&local_root),
                 };
                 let _ = tx.send(entries);
@@ -358,34 +359,30 @@ fn list_local(root: &Path) -> Vec<FileEntry> {
     out
 }
 
-/// 远程（WSL）工作区：一次 `find` 拿全部文件。
+/// 远程（WSL / SSH）工作区：一次 `find` 拿全部文件。
 ///
-/// 注意两点：
-/// - `-path` 的模式要**带引号**传给 wsl.exe：它会交给发行版的 shell 再解析一次，
-///   不加引号的话 `*/.git/*` 会被 shell 提前展开成几百个路径，find 直接报错；
-/// - 必须排掉构建目录：这个工程光 `build*` 下面就有十几万个 .o 文件。
-fn list_remote(distro: &str, posix_root: &str) -> Vec<FileEntry> {
-    let Ok(output) = std::process::Command::new("wsl.exe")
-        .args(["-d", distro, "--cd", posix_root, "--", "find", ".", "-type", "f"])
-        .args([
-            "-not",
-            "-path",
-            "'*/.git/*'",
-            "-not",
-            "-path",
-            "'*/build*/*'",
-            "-not",
-            "-path",
-            "'*/out/*'",
-            "-not",
-            "-path",
-            "'*/CMakeFiles/*'",
-            "-not",
-            "-path",
-            "'*/node_modules/*'",
-        ])
-        .output()
-    else {
+/// 排掉 `-path` 的子目录用单引号写在脚本里（`shell_quote` 之后整段交给
+/// `bash -l -c`），不会被远端 shell 提前展开；必须排掉构建目录：这个工程光
+/// `build*` 下面就有十几万个 .o 文件。
+fn list_remote(target: &RemoteTarget, posix_root: &str) -> Vec<FileEntry> {
+    let script = format!(
+        "cd {} && find . -type f -not -path '*/.git/*' -not -path '*/build*/*' \
+-not -path '*/out/*' -not -path '*/CMakeFiles/*' -not -path '*/node_modules/*'",
+        ide_core::remote::shell_quote(posix_root)
+    );
+    let (program, args) = target.shell_argv(&script);
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 后台索引不能弹出控制台窗口。
+        cmd.creation_flags(0x0800_0000);
+    }
+    let Ok(output) = cmd.output() else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -454,6 +451,36 @@ mod tests {
 
     fn entry(name: &str) -> FileEntry {
         FileEntry::new(format!("src/utils/{name}"), name.to_string())
+    }
+
+    /// 真实 SSH 验收：索引脚本在远端跑通（排除 build/.git、只留源码类文件）。
+    ///
+    /// `cargo test -p ide-ui ssh_file_index_lists_remote_sources -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要一台可免密登录的 SSH 主机（LITEIDE_SSH_TEST_HOST/USER）"]
+    fn ssh_file_index_lists_remote_sources() {
+        let user = std::env::var("LITEIDE_SSH_TEST_USER").unwrap_or_else(|_| "fubin".to_string());
+        let host = std::env::var("LITEIDE_SSH_TEST_HOST")
+            .unwrap_or_else(|_| "192.168.77.6".to_string());
+        let root = std::env::var("LITEIDE_SSH_TEST_ROOT")
+            .unwrap_or_else(|_| "/home/fubin/work/candanza".to_string());
+        let target = RemoteTarget::ssh(user, host, 22);
+        let entries = list_remote(&target, &root);
+        assert!(!entries.is_empty(), "远程索引不应为空: {root}");
+        assert!(
+            entries.iter().any(|e| e.name.ends_with(".cpp") || e.name.ends_with(".h")),
+            "应索引到 C/C++ 文件"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.rel.starts_with("build/") || e.rel.contains("/build/")),
+            "构建目录应被排除"
+        );
+        assert!(
+            !entries.iter().any(|e| e.rel.contains("/.git/")),
+            ".git 应被排除"
+        );
     }
 
     #[test]

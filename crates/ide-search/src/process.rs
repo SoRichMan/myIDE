@@ -1,5 +1,6 @@
-//! ripgrep 子进程调用：WSL 桥接 + 环境变量覆盖。
+//! ripgrep 子进程调用：WSL / SSH 桥接 + 环境变量覆盖。
 
+use ide_core::remote::{shell_quote, RemoteTarget};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -10,6 +11,30 @@ pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 远端解析 rg 的 shell 片段。
+///
+/// 有些机器（比如 CentOS 7 上的开发机）把 rg 装在 `~/.cache/opencode/bin` 这类
+/// 不在登录 PATH 里的位置，所以 PATH 找不到时再试几个常见安装目录。
+const RG_RESOLVER: &str = concat!(
+    "RG=$(command -v rg 2>/dev/null); ",
+    "if [ -z \"$RG\" ]; then ",
+    "for c in \"$HOME/.cache/opencode/bin/rg\" \"$HOME/.local/bin/rg\" ",
+    "/usr/local/bin/rg /usr/bin/rg \"$HOME/opt/rg/bin/rg\"; do ",
+    "[ -x \"$c\" ] && { RG=$c; break; }; done; fi; ",
+    "if [ -z \"$RG\" ]; then echo 'rg 不在远端 PATH 中' >&2; exit 127; fi; "
+);
+
+/// 解析 rg 的前缀（`LITEIDE_RG_REMOTE` 可指定远端绝对路径，跳过探测）。
+fn rg_prefix() -> String {
+    if let Ok(p) = std::env::var("LITEIDE_RG_REMOTE") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return format!("RG={}; ", shell_quote(p));
+        }
+    }
+    RG_RESOLVER.to_string()
+}
 
 /// Windows 路径 → WSL 视角路径。
 ///
@@ -40,22 +65,12 @@ fn distro() -> String {
     std::env::var("LITEIDE_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu2404".to_string())
 }
 
-/// 构造一个带 CREATE_NO_WINDOW 的 Command。
-fn base() -> Command {
-    let mut c = Command::new(WSL_EXE);
-    #[cfg(windows)]
-    {
-        c.creation_flags(CREATE_NO_WINDOW);
-    }
-    c
-}
-
-/// 以 WSL 调用 `rg`，工作目录为 `root_win`（Windows 路径）。
+/// 以远端调用 `rg`，工作目录为 `root_win`（Windows 或 POSIX 路径）。
 ///
-/// `LITEIDE_RG_CMD` 整条覆盖时按空白拆分（测试用），否则
-/// `wsl.exe -d <distro> -- bash -lc "cd <root_wsl> && rg <args...>"`。
+/// `LITEIDE_RG_CMD` 整条覆盖时按空白拆分（测试用），否则在远端跑
+/// `cd <root> && rg <args...>`：WSL 走 `wsl.exe`，SSH 远程工作区走 `ssh`。
 async fn run_rg(root_win: &str, extra_args: &[&str]) -> Result<String, String> {
-    // 覆盖模式：直接执行（不经过 wsl）。
+    // 覆盖模式：直接执行（不经过远端）。
     if let Ok(cmdline) = std::env::var("LITEIDE_RG_CMD") {
         if !cmdline.trim().is_empty() {
             let mut parts = cmdline.split_whitespace();
@@ -82,26 +97,34 @@ async fn run_rg(root_win: &str, extra_args: &[&str]) -> Result<String, String> {
     }
 
     let root_wsl = win_to_wsl_path(root_win);
-    let distro = distro();
-    // 组装 shell 命令：cd 到项目根后跑 rg。参数用单引号包裹（rg 参数多为固定 flag，
-    // 真正的搜索词由 manager 经 -- 传入并单独转义）。
-    let mut argv = String::new();
-    argv.push_str("cd ");
-    argv.push_str(&shell_quote(&root_wsl));
-    argv.push_str(" && rg --color=never --no-messages");
+    // 组装 shell 命令：解析 rg 路径、cd 到项目根后跑 rg。参数用单引号包裹
+    // （rg 参数多为固定 flag，真正的搜索词由 manager 经 -- 传入并单独转义）。
+    let mut script = rg_prefix();
+    script.push_str("cd ");
+    script.push_str(&shell_quote(&root_wsl));
+    script.push_str(" && exec \"$RG\" --color=never --no-messages");
     for a in extra_args {
-        argv.push(' ');
-        argv.push_str(&shell_quote(a));
+        script.push(' ');
+        script.push_str(&shell_quote(a));
     }
 
-    let fut = base()
-        .args(["-d", &distro, "--", "bash", "-lc", &argv])
-        .output();
+    let target = match ide_core::remote::ssh_target_for_path(root_win) {
+        Some(t) => t,
+        None => RemoteTarget::wsl(distro()),
+    };
+    let (program, argv) = target.shell_argv(&script);
+    let mut c = Command::new(&program);
+    c.args(&argv);
+    #[cfg(windows)]
+    {
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let fut = c.output();
     let out = match tokio::time::timeout(SEARCH_TIMEOUT, fut).await {
         Ok(r) => r,
         Err(_) => {
             return Err(format!(
-                "rg 调用超时（{}s，项目过大或 WSL 繁忙）",
+                "rg 调用超时（{}s，项目过大或远端繁忙）",
                 SEARCH_TIMEOUT.as_secs()
             ))
         }
@@ -120,10 +143,6 @@ async fn run_rg(root_win: &str, extra_args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// POSIX shell 单引号转义。
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
 
 /// 内容搜索选项（Ctrl+Shift+F 面板上的开关）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -226,24 +245,33 @@ pub async fn probe_rg() -> Result<String, String> {
     if std::env::var("LITEIDE_RG_CMD").is_ok() {
         return Ok("custom".to_string());
     }
-    let distro = distro();
-    let fut = base()
-        .args(["-d", &distro, "--", "sh", "-lc", "command -v rg"])
-        .output();
-    match tokio::time::timeout(DETECT_TIMEOUT, fut).await {
+    let target = match ide_core::remote::current_target() {
+        Some(t) if t.is_ssh() => t,
+        _ => RemoteTarget::wsl(distro()),
+    };
+    let script = format!("{}printf '%s' \"$RG\"", rg_prefix());
+    let (program, argv) = target.shell_argv(&script);
+    let mut c = Command::new(&program);
+    c.args(&argv);
+    #[cfg(windows)]
+    {
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    match tokio::time::timeout(DETECT_TIMEOUT, c.output()).await {
         Ok(Ok(o)) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if s.is_empty() {
-                Err("rg 不在 WSL PATH 中".to_string())
+                Err(format!("rg 不在远端 PATH 中（{}）", target.label()))
             } else {
                 Ok(s)
             }
         }
-        Ok(o) => Err(format!(
-            "rg 探测失败: {}",
-            o.map(|x| String::from_utf8_lossy(&x.stderr).trim().to_string())
-                .unwrap_or_else(|e| e.to_string())
+        Ok(Ok(o)) => Err(format!(
+            "rg 探测失败（{}）: {}",
+            target.label(),
+            String::from_utf8_lossy(&o.stderr).trim()
         )),
+        Ok(Err(e)) => Err(format!("rg 探测失败: {e}")),
         Err(_) => Err("rg 探测超时".to_string()),
     }
 }
@@ -352,5 +380,37 @@ mod tests {
                 ("-g".to_string(), "!vendor".to_string()),
             ]
         );
+    }
+
+    /// 真实 SSH 验收：远端解析 rg（不在 PATH 里也能找到）+ `--files` / `--json` 跑通。
+    ///
+    /// `cargo test -p ide-search ssh_remote_search -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "需要一台可免密登录的 SSH 主机（LITEIDE_SSH_TEST_HOST/USER）"]
+    async fn ssh_remote_search() {
+        let user = std::env::var("LITEIDE_SSH_TEST_USER").unwrap_or_else(|_| "fubin".to_string());
+        let host = std::env::var("LITEIDE_SSH_TEST_HOST")
+            .unwrap_or_else(|_| "192.168.77.6".to_string());
+        let target = ide_core::remote::RemoteTarget::ssh(user, host, 22);
+        ide_core::remote::set_current_target(Some(target.clone()));
+
+        let rg = probe_rg().await.expect("远端应能解析出 rg");
+        assert!(rg.ends_with("rg"), "解析结果应为 rg 可执行文件: {rg}");
+
+        let root = std::env::var("LITEIDE_SSH_TEST_ROOT")
+            .unwrap_or_else(|_| "/home/fubin/work/candanza".to_string());
+        let files = list_files(&root).await.expect("rg --files 应成功");
+        assert!(!files.is_empty(), "远程工程应列出文件: {root}");
+        assert!(
+            files.iter().any(|f| f.ends_with(".cpp") || f.ends_with(".h")),
+            "应有 C/C++ 文件"
+        );
+
+        let out = search_content(&root, "candanza", &SearchOptions::default())
+            .await
+            .expect("内容搜索应成功");
+        assert!(out.contains("\"type\":\"match\""), "应返回 rg JSON 事件");
+
+        ide_core::remote::set_current_target(None);
     }
 }

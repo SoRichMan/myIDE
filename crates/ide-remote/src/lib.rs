@@ -1,23 +1,32 @@
-//! ide-remote: 在 WSL 发行版**内部**读写文件、启动终端。
+//! ide-remote: 在远程主机（WSL 发行版 / SSH 主机）**内部**读写文件、启动终端。
 //!
-//! 连接 WSL 工作区后，IDE 不再用 `\\wsl.localhost\<distro>\...`（Windows 侧 9P 挂载）
-//! 访问 Linux 文件，而是在发行版里常驻一个 `bash -l` 会话，所有读/写/列目录都按 POSIX
-//! 路径在 WSL 内部完成。差别不只是路径写法：
+//! 连接远程工作区后，IDE 不再用 `\\wsl.localhost\<distro>\...`（Windows 侧 9P 挂载）
+//! 访问 Linux 文件，而是在远端常驻一个 `bash -l` 会话，所有读/写/列目录都按 POSIX
+//! 路径在远端内部完成。差别不只是路径写法：
 //!
-//! - 环境变量来自 WSL 用户自己的登录环境（PATH / LANG / CC / CXX …），不是 Windows 侧继承；
+//! - 环境变量来自远端用户自己的登录环境（PATH / LANG / CC / CXX …），不是 Windows 侧继承；
 //! - 权限、符号链接、大小写、硬链接语义都是 Linux 的；
-//! - 后续 Terminal 用同一套 `wsl.exe --cd <posix>` 启动，落点与编辑器一致。
+//! - 后续 Terminal 用同一套 `wsl.exe --cd <posix>`（WSL）或 `ssh -t ... 'cd <posix> && exec bash -l'`
+//!   （SSH）启动，落点与编辑器一致。
+//!
+//! 两种远端共用同一份 [`ide_core::remote::RemoteTarget`] 描述与同一套协议，
+//! 只有「把命令送过去」的 argv 不同（见 `RemoteTarget::shell_argv` / `interactive_argv`）。
 //!
 //! 协议：行式（TAB 分隔），参数与返回都走 base64，避免路径里的空格/引号/换行破坏分帧。
-//! 常驻会话省掉了每次 `wsl.exe` 冷启动（实测单次调用约 120ms，会话内往返约 1ms）。
+//! 常驻会话省掉了每次 `wsl.exe`／`ssh` 冷启动（实测单次调用约 120ms，会话内往返约 1ms）。
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use ide_core::remote::{
+    is_posix_path, normalize_posix, shell_quote, RemoteTarget, DEFAULT_SSH_PORT,
+};
+
 mod terminal;
-pub use terminal::{TermOutput, WslTerminal};
+pub use terminal::{RemoteTerminal, TermOutput};
 
 /// 单次请求的等待上限：bash 会话卡住（例如被杀）时不能让 UI 无限等。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -25,12 +34,12 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// 常驻 agent：在 WSL 里跑一个 `bash -l`，从 stdin 读命令、往 stdout 写结果。
+/// 常驻 agent：在远端跑一个 `bash -l`，从 stdin 读命令、往 stdout 写结果。
 ///
 /// `-l` 是为了拿到用户登录环境（`~/.profile`、`/etc/profile` 里的 PATH）；
 /// 副作用是启动时可能有 profile 输出，因此帧里只认「id 对得上」的响应行。
 ///
-/// 刻意写成**单行**：脚本是作为 Windows 命令行参数传给 `wsl.exe` 的，
+/// 刻意写成**单行**：脚本是作为命令行参数传给 `wsl.exe` / `ssh` 的，
 /// 换行在 argv 里会经过一层转义，换成单行可以彻底避开这类坑。
 const AGENT_SCRIPT: &str = concat!(
     "export LC_ALL=C; ",
@@ -74,70 +83,58 @@ pub enum PathKind {
     Missing,
 }
 
-/// 规范化 POSIX 目录：补前导 `/`、去多余尾部 `/`，空串视为 `/`。
-///
-/// 反斜杠一律当分隔符处理（`Path::join` 在 Windows 上拼出来的是 `\`）。
-pub fn normalize_posix(p: &str) -> String {
-    let t = p.trim().replace('\\', "/");
-    let t = t.trim_end_matches('/');
-    if t.is_empty() {
-        "/".to_string()
-    } else if t.starts_with('/') {
-        t.to_string()
-    } else {
-        format!("/{t}")
-    }
-}
-
-/// 路径是否像远端 POSIX 路径（`/...`；盘符路径 `E:\...` 不算）。
-pub fn is_posix_path(p: &str) -> bool {
-    let t = p.trim_start();
-    t.starts_with('/') && !t.starts_with("//")
-}
-
-/// 常驻 WSL 文件会话。所有调用都是同步的（会话内往返约 1ms），由调用方串行使用。
-pub struct WslFs {
+/// 常驻远程文件会话。所有调用都是同步的（会话内往返约 1ms），由调用方串行使用。
+pub struct RemoteFs {
     session: Option<Session>,
 }
 
-impl Default for WslFs {
+impl Default for RemoteFs {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl WslFs {
+impl RemoteFs {
     pub fn new() -> Self {
         Self { session: None }
     }
 
     /// 读文本：按 UTF-8 无损解码，非 UTF-8 内容做 lossy 替换（编辑器只处理文本）。
-    pub fn read_text(&mut self, distro: &str, posix: &str) -> Result<String, String> {
-        let bytes = self.read_bytes(distro, posix)?;
+    pub fn read_text(&mut self, target: &RemoteTarget, posix: &str) -> Result<String, String> {
+        let bytes = self.read_bytes(target, posix)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// 读原始字节（`base64 -w0` 的逆过程）。
-    pub fn read_bytes(&mut self, distro: &str, posix: &str) -> Result<Vec<u8>, String> {
+    pub fn read_bytes(&mut self, target: &RemoteTarget, posix: &str) -> Result<Vec<u8>, String> {
         let path = normalize_posix(posix);
-        let b64 = self.request(distro, "read", &path, "")?;
+        let b64 = self.request(target, "read", &path, "")?;
         b64_decode(&b64).ok_or_else(|| format!("读取 {path} 的响应不是合法 base64"))
     }
 
     /// 写文本：内容作为参数走 base64 上链，不经过 shell 引号，原样落盘（保留权限位）。
     ///
-    /// 参数由 [`WslFs::request`] 统一做一次传输编码，所以这里直接传原文，
+    /// 参数由 [`RemoteFs::request`] 统一做一次传输编码，所以这里直接传原文，
     /// 文件里的 TAB / 换行 / 引号都不会破坏分帧。
-    pub fn write_text(&mut self, distro: &str, posix: &str, text: &str) -> Result<(), String> {
+    pub fn write_text(
+        &mut self,
+        target: &RemoteTarget,
+        posix: &str,
+        text: &str,
+    ) -> Result<(), String> {
         let path = normalize_posix(posix);
-        self.request(distro, "write", &path, text)?;
+        self.request(target, "write", &path, text)?;
         Ok(())
     }
 
     /// 列目录（一层，文件 + 目录；隐藏项也在内）。
-    pub fn list_dir(&mut self, distro: &str, posix: &str) -> Result<Vec<RemoteEntry>, String> {
+    pub fn list_dir(
+        &mut self,
+        target: &RemoteTarget,
+        posix: &str,
+    ) -> Result<Vec<RemoteEntry>, String> {
         let path = normalize_posix(posix);
-        let raw = self.request(distro, "list", &path, "")?;
+        let raw = self.request(target, "list", &path, "")?;
         let mut out = Vec::new();
         for line in raw.split('\n') {
             let Some((kind, name)) = line.split_once('\t') else {
@@ -154,9 +151,9 @@ impl WslFs {
         Ok(out)
     }
 
-    pub fn path_kind(&mut self, distro: &str, posix: &str) -> Result<PathKind, String> {
+    pub fn path_kind(&mut self, target: &RemoteTarget, posix: &str) -> Result<PathKind, String> {
         let path = normalize_posix(posix);
-        Ok(match self.request(distro, "stat", &path, "")?.as_str() {
+        Ok(match self.request(target, "stat", &path, "")?.as_str() {
             "d" => PathKind::Dir,
             "f" => PathKind::File,
             "o" => PathKind::Other,
@@ -164,49 +161,58 @@ impl WslFs {
         })
     }
 
-    pub fn is_dir(&mut self, distro: &str, posix: &str) -> bool {
-        matches!(self.path_kind(distro, posix), Ok(PathKind::Dir))
+    pub fn is_dir(&mut self, target: &RemoteTarget, posix: &str) -> bool {
+        matches!(self.path_kind(target, posix), Ok(PathKind::Dir))
     }
 
-    pub fn is_file(&mut self, distro: &str, posix: &str) -> bool {
-        matches!(self.path_kind(distro, posix), Ok(PathKind::File))
+    pub fn is_file(&mut self, target: &RemoteTarget, posix: &str) -> bool {
+        matches!(self.path_kind(target, posix), Ok(PathKind::File))
     }
 
-    pub fn exists(&mut self, distro: &str, posix: &str) -> bool {
+    pub fn exists(&mut self, target: &RemoteTarget, posix: &str) -> bool {
         matches!(
-            self.path_kind(distro, posix),
+            self.path_kind(target, posix),
             Ok(PathKind::Dir) | Ok(PathKind::File) | Ok(PathKind::Other)
         )
     }
 
-    pub fn create_dir_all(&mut self, distro: &str, posix: &str) -> Result<(), String> {
+    pub fn create_dir_all(&mut self, target: &RemoteTarget, posix: &str) -> Result<(), String> {
         let path = normalize_posix(posix);
-        self.request(distro, "mkdir", &path, "")?;
+        self.request(target, "mkdir", &path, "")?;
         Ok(())
     }
 
-    /// 关闭常驻会话（切换发行版/退出时调用）。
+    /// 关闭常驻会话（切换发行版/主机/退出时调用）。
     pub fn shutdown(&mut self) {
         self.session = None;
     }
 
     /// 发一条请求并等对应响应；会话失效时丢弃并允许下次重建。
-    fn request(&mut self, distro: &str, op: &str, a1: &str, a2: &str) -> Result<String, String> {
-        let distro = distro.trim();
-        if distro.is_empty() {
-            return Err("未指定 WSL 发行版".to_string());
+    fn request(
+        &mut self,
+        target: &RemoteTarget,
+        op: &str,
+        a1: &str,
+        a2: &str,
+    ) -> Result<String, String> {
+        if target.is_wsl() {
+            if let RemoteTarget::Wsl { distro } = target {
+                if distro.is_empty() {
+                    return Err("未指定 WSL 发行版".to_string());
+                }
+            }
         }
-        // 会话不可用（首次/换发行版/上次失败）就重建；重建失败直接把错误抛给调用方。
+        // 会话不可用（首次/换目标/上次失败）就重建；重建失败直接把错误抛给调用方。
         let need_new = match &self.session {
-            Some(s) => s.distro != distro || s.closed,
+            Some(s) => &s.target != target || s.closed,
             None => true,
         };
         if need_new {
-            self.session = Some(Session::spawn(distro)?);
+            self.session = Some(Session::spawn(target)?);
         }
         let result = match self.session.as_mut() {
             Some(s) => s.request(op, a1, a2),
-            None => Err("WSL 会话未建立".to_string()),
+            None => Err("远程会话未建立".to_string()),
         };
         if result.is_err() {
             // 超时/管道断：这个会话已经不可信，下次调用重建。
@@ -216,9 +222,9 @@ impl WslFs {
     }
 }
 
-/// 一次常驻会话（一个 `wsl.exe -- bash -l` 进程）。
+/// 一次常驻会话（一个 `wsl.exe`／`ssh` 进程里的 `bash -l`）。
 struct Session {
-    distro: String,
+    target: RemoteTarget,
     child: Child,
     stdin: ChildStdin,
     rx: Receiver<String>,
@@ -227,17 +233,11 @@ struct Session {
 }
 
 impl Session {
-    fn spawn(distro: &str) -> Result<Self, String> {
-        let mut cmd = Command::new("wsl.exe");
-        // 必须用 `--exec`：走默认的 `--` 时 wsl.exe 会先套一层自己的解析器，
-        // 实测会吞掉 stdin 的第一行（bash 的 `read` 直接拿到空串）。
-        cmd.arg("-d")
-            .arg(distro)
-            .arg("--exec")
-            .arg("bash")
-            .arg("-l")
-            .arg("-c")
-            .arg(AGENT_SCRIPT)
+    fn spawn(target: &RemoteTarget) -> Result<Self, String> {
+        let label = target.label();
+        let (program, args) = target.shell_argv(AGENT_SCRIPT);
+        let mut cmd = Command::new(&program);
+        cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -248,14 +248,14 @@ impl Session {
         }
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("启动 WSL 会话失败（{distro}）: {e}"))?;
-        let stdin = child.stdin.take().ok_or("拿不到 WSL 会话 stdin")?;
-        let stdout = child.stdout.take().ok_or("拿不到 WSL 会话 stdout")?;
-        let stderr = child.stderr.take().ok_or("拿不到 WSL 会话 stderr")?;
+            .map_err(|e| format!("启动远程会话失败（{label}）: {e}"))?;
+        let stdin = child.stdin.take().ok_or("拿不到远程会话 stdin")?;
+        let stdout = child.stdout.take().ok_or("拿不到远程会话 stdout")?;
+        let stderr = child.stderr.take().ok_or("拿不到远程会话 stderr")?;
 
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::Builder::new()
-            .name("wslfs-out".to_string())
+            .name("remotefs-out".to_string())
             .spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
@@ -264,21 +264,30 @@ impl Session {
                     }
                 }
             })
-            .map_err(|e| format!("启动 WSL 读取线程失败: {e}"))?;
-        // stderr 只记日志：agent 的错误都走协议返回，这里多半是 profile 噪音。
-        let tag = distro.to_string();
+            .map_err(|e| format!("启动远程读取线程失败: {e}"))?;
+        // stderr 多数是 profile 噪音，但连接失败时（ssh 的 "Permission denied"、
+        // "Host key verification failed"）关键信息只在这里，留最后几行给握手报错。
+        let tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let tail_c = tail.clone();
+        let tag = label.clone();
         std::thread::Builder::new()
-            .name("wslfs-err".to_string())
+            .name("remotefs-err".to_string())
             .spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    tracing::debug!("wsl[{tag}] stderr: {line}");
+                    tracing::debug!("remote[{tag}] stderr: {line}");
+                    if let Ok(mut v) = tail_c.lock() {
+                        v.push(line);
+                        if v.len() > 8 {
+                            v.remove(0);
+                        }
+                    }
                 }
             })
-            .map_err(|e| format!("启动 WSL 错误读取线程失败: {e}"))?;
+            .map_err(|e| format!("启动远程错误读取线程失败: {e}"))?;
 
         let mut s = Self {
-            distro: distro.to_string(),
+            target: target.clone(),
             child,
             stdin,
             rx,
@@ -286,31 +295,49 @@ impl Session {
             closed: false,
         };
         // 握手：profile 可能先往 stdout 打东西，用 ping 把管道对齐到「协议开始」。
-        s.request("ping", "", "")
-            .map_err(|e| format!("WSL 会话握手失败（{distro}）: {e}"))?;
+        if let Err(e) = s.request("ping", "", "") {
+            let detail = tail
+                .lock()
+                .ok()
+                .map(|v| v.join(" / "))
+                .unwrap_or_default();
+            return Err(if detail.trim().is_empty() {
+                format!("远程会话握手失败（{label}）: {e}")
+            } else {
+                format!("远程会话握手失败（{label}）: {e}；stderr: {detail}")
+            });
+        }
         Ok(s)
     }
 
     fn request(&mut self, op: &str, a1: &str, a2: &str) -> Result<String, String> {
         self.next_id += 1;
         let id = self.next_id;
-        let line = format!("{id}\t{op}\t{}\t{}\n", b64_encode(a1.as_bytes()), b64_encode(a2.as_bytes()));
+        let line = format!(
+            "{id}\t{op}\t{}\t{}\n",
+            b64_encode(a1.as_bytes()),
+            b64_encode(a2.as_bytes())
+        );
         self.stdin
             .write_all(line.as_bytes())
             .and_then(|_| self.stdin.flush())
             .map_err(|e| {
                 self.closed = true;
-                format!("写入 WSL 会话失败: {e}")
+                format!("写入远程会话失败: {e}")
             })?;
 
         let want = id.to_string();
         loop {
             let line = match self.rx.recv_timeout(REQUEST_TIMEOUT) {
                 Ok(l) => l,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.closed = true;
+                    return Err(format!("远程会话已断开（op={op}）"));
+                }
                 Err(_) => {
                     self.closed = true;
                     return Err(format!(
-                        "WSL 会话响应超时（{}s，op={op}）",
+                        "远程会话响应超时（{}s，op={op}）",
                         REQUEST_TIMEOUT.as_secs()
                     ));
                 }
@@ -326,13 +353,13 @@ impl Session {
                 }
                 let msg = String::from_utf8_lossy(&payload).trim().to_string();
                 return Err(if msg.is_empty() {
-                    format!("WSL 操作失败（op={op}）")
+                    format!("远程操作失败（op={op}）")
                 } else {
                     msg
                 });
             }
             // 别的 id（超时后被丢弃的旧请求）或 profile 噪音：忽略继续等。
-            tracing::trace!("wsl 会话丢弃一行: {line}");
+            tracing::trace!("远程会话丢弃一行: {line}");
         }
     }
 }
@@ -345,54 +372,52 @@ impl Drop for Session {
     }
 }
 
-/// 在 WSL 内部打开终端，落点是工作区目录（`--cd` 走发行版内路径）。
+/// 在远端打开终端窗口，落点是工作区目录。
 ///
-/// 优先 Windows Terminal（`wt.exe`），没有就退回 `wsl.exe` 自带控制台——
-/// 两者都是 `wsl.exe` 起的登录 shell，环境变量即 WSL 用户自己的。
-pub fn open_terminal(distro: &str, posix_cwd: &str) -> Result<(), String> {
-    let distro = distro.trim();
-    if distro.is_empty() {
-        return Err("未指定 WSL 发行版".to_string());
+/// WSL 优先 Windows Terminal（`wt.exe`），没有就退回 `wsl.exe` 自带控制台；
+/// SSH 同样优先 `wt.exe`，没有就退回 `ssh.exe` 自己的控制台窗口。
+/// 两者跑的都是远端用户的登录 shell，环境变量即远端自己的。
+pub fn open_terminal(target: &RemoteTarget, posix_cwd: &str) -> Result<(), String> {
+    if let RemoteTarget::Wsl { distro } = target {
+        if distro.trim().is_empty() {
+            return Err("未指定 WSL 发行版".to_string());
+        }
     }
     let cwd = normalize_posix(posix_cwd);
-    let title = format!("{distro}: {cwd}");
+    let title = format!("{}: {cwd}", target.short_label());
+    let (program, args) = target.terminal_argv(&cwd);
 
     let mut wt = Command::new("wt.exe");
-    wt.args([
-        "new-tab",
-        "--title",
-        &title,
-        "wsl.exe",
-        "-d",
-        distro,
-        "--cd",
-        &cwd,
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
+    wt.arg("new-tab")
+        .arg("--title")
+        .arg(&title)
+        .arg(&program)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     if wt.spawn().is_ok() {
         return Ok(());
     }
 
-    let mut fallback = Command::new("wsl.exe");
+    let mut fallback = Command::new(&program);
     fallback
-        .arg("-d")
-        .arg(distro)
-        .arg("--cd")
-        .arg(&cwd)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        fallback.creation_flags(CREATE_NO_WINDOW);
+        // WSL 分支保持原样（不弹黑框）；SSH 需要可见的控制台窗口，否则用户看不到 shell。
+        if target.is_wsl() {
+            fallback.creation_flags(CREATE_NO_WINDOW);
+        }
     }
     fallback
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("启动 WSL 终端失败: {e}"))
+        .map_err(|e| format!("启动远程终端失败（{}）: {e}", target.label()))
 }
 
 // ---------------------------------------------------------------------------
@@ -495,22 +520,57 @@ mod tests {
     #[test]
     #[ignore = "需要本机 WSL 发行版 Ubuntu2404"]
     fn wsl_session_roundtrip() {
-        let distro = std::env::var("LITEIDE_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu2404".to_string());
+        let distro =
+            std::env::var("LITEIDE_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu2404".to_string());
+        let target = RemoteTarget::wsl(distro);
         let dir = "/tmp/liteide_remote_test";
         let file = format!("{dir}/hello.txt");
-        let mut fs = WslFs::new();
-        fs.create_dir_all(&distro, dir).expect("mkdir");
-        assert!(fs.is_dir(&distro, dir));
-        fs.write_text(&distro, &file, "line one\nline two\n").expect("write");
-        assert!(fs.is_file(&distro, &file));
-        assert_eq!(fs.read_text(&distro, &file).unwrap(), "line one\nline two\n");
-        let entries = fs.list_dir(&distro, dir).expect("list");
+        let mut fs = RemoteFs::new();
+        fs.create_dir_all(&target, dir).expect("mkdir");
+        assert!(fs.is_dir(&target, dir));
+        fs.write_text(&target, &file, "line one\nline two\n")
+            .expect("write");
+        assert!(fs.is_file(&target, &file));
+        assert_eq!(
+            fs.read_text(&target, &file).unwrap(),
+            "line one\nline two\n"
+        );
+        let entries = fs.list_dir(&target, dir).expect("list");
         assert!(entries.iter().any(|e| e.name == "hello.txt" && !e.is_dir));
         // 写坏路径要报错，而不是静默成功。
-        assert!(fs.write_text(&distro, "/proc/nope/x", "x").is_err());
+        assert!(fs.write_text(&target, "/proc/nope/x", "x").is_err());
         assert_eq!(
-            fs.path_kind(&distro, "/tmp/liteide_remote_test/does-not-exist").unwrap(),
+            fs.path_kind(&target, "/tmp/liteide_remote_test/does-not-exist")
+                .unwrap(),
             PathKind::Missing
         );
+    }
+
+    /// 真实 SSH 验收（免密已配好才跑）：
+    /// `LITEIDE_SSH_TEST=1 cargo test -p ide-remote ssh_session_roundtrip -- --ignored`
+    #[test]
+    #[ignore = "需要一台可免密登录的 SSH 主机（LITEIDE_SSH_TEST_HOST/USER）"]
+    fn ssh_session_roundtrip() {
+        let user = std::env::var("LITEIDE_SSH_TEST_USER").unwrap_or_else(|_| "fubin".to_string());
+        let host = std::env::var("LITEIDE_SSH_TEST_HOST")
+            .unwrap_or_else(|_| "192.168.77.6".to_string());
+        let port = std::env::var("LITEIDE_SSH_TEST_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(DEFAULT_SSH_PORT);
+        let target = RemoteTarget::ssh(user, host, port);
+        let dir = format!("/tmp/liteide_ssh_test_{}", std::process::id());
+        let file = format!("{dir}/hello.txt");
+        let mut fs = RemoteFs::new();
+        fs.create_dir_all(&target, &dir).expect("mkdir");
+        assert!(fs.is_dir(&target, &dir));
+        fs.write_text(&target, &file, "ssh line one\n")
+            .expect("write");
+        assert_eq!(fs.read_text(&target, &file).unwrap(), "ssh line one\n");
+        let entries = fs.list_dir(&target, &dir).expect("list");
+        assert!(entries.iter().any(|e| e.name == "hello.txt"));
+        // 清理（agent 没有 rm 操作，只能借 shell 脚本）。
+        let (prog, args) = target.shell_argv(&format!("rm -rf {}", shell_quote(&dir)));
+        let _ = Command::new(prog).args(args).output();
     }
 }

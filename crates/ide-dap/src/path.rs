@@ -8,9 +8,16 @@
 //!
 //! 限制：仅支持 NTFS 盘符路径（`C:` / `E:` 等），不支持 UNC/网络路径。
 
-/// Windows 路径 → WSL 路径。`E:\a\b` / `e:/a/b` → `/mnt/e/a/b`。
+/// Windows 路径 → 远端视角路径。`E:\a\b` / `e:/a/b` → `/mnt/e/a/b`。
+///
+/// SSH 远程工作区里的路径本来就是远端 POSIX 路径（`/home/fubin/...`），
+/// 原样透传：不能按盘符规则重写，否则 gdb 找不到程序。
 pub fn win_to_wsl(path: &str) -> Option<String> {
-    let p = path.replace('\\', "/");
+    let trimmed = path.trim();
+    if trimmed.starts_with('/') {
+        return Some(trimmed.replace('\\', "/"));
+    }
+    let p = trimmed.replace('\\', "/");
     let p = p.trim_start_matches('/');
     let (drive, rest) = p.split_once(':')?;
     if drive.len() != 1 || !drive.chars().next()?.is_ascii_alphabetic() {
@@ -61,6 +68,20 @@ mod tests {
     fn win_to_wsl_rejects_non_drive() {
         assert_eq!(win_to_wsl(r"\\.\pipe\foo"), None);
         assert_eq!(win_to_wsl("relative/path"), None);
+    }
+
+    #[test]
+    fn win_to_wsl_passes_through_remote_posix() {
+        // SSH 远程工作区：程序路径本来就是远端 POSIX 路径，必须原样透传。
+        assert_eq!(
+            win_to_wsl("/home/fubin/work/candanza/build/app").as_deref(),
+            Some("/home/fubin/work/candanza/build/app")
+        );
+        // 已经有 /mnt/ 前缀的路径同样透传（不再二次加 /mnt）。
+        assert_eq!(
+            win_to_wsl("/mnt/e/proj/a.out").as_deref(),
+            Some("/mnt/e/proj/a.out")
+        );
     }
 
     #[test]

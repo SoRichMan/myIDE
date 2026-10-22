@@ -1,15 +1,28 @@
-//! gdb 子进程管理（阶段 3）：WSL 发行版探测、gdb 可用性检查、进程启动。
+//! gdb 子进程管理（阶段 3）：WSL 发行版 / SSH 主机探测、gdb 可用性检查、进程启动。
 //!
-//! IDE 在 Windows，gdb 在 WSL 内运行，通过 `wsl.exe -d <distro> -- gdb ...` 桥接，
+//! IDE 在 Windows，gdb 在远端运行：
+//! - WSL：`wsl.exe -d <distro> --exec bash -l -c 'exec gdb ...'`；
+//! - SSH：`ssh -T ... <user>@<host> "bash -l -c 'exec gdb ...'"`。
+//!
 //! stdio 即 MI 通道。与 ide-lsp 的 clangd 启动模式保持一致：
 //! - `LITEIDE_GDB_CMD` 环境变量整条覆盖启动命令（mock/原生 Linux 场景，测试用）
 //! - `LITEIDE_WSL_DISTRO` 指定发行版
 
+use ide_core::remote::RemoteTarget;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 
 /// `wsl.exe` 可执行文件名（Windows 侧）。
 pub const WSL_EXE: &str = "wsl.exe";
+
+/// 远端解析 gdb 的 shell 片段（devtoolset 等非 PATH 安装也能找到）。
+const GDB_RESOLVER: &str = concat!(
+    "GDB=$(command -v gdb 2>/dev/null); ",
+    "if [ -z \"$GDB\" ]; then ",
+    "for c in /opt/rh/devtoolset-*/root/usr/bin/gdb /usr/local/bin/gdb \"$HOME/.local/bin/gdb\"; do ",
+    "[ -x \"$c\" ] && { GDB=$c; break; }; done; fi; ",
+    "if [ -z \"$GDB\" ]; then echo 'gdb 不在远端 PATH 中' >&2; exit 127; fi; "
+);
 
 /// 优先探测的发行版名（实际安装名 > 文档名 > 泛名）。
 pub const PREFERRED_DISTROS: &[&str] = &["Ubuntu2404", "Ubuntu-24.04", "Ubuntu"];
@@ -201,6 +214,61 @@ pub fn spawn_gdb(wsl_distro: &str) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
+/// 检查 gdb 是否在 SSH 主机的 PATH（或常见安装位置）中。返回其路径。
+pub async fn probe_gdb_remote(target: &RemoteTarget) -> Result<String, String> {
+    let script = format!("{}printf '%s' \"$GDB\"", GDB_RESOLVER);
+    let (program, argv) = target.shell_argv(&script);
+    let mut c = Command::new(&program);
+    c.args(&argv);
+    #[cfg(windows)]
+    {
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = match tokio::time::timeout(DETECT_TIMEOUT, c.output()).await {
+        Ok(r) => r,
+        Err(_) => {
+            return Err(format!(
+                "SSH 探测超时（{}，检查网络/免密登录）",
+                target.label()
+            ));
+        }
+    };
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                Err(format!("gdb 不在 {} 的 PATH 中", target.label()))
+            } else {
+                Ok(s)
+            }
+        }
+        Ok(o) => Err(format!(
+            "gdb 探测失败（{}）: {}",
+            target.label(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("ssh 调用失败: {e}")),
+    }
+}
+
+/// 通过 SSH 启动 gdb（MI2 解释器）。
+pub fn spawn_gdb_remote(target: &RemoteTarget) -> std::io::Result<Child> {
+    // -q 不打印版本横幅；-nx 不加载 .gdbinit（确定性）。
+    let script = format!("{}exec \"$GDB\" -q -nx --interpreter=mi2", GDB_RESOLVER);
+    let (program, argv) = target.shell_argv(&script);
+    let mut cmd = Command::new(&program);
+    cmd.args(&argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.spawn()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +306,29 @@ mod tests {
         assert!(!WSL_EXE.is_empty());
         #[cfg(windows)]
         assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+    }
+
+    #[test]
+    fn ssh_spawn_builds_ssh_argv_with_gdb_script() {
+        let target = RemoteTarget::ssh("fubin", "192.168.77.6", 22);
+        let (program, argv) = target.shell_argv("exec gdb -q -nx");
+        assert!(program.ends_with("ssh"));
+        assert!(argv.contains(&"fubin@192.168.77.6".to_string()));
+        assert!(argv.last().unwrap().contains("-nx"));
+        assert!(GDB_RESOLVER.contains("devtoolset"));
+    }
+
+    /// 真实 SSH 验收：远端解析 gdb（devtoolset 等非 PATH 安装也能找到）。
+    ///
+    /// `cargo test -p ide-dap ssh_probe_gdb -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "需要一台可免密登录的 SSH 主机（LITEIDE_SSH_TEST_HOST/USER）"]
+    async fn ssh_probe_gdb_finds_binary() {
+        let user = std::env::var("LITEIDE_SSH_TEST_USER").unwrap_or_else(|_| "fubin".to_string());
+        let host = std::env::var("LITEIDE_SSH_TEST_HOST")
+            .unwrap_or_else(|_| "192.168.77.6".to_string());
+        let target = RemoteTarget::ssh(user, host, 22);
+        let path = probe_gdb_remote(&target).await.expect("远端应能解析出 gdb");
+        assert!(path.ends_with("gdb"), "应返回 gdb 路径: {path}");
     }
 }

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ide-core = { path = "../ide-core" }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -4,5 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ide-core = { path = "../ide-core" }
 portable-pty = "0.9"
 tracing.workspace = true

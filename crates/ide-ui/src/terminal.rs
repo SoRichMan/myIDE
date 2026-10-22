@@ -1,4 +1,4 @@
-//! 集成终端：WSL PTY 会话 + vt100 屏幕模型 + egui 自绘。
+//! 集成终端：远端（WSL / SSH）PTY 会话 + vt100 屏幕模型 + egui 自绘。
 //!
 //! 这一层只做「终端」本身：会话集合、键盘编码、网格绘制、滚回、选区。
 //! 面板的标题栏/菜单/命令分发在 `main.rs`。
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, FontId, Pos2, Rect, Vec2};
 use ide_core::theme::ThemeKind;
-use ide_remote::WslTerminal;
+use ide_remote::{RemoteTarget, RemoteTerminal};
 use vt100::{Color, Parser, Screen};
 
 /// 滚回上限（行）。VS Code 默认 1000，这里给 5000 行，内存约几百 KB。
@@ -89,11 +89,11 @@ fn hex(s: &str) -> Color32 {
     }
 }
 
-/// 一个终端会话（一个 `wsl.exe` 进程 + 一块屏幕）。
+/// 一个终端会话（一个远端 PTY 进程 + 一块屏幕）。
 pub struct TerminalSession {
     pub id: usize,
     pub title: String,
-    pub shell: WslTerminal,
+    pub shell: RemoteTerminal,
     pub parser: Parser,
     pub cols: u16,
     pub rows: u16,
@@ -290,12 +290,12 @@ impl TerminalSet {
     /// 新建会话并切过去。失败信息同时写进 `last_error`，由面板空态展示。
     pub fn spawn(
         &mut self,
-        distro: &str,
+        target: &RemoteTarget,
         cwd: &str,
         cols: u16,
         rows: u16,
     ) -> Result<(), String> {
-        let shell = WslTerminal::spawn(distro, cwd, cols, rows)?;
+        let shell = RemoteTerminal::spawn(target, cwd, cols, rows)?;
         let id = self.next_id;
         self.next_id += 1;
         let title = if self.sessions.is_empty() {
@@ -1855,10 +1855,12 @@ mod tests {
     #[test]
     #[ignore = "需要本机 WSL 发行版"]
     fn real_wsl_resize_keeps_content() {
-        let distro =
-            std::env::var("LITEIDE_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu2404".to_string());
+        let target = RemoteTarget::wsl(
+            std::env::var("LITEIDE_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu2404".to_string()),
+        );
         let mut set = TerminalSet::new();
-        set.spawn(&distro, "/tmp", 100, 13).expect("启动 WSL 终端");
+        set.spawn(&target, "/tmp", 100, 13)
+            .expect("启动 WSL 终端");
 
         // 等提示符（poll 会自动应答 DSR）。
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1987,9 +1989,10 @@ mod tests {
     #[test]
     #[ignore = "需要本机 WSL 发行版"]
     fn probe_conpty_resize_bytes() {
-        let distro =
-            std::env::var("LITEIDE_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu2404".to_string());
-        let mut term = WslTerminal::spawn(&distro, "/tmp", 100, 13).expect("启动 WSL PTY");
+        let target = RemoteTarget::wsl(
+            std::env::var("LITEIDE_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu2404".to_string()),
+        );
+        let mut term = RemoteTerminal::spawn(&target, "/tmp", 100, 13).expect("启动 WSL PTY");
         let mut raw = Vec::new();
         // wsl.exe 启动时先发 DSR（问光标位置）；答得太早会丢，要等 shell 准备好。
         let mut asked_at: Option<Instant> = None;

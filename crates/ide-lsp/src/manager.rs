@@ -11,8 +11,9 @@
 
 use crate::client::{LspClient, LspError, LspEvents, ServerEvent};
 use crate::message::{HoverInfo, Location, Position, SymbolInfo, WorkspaceSymbol};
-use crate::process::{pick_wsl_distro, probe_clangd, spawn_clangd};
+use crate::process::{pick_wsl_distro, probe_clangd, probe_clangd_remote, spawn_clangd, spawn_clangd_remote};
 use crate::DEFAULT_TIMEOUT;
+use ide_core::remote::RemoteTarget;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -86,8 +87,10 @@ pub struct LspManager {
     cmd_tx: mpsc::UnboundedSender<Command>,
     ev_rx: std::sync::mpsc::Receiver<Event>,
     status: Arc<Mutex<LspStatus>>,
-    /// 当前连接的 WSL 发行版（无远程连接时为 None）。状态栏「连接」项读取。
+    /// 当前连接的目标（`None` = 沿用原来的 WSL 自动探测）。状态栏「连接」项读取。
     remote: Arc<Mutex<Option<String>>>,
+    /// SSH 远程目标：设置后 clangd 走 `ssh`，而不是本机 WSL。
+    target: Arc<Mutex<Option<RemoteTarget>>>,
     /// 当前 clangd 会话的根目录 URI（切换远程根后要判断是否需要重启）。
     root: Arc<Mutex<Option<String>>>,
     rt: Option<tokio::runtime::Runtime>,
@@ -106,6 +109,7 @@ impl LspManager {
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Event>();
         let status = Arc::new(Mutex::new(LspStatus::Off));
         let remote = Arc::new(Mutex::new(None));
+        let target: Arc<Mutex<Option<RemoteTarget>>> = Arc::new(Mutex::new(None));
         let root = Arc::new(Mutex::new(None));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -115,10 +119,11 @@ impl LspManager {
             .expect("tokio runtime 启动失败");
         let status_c = status.clone();
         let remote_c = remote.clone();
+        let target_c = target.clone();
         let root_c = root.clone();
         let ev_tx_c = ev_tx.clone();
         rt.spawn(async move {
-            session_loop(cmd_rx, ev_tx_c, status_c, remote_c, root_c).await;
+            session_loop(cmd_rx, ev_tx_c, status_c, remote_c, target_c, root_c).await;
         });
         let _ = ev_tx;
         Self {
@@ -126,6 +131,7 @@ impl LspManager {
             ev_rx,
             status,
             remote,
+            target,
             root,
             rt: Some(rt),
             seq: 0,
@@ -137,9 +143,20 @@ impl LspManager {
         self.status.lock().unwrap().clone()
     }
 
-    /// 已连接的 WSL 发行版名（未连接时为 None）。
+    /// 已连接的远端标签（`WSL: Ubuntu2404` / `SSH: user@host`；未连接时为 None）。
     pub fn remote_name(&self) -> Option<String> {
         self.remote.lock().unwrap().clone()
+    }
+
+    /// 切换 clangd 的远端目标（`None` = 回到原来的 WSL 自动探测）。
+    ///
+    /// 已启动过就带当前根重启一次，让新目标立即生效；还没启动时只记住，
+    /// 等 `start()` 时直接用。
+    pub fn set_remote_target(&mut self, target: Option<RemoteTarget>) {
+        *self.target.lock().unwrap() = target;
+        if let Some(root_uri) = self.root_uri() {
+            let _ = self.cmd_tx.send(Command::Reopen { root_uri });
+        }
     }
 
     /// 当前 clangd 会话的根 URI（尚未启动时为 None）。
@@ -245,9 +262,18 @@ struct SessionState {
     ui_tx: std::sync::mpsc::Sender<Event>,
     status: Arc<Mutex<LspStatus>>,
     remote: Arc<Mutex<Option<String>>>,
+    target: Arc<Mutex<Option<RemoteTarget>>>,
     root: Arc<Mutex<Option<String>>>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     root_uri: Option<String>,
+}
+
+/// 这一轮 clangd 跑在哪里。
+enum Transport {
+    /// WSL 发行版（`None` 仅出现在 `LITEIDE_LSP_CMD` 覆盖模式）。
+    Wsl(Option<String>),
+    /// SSH 主机。
+    Ssh(RemoteTarget),
 }
 
 /// 就绪循环的退出原因。
@@ -265,12 +291,14 @@ async fn session_loop(
     ui_tx: std::sync::mpsc::Sender<Event>,
     status: Arc<Mutex<LspStatus>>,
     remote: Arc<Mutex<Option<String>>>,
+    target: Arc<Mutex<Option<RemoteTarget>>>,
     root: Arc<Mutex<Option<String>>>,
 ) {
     let mut st = SessionState {
         ui_tx,
         status,
         remote,
+        target,
         root,
         cmd_rx,
         root_uri: None,
@@ -303,7 +331,32 @@ async fn session_loop(
         just_crashed = false;
 
         // ---- 探测环境（LITEIDE_LSP_CMD 覆盖时跳过，测试用） ----
-        let distro = if !crate::process::using_custom_command() {
+        let wanted = st.target.lock().unwrap().clone();
+        let transport = if crate::process::using_custom_command() {
+            tracing::info!("使用 LITEIDE_LSP_CMD 覆盖启动命令（跳过远端探测）");
+            *st.remote.lock().unwrap() = None;
+            Transport::Wsl(None)
+        } else if let Some(t) = wanted.filter(|t| t.is_ssh()) {
+            set_status(&st, LspStatus::Detecting);
+            match probe_clangd_remote(&t).await {
+                Ok(path) => tracing::info!("{} clangd at {path}", t.label()),
+                Err(e) => {
+                    tracing::warn!("clangd probe failed: {e}");
+                    set_status(
+                        &st,
+                        LspStatus::Unavailable(ide_core::diagnostics::tool_missing_on(
+                            &t, "clangd", &e,
+                        )),
+                    );
+                    just_crashed = true;
+                    continue;
+                }
+            }
+            // 探测成功即视为已建立 SSH 连接（即使 clangd 随后崩溃，
+            // 状态栏「连接」项仍应显示 SSH: user@host）。
+            *st.remote.lock().unwrap() = Some(t.label());
+            Transport::Ssh(t)
+        } else {
             set_status(&st, LspStatus::Detecting);
             let Some(d) = pick_wsl_distro().await else {
                 set_status(
@@ -315,7 +368,7 @@ async fn session_loop(
             };
             // 探测到发行版即视为已建立 WSL 连接（即使 clangd 缺失/崩溃，
             // 状态栏「连接」项仍应显示 WSL: <distro>）。
-            *st.remote.lock().unwrap() = Some(d.clone());
+            *st.remote.lock().unwrap() = Some(format!("WSL: {d}"));
             match probe_clangd(&d).await {
                 Ok(path) => {
                     tracing::info!("WSL distro={d}, clangd at {path}");
@@ -330,16 +383,16 @@ async fn session_loop(
                     continue;
                 }
             }
-            Some(d)
-        } else {
-            tracing::info!("使用 LITEIDE_LSP_CMD 覆盖启动命令（跳过 WSL 探测）");
-            *st.remote.lock().unwrap() = None;
-            None
+            Transport::Wsl(Some(d))
         };
 
         // ---- 启动 clangd 并握手 ----
         set_status(&st, LspStatus::Connecting);
-        let child = match spawn_clangd(distro.as_deref().unwrap_or("mock")) {
+        let spawned = match &transport {
+            Transport::Ssh(t) => spawn_clangd_remote(t),
+            Transport::Wsl(d) => spawn_clangd(d.as_deref().unwrap_or("mock")),
+        };
+        let child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 set_status(

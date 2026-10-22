@@ -1,13 +1,34 @@
-//! clangd 子进程管理：WSL 发行版探测、clangd 可用性检查、进程启动。
+//! clangd 子进程管理：WSL 发行版 / SSH 主机探测、clangd 可用性检查、进程启动。
 //!
-//! IDE 在 Windows，clangd 在 WSL 内运行，通过 `wsl.exe -d <distro> clangd` 桥接，
+//! IDE 在 Windows，clangd 在远端运行：
+//! - WSL：`wsl.exe -d <distro> --exec bash -l -c 'exec clangd ...'`；
+//! - SSH：`ssh -T ... <user>@<host> "bash -l -c 'exec clangd ...'"`。
+//!
 //! stdio 即 LSP 通道。
 
+use ide_core::remote::RemoteTarget;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 
 /// `wsl.exe` 可执行文件名（Windows 侧）。
 pub const WSL_EXE: &str = "wsl.exe";
+
+/// 远端解析 clangd 的 shell 片段。
+///
+/// 不少开发机把 LLVM 装在 `/opt/rh/llvm-toolset-*` 或 `/usr/lib/llvm-*/bin`，
+/// 并不在登录 PATH 里，所以 PATH 找不到时再扫一遍常见目录。
+const CLANGD_RESOLVER: &str = concat!(
+    "CLANGD=$(command -v clangd 2>/dev/null); ",
+    "if [ -z \"$CLANGD\" ]; then ",
+    "for c in /usr/lib/llvm-*/bin/clangd /usr/local/bin/clangd \"$HOME/.local/bin/clangd\" ",
+    "/opt/rh/llvm-toolset-*/root/usr/bin/clangd \"$HOME/opt/llvm/bin/clangd\"; do ",
+    "[ -x \"$c\" ] && { CLANGD=$c; break; }; done; fi; ",
+    "if [ -z \"$CLANGD\" ]; then echo 'clangd 不在远端 PATH 中' >&2; exit 127; fi; "
+);
+
+/// clangd 启动参数（与原来 WSL 分支保持一致）。
+const CLANGD_ARGS: &str = "--log=error --background-index --pch-storage=memory \
+--header-insertion=never --function-arg-placeholders=0";
 
 /// Windows 下隐藏控制台窗口（GUI 程序不得弹出黑框）。
 #[cfg(windows)]
@@ -252,6 +273,59 @@ pub fn spawn_clangd(wsl_distro: &str) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
+/// 检查 clangd 是否在 SSH 主机的 PATH（或常见 LLVM 安装目录）中。返回其路径。
+pub async fn probe_clangd_remote(target: &RemoteTarget) -> Result<String, String> {
+    let script = format!("{}printf '%s' \"$CLANGD\"", CLANGD_RESOLVER);
+    let (program, argv) = target.shell_argv(&script);
+    let mut c = Command::new(&program);
+    c.args(&argv);
+    #[cfg(windows)]
+    {
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = match tokio::time::timeout(DETECT_TIMEOUT, c.output()).await {
+        Ok(r) => r,
+        Err(_) => {
+            return Err(format!(
+                "SSH 探测超时（{}，检查网络/免密登录）",
+                target.label()
+            ));
+        }
+    };
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                Err(format!("clangd 不在 {} 的 PATH 中", target.label()))
+            } else {
+                Ok(s)
+            }
+        }
+        Ok(o) => Err(format!(
+            "clangd 探测失败（{}）: {}",
+            target.label(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("ssh 调用失败: {e}")),
+    }
+}
+
+/// 通过 SSH 启动 clangd（stdio 即 LSP 通道）。
+pub fn spawn_clangd_remote(target: &RemoteTarget) -> std::io::Result<Child> {
+    let script = format!("{}exec \"$CLANGD\" {CLANGD_ARGS}", CLANGD_RESOLVER);
+    let (program, argv) = target.shell_argv(&script);
+    let mut cmd = Command::new(&program);
+    cmd.args(&argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.spawn()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +377,34 @@ mod tests {
         assert!(!WSL_EXE.is_empty());
         #[cfg(windows)]
         assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+    }
+
+    #[test]
+    fn ssh_spawn_builds_ssh_argv_with_clangd_script() {
+        let target = RemoteTarget::ssh("fubin", "192.168.77.6", 22);
+        let (program, argv) = target.shell_argv(&format!("exec clangd {}", CLANGD_ARGS));
+        assert!(program.ends_with("ssh"));
+        assert!(argv.contains(&"fubin@192.168.77.6".to_string()));
+        let last = argv.last().unwrap();
+        assert!(last.starts_with("bash -l -c '"));
+        assert!(last.contains("clangd"));
+        // 解析器要在 PATH 之外也找得到常见 LLVM 安装位置。
+        assert!(CLANGD_RESOLVER.contains("/usr/lib/llvm-*/bin/clangd"));
+    }
+
+    /// 真实 SSH 验收：探测不会挂住，且结果要么给出 clangd 路径、要么给出明确原因。
+    ///
+    /// `cargo test -p ide-lsp ssh_probe_clangd -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "需要一台可免密登录的 SSH 主机（LITEIDE_SSH_TEST_HOST/USER）"]
+    async fn ssh_probe_clangd_reports_path_or_clear_error() {
+        let user = std::env::var("LITEIDE_SSH_TEST_USER").unwrap_or_else(|_| "fubin".to_string());
+        let host = std::env::var("LITEIDE_SSH_TEST_HOST")
+            .unwrap_or_else(|_| "192.168.77.6".to_string());
+        let target = RemoteTarget::ssh(user, host, 22);
+        match probe_clangd_remote(&target).await {
+            Ok(path) => assert!(path.ends_with("clangd"), "应返回 clangd 路径: {path}"),
+            Err(e) => assert!(e.contains("clangd"), "错误应说明 clangd 缺失: {e}"),
+        }
     }
 }

@@ -27,6 +27,16 @@ pub struct AppSettings {
     pub remote_distro: Option<String>,
     /// 远程工作区的 POSIX 路径（如 `/home/work/proj`）；与 `remote_distro` 成对出现。
     pub remote_path: Option<String>,
+    /// 远程连接种类：`"wsl"` / `"ssh"`。
+    ///
+    /// 旧配置文件里没有这个字段（且只有 `remote_distro`），按 WSL 处理。
+    pub remote_kind: Option<String>,
+    /// SSH 主机名 / IP（`remote_kind == "ssh"` 时使用）。
+    pub ssh_host: Option<String>,
+    /// SSH 用户名（免密登录用的那个用户）。
+    pub ssh_user: Option<String>,
+    /// SSH 端口（0 表示未设置，按 22 处理）。
+    pub ssh_port: u16,
     /// 鼠标滚轮方向：
     /// - `"normal"`：滚轮向下 = 看到更后面的内容（VS Code 行为）；
     /// - `"reversed"`：与上面相反。
@@ -46,6 +56,10 @@ impl Default for AppSettings {
             show_breadcrumbs: true,
             remote_distro: None,
             remote_path: None,
+            remote_kind: None,
+            ssh_host: None,
+            ssh_user: None,
+            ssh_port: ide_core::remote::DEFAULT_SSH_PORT,
             mouse_scroll_direction: "normal".to_string(),
         }
     }
@@ -55,6 +69,45 @@ impl AppSettings {
     /// 滚轮方向是否反转（`"reversed"` = 反向）。
     pub fn scroll_reversed(&self) -> bool {
         self.mouse_scroll_direction.trim().eq_ignore_ascii_case("reversed")
+    }
+
+    /// 当前应该使用的远程目标（`None` = 本地工作区）。
+    ///
+    /// - `remote_kind == "ssh"`：需要用户名 + 主机（端口 0 按 22 算）；
+    /// - 其余情况（含旧配置里只有 `remote_distro` 的）：按 WSL 处理，需要发行版名。
+    ///
+    /// `remote_path` 必须存在：只选主机不选目录不算连上工作区。
+    pub fn remote_target(&self) -> Option<ide_core::remote::RemoteTarget> {
+        let path = self.remote_path.as_deref()?.trim();
+        if path.is_empty() {
+            return None;
+        }
+        let kind = self
+            .remote_kind
+            .as_deref()
+            .map(|k| k.trim().to_ascii_lowercase());
+        if kind.as_deref() == Some("ssh") {
+            let user = self.ssh_user.as_deref()?.trim();
+            let host = self.ssh_host.as_deref()?.trim();
+            if user.is_empty() || host.is_empty() {
+                return None;
+            }
+            return Some(ide_core::remote::RemoteTarget::ssh(
+                user,
+                host,
+                self.ssh_port,
+            ));
+        }
+        let distro = self.remote_distro.as_deref()?.trim();
+        if distro.is_empty() {
+            return None;
+        }
+        Some(ide_core::remote::RemoteTarget::wsl(distro))
+    }
+
+    /// 状态栏/菜单里的远程标签（未连接为 `None`）。
+    pub fn remote_label(&self) -> Option<String> {
+        self.remote_target().map(|t| t.label())
     }
 
     /// 配置文件绝对路径。
@@ -72,20 +125,21 @@ impl AppSettings {
     }
 
     /// 读取配置：文件不存在/损坏时返回默认值并附警告信息（不 panic）。
+    ///
+    /// 解析失败也返回文件的 mtime：热重载靠 mtime 判断「外部改过没有」，
+    /// 返回 `None` 会让损坏的配置文件被当成「每帧都变」，从而每帧重新加载。
     pub fn load() -> (AppSettings, Option<SystemTime>) {
         let path = Self::config_path();
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         match std::fs::read_to_string(&path) {
             Ok(raw) => match serde_json::from_str::<AppSettings>(&raw) {
-                Ok(s) => {
-                    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                    (s, mtime)
-                }
+                Ok(s) => (s, mtime),
                 Err(e) => {
                     tracing::warn!("settings.json 解析失败({e})，使用默认设置: {}", path.display());
-                    (AppSettings::default(), None)
+                    (AppSettings::default(), mtime)
                 }
             },
-            Err(_) => (AppSettings::default(), None),
+            Err(_) => (AppSettings::default(), mtime),
         }
     }
 
@@ -154,6 +208,77 @@ mod tests {
     }
 
     #[test]
+    fn remote_target_ssh_and_legacy_wsl() {
+        use ide_core::remote::RemoteTarget;
+
+        let mut s = AppSettings::default();
+        assert!(s.remote_target().is_none(), "默认是本地工作区");
+
+        // 旧配置：只有发行版 + 路径 ⇒ WSL。
+        s.remote_distro = Some("Ubuntu2404".to_string());
+        assert!(s.remote_target().is_none(), "没有路径不算连接");
+        s.remote_path = Some("/home/fubin/work/candanza".to_string());
+        assert_eq!(
+            s.remote_target(),
+            Some(RemoteTarget::wsl("Ubuntu2404")),
+            "legacy 配置按 WSL 处理"
+        );
+        assert_eq!(s.remote_label().as_deref(), Some("WSL: Ubuntu2404"));
+
+        // SSH：需要用户名 + 主机；端口 0 按 22 算。
+        s.remote_kind = Some("ssh".to_string());
+        s.ssh_host = Some("192.168.77.6".to_string());
+        assert!(s.remote_target().is_none(), "缺用户名不算连接");
+        s.ssh_user = Some("fubin".to_string());
+        s.ssh_port = 0;
+        assert_eq!(
+            s.remote_target(),
+            Some(RemoteTarget::ssh("fubin", "192.168.77.6", 22))
+        );
+        assert_eq!(s.remote_label().as_deref(), Some("SSH: fubin@192.168.77.6"));
+
+        // kind 大小写/空格不敏感；端口原样保留。
+        s.remote_kind = Some(" SSH ".to_string());
+        s.ssh_port = 2222;
+        assert_eq!(
+            s.remote_target(),
+            Some(RemoteTarget::ssh("fubin", "192.168.77.6", 2222))
+        );
+
+        // 显式回到 WSL：即使 ssh_* 还留着也不影响。
+        s.remote_kind = Some("wsl".to_string());
+        assert_eq!(
+            s.remote_target(),
+            Some(RemoteTarget::wsl("Ubuntu2404"))
+        );
+    }
+
+    #[test]
+    fn remote_kind_survives_json_roundtrip() {
+        let s = AppSettings {
+            remote_kind: Some("ssh".to_string()),
+            ssh_host: Some("h".to_string()),
+            ssh_user: Some("u".to_string()),
+            ssh_port: 2200,
+            remote_path: Some("/home/u/p".to_string()),
+            ..AppSettings::default()
+        };
+        let raw = serde_json::to_string(&s).unwrap();
+        let back: AppSettings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back, s);
+        // 旧 JSON（无 remote_kind）仍能解析成 WSL 连接。
+        let legacy: AppSettings = serde_json::from_str(
+            r#"{"remote_distro":"Debian","remote_path":"/home/x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.remote_target(),
+            Some(ide_core::remote::RemoteTarget::wsl("Debian"))
+        );
+    }
+
+
+    #[test]
     fn scroll_direction_defaults_to_normal_and_can_be_inverted() {
         let mut s = AppSettings::default();
         assert!(!s.scroll_reversed(), "默认应与 VS Code 一致");
@@ -196,7 +321,8 @@ mod tests {
         std::fs::write(&path, "{ not json !!!").unwrap();
         let (s, mtime) = AppSettings::load();
         assert_eq!(s, AppSettings::default());
-        assert!(mtime.is_none());
+        // 记住 mtime 才不会让热重载每帧重试同一个坏文件。
+        assert!(mtime.is_some(), "损坏文件也应记住 mtime");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -221,6 +347,22 @@ mod tests {
         let (s, _) = AppSettings::load();
         assert_eq!(s.font_size, 16.0);
         assert_eq!(s.theme, "C/C++ Dark"); // 缺失字段回退默认
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 损坏的 JSON 不能导致「每帧重新加载」：mtime 必须被记住。
+    #[test]
+    fn corrupt_settings_reloads_only_when_file_changes() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = temp_config_dir("corrupt-hot");
+        std::env::set_var("LITEIDE_CONFIG_DIR", &dir);
+        let path = AppSettings::config_path();
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let (mut s, mtime) = AppSettings::load();
+        assert_eq!(s, AppSettings::default());
+        assert!(mtime.is_some(), "损坏文件也要记住 mtime");
+        let mut guard = mtime;
+        assert!(!s.hot_reload(&mut guard), "内容没变时不应重复热重载");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

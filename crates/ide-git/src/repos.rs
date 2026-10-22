@@ -78,16 +78,16 @@ pub fn repo_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// 在 WSL（远程工作区）里查找 git 仓库。
+/// 在远端（WSL 发行版 / SSH 主机）里查找 git 仓库。
 ///
 /// 远程工作区是 POSIX 路径，Windows 侧无法直接遍历，
-/// 因此在 WSL 里跑一条 `find`（一次调用，不逐目录往返）。
-pub fn discover_repos_wsl(root: &str, distro: &str) -> Vec<String> {
+/// 因此在远端跑一条 `find`（一次调用，不逐目录往返）。
+pub fn discover_repos_remote(root: &str, target: &ide_core::remote::RemoteTarget) -> Vec<String> {
     let script = format!(
         "cd {} && find . -maxdepth 2 -name .git -prune -print 2>/dev/null",
         crate::process::shell_quote(root)
     );
-    let Ok(out) = crate::process::run_wsl_blocking(distro, &script) else {
+    let Ok(out) = crate::process::run_remote_blocking(target, &script) else {
         return Vec::new();
     };
     let mut repos = Vec::new();
@@ -96,7 +96,7 @@ pub fn discover_repos_wsl(root: &str, distro: &str) -> Vec<String> {
         "cd {} && git rev-parse --show-toplevel 2>/dev/null",
         crate::process::shell_quote(root)
     );
-    if let Ok(toplevel) = crate::process::run_wsl_blocking(distro, &head_script) {
+    if let Ok(toplevel) = crate::process::run_remote_blocking(target, &head_script) {
         let t = toplevel.trim();
         if !t.is_empty() {
             repos.push(t.to_string());
@@ -120,6 +120,11 @@ pub fn discover_repos_wsl(root: &str, distro: &str) -> Vec<String> {
         }
     }
     repos
+}
+
+/// 兼容旧接口：在指定 WSL 发行版里查找仓库。
+pub fn discover_repos_wsl(root: &str, distro: &str) -> Vec<String> {
+    discover_repos_remote(root, &ide_core::remote::RemoteTarget::wsl(distro))
 }
 
 #[cfg(test)]

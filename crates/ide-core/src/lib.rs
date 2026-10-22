@@ -2,6 +2,7 @@
 pub mod buffer;
 pub mod diagnostics;
 pub mod highlight;
+pub mod remote;
 pub mod theme;
 
 pub use buffer::Buffer;

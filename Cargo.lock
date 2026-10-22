@@ -1763,6 +1763,7 @@ name = "ide-git"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ide-core",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1788,6 +1789,7 @@ dependencies = [
 name = "ide-remote"
 version = "0.1.0"
 dependencies = [
+ "ide-core",
  "portable-pty",
  "tracing",
 ]
@@ -1797,6 +1799,7 @@ name = "ide-search"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ide-core",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

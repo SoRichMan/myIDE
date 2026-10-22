@@ -13,7 +13,8 @@ use crate::client::{GdbClient, GdbEvent, GdbEvents, DEFAULT_TIMEOUT};
 use crate::command as cmd;
 use crate::mi::{MiValue, StoppedFrame};
 use crate::path::{win_to_wsl, wsl_to_win};
-use crate::process::{pick_wsl_distro, probe_gdb, spawn_gdb, using_custom_command};
+use crate::process::{pick_wsl_distro, probe_gdb, probe_gdb_remote, spawn_gdb, spawn_gdb_remote, using_custom_command};
+use ide_core::remote::RemoteTarget;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -160,6 +161,8 @@ pub struct DapManager {
     cmd_tx: mpsc::UnboundedSender<Command>,
     ev_rx: std::sync::mpsc::Receiver<Event>,
     status: Arc<Mutex<DapStatus>>,
+    /// SSH 远程目标：设置后 gdb 走 `ssh`，而不是本机 WSL。
+    target: Arc<Mutex<Option<RemoteTarget>>>,
     rt: Option<tokio::runtime::Runtime>,
     seq: u64,
 }
@@ -175,6 +178,7 @@ impl DapManager {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Event>();
         let status = Arc::new(Mutex::new(DapStatus::Off));
+        let target: Arc<Mutex<Option<RemoteTarget>>> = Arc::new(Mutex::new(None));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("dap-worker")
@@ -182,15 +186,17 @@ impl DapManager {
             .build()
             .expect("tokio runtime 启动失败");
         let status_c = status.clone();
+        let target_c = target.clone();
         let ev_tx_c = ev_tx.clone();
         rt.spawn(async move {
-            session_loop(cmd_rx, ev_tx_c, status_c).await;
+            session_loop(cmd_rx, ev_tx_c, status_c, target_c).await;
         });
         let _ = ev_tx;
         Self {
             cmd_tx,
             ev_rx,
             status,
+            target,
             rt: Some(rt),
             seq: 0,
         }
@@ -199,6 +205,13 @@ impl DapManager {
     /// 当前状态（状态栏直接读）。
     pub fn status(&self) -> DapStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    /// 切换 gdb 的远端目标（`None` = 回到原来的 WSL 自动探测）。
+    ///
+    /// 调试会话每次都从 `Start` 重新探测，所以这里只记住目标即可。
+    pub fn set_remote_target(&mut self, target: Option<RemoteTarget>) {
+        *self.target.lock().unwrap() = target;
     }
 
     /// 拉取一个事件（每帧调用一次，非阻塞）。
@@ -295,6 +308,8 @@ impl Drop for DapManager {
 struct SessionState {
     ui_tx: std::sync::mpsc::Sender<Event>,
     status: Arc<Mutex<DapStatus>>,
+    /// SSH 远程目标（`None` = 沿用原来的 WSL 自动探测）。
+    target: Arc<Mutex<Option<RemoteTarget>>>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     breakpoints: Vec<BreakpointInfo>,
     watches: Vec<String>,
@@ -308,14 +323,24 @@ enum ReadyOutcome {
     Exit,
 }
 
+/// 这一轮 gdb 跑在哪里。
+enum Transport {
+    /// WSL 发行版（`None` 仅出现在 `LITEIDE_GDB_CMD` 覆盖模式）。
+    Wsl(Option<String>),
+    /// SSH 主机。
+    Ssh(RemoteTarget),
+}
+
 async fn session_loop(
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     ui_tx: std::sync::mpsc::Sender<Event>,
     status: Arc<Mutex<DapStatus>>,
+    target: Arc<Mutex<Option<RemoteTarget>>>,
 ) {
     let mut st = SessionState {
         ui_tx,
         status,
+        target,
         cmd_rx,
         breakpoints: Vec::new(),
         watches: Vec::new(),
@@ -350,7 +375,28 @@ async fn session_loop(
         st.binary_wsl = Some(binary_wsl.clone());
 
         // ---- 探测环境（LITEIDE_GDB_CMD 覆盖时跳过，测试用） ----
-        let distro = if !using_custom_command() {
+        let wanted = st.target.lock().unwrap().clone();
+        let transport = if using_custom_command() {
+            tracing::info!("使用 LITEIDE_GDB_CMD 覆盖启动命令（跳过远端探测）");
+            Transport::Wsl(None)
+        } else if let Some(t) = wanted.filter(|t| t.is_ssh()) {
+            set_status(&st, DapStatus::Starting);
+            match probe_gdb_remote(&t).await {
+                Ok(path) => tracing::info!("{} gdb at {path}", t.label()),
+                Err(e) => {
+                    tracing::warn!("gdb probe failed: {e}");
+                    set_status(
+                        &st,
+                        DapStatus::Unavailable(ide_core::diagnostics::tool_missing_on(
+                            &t, "gdb", &e,
+                        )),
+                    );
+                    just_crashed = true;
+                    continue;
+                }
+            }
+            Transport::Ssh(t)
+        } else {
             set_status(&st, DapStatus::Starting);
             let Some(d) = pick_wsl_distro().await else {
                 set_status(&st, DapStatus::Unavailable(ide_core::diagnostics::wsl_missing()));
@@ -369,15 +415,16 @@ async fn session_loop(
                     continue;
                 }
             }
-            Some(d)
-        } else {
-            tracing::info!("使用 LITEIDE_GDB_CMD 覆盖启动命令（跳过 WSL 探测）");
-            None
+            Transport::Wsl(Some(d))
         };
 
         // ---- 启动 gdb 并初始化 ----
         set_status(&st, DapStatus::Starting);
-        let child = match spawn_gdb(distro.as_deref().unwrap_or("mock")) {
+        let spawned = match &transport {
+            Transport::Ssh(t) => spawn_gdb_remote(t),
+            Transport::Wsl(d) => spawn_gdb(d.as_deref().unwrap_or("mock")),
+        };
+        let child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 set_status(&st, DapStatus::Unavailable(format!("启动 gdb 失败: {e}")));
@@ -1016,6 +1063,7 @@ mod tests {
         let mut st = SessionState {
             ui_tx: std::sync::mpsc::channel().0,
             status: Arc::new(Mutex::new(DapStatus::Off)),
+            target: Arc::new(Mutex::new(None)),
             cmd_rx: mpsc::unbounded_channel().1,
             breakpoints: Vec::new(),
             watches: Vec::new(),

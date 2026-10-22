@@ -114,7 +114,7 @@ E:\TestDeepSeek\
 └── target\release\liteide.exe  9.68 MB
 ```
 
-## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第十六轮 VS Code 风格的源代码管理面板 CHANGES + GRAPH）
+## 当前状态：阶段 6 + 后续复核轮次已完成 ✅（阶段 1-6 全部交付；最近一轮 = 第二十四轮 SSH 远程后端，WSL 连接保持不变）
 
 ### 已交付
 
@@ -1777,6 +1777,79 @@ GRAPH
 
 - `tab_title_does_not_overlap_close_button`：悬停时标题右边缘 ≤ 叉叉左边缘；
 - `tab_close_button_only_shows_on_hover`：不悬停不画叉叉，悬停才画。
+
+---
+
+## 第二十四轮：SSH 远程后端（WSL 之外新增的连接方式）（2026-10-22）
+
+用户要求：**除了 WSL 连接以外，再增加一个 SSH 远程的功能**，目标 `fubin@192.168.77.6`、
+工程根 `/home/fubin/work/candanza`，WSL 现有行为不能动。
+
+做法：把「远程」抽象成 `RemoteTarget`，WSL / SSH 只是两种传输；文件、集成终端、git、rg、
+clangd、gdb、Ctrl+P 索引全部共用同一套上层逻辑（**没有**给 SSH 单写一条代码路径）。
+
+### 抽象层（`crates/ide-core/src/remote.rs`）
+
+- `RemoteTarget::{Wsl{Distro}, Ssh{user,host,port}}`，`wsl()` / `ssh()` 构造（端口 0 按 22）、
+  `label()`（`WSL: Ubuntu2404` / `SSH: fubin@192.168.77.6`）、
+  `shell_argv` / `exec_argv` / `interactive_argv` / `terminal_argv`；
+- SSH 非交互：`ssh -T -p <port> -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new`；
+  交互（终端、要输密码、首次确认指纹）：`ssh -t ...`（不带 BatchMode）；
+- 远端脚本统一是 `bash -l -c <shell_quote(script)>`（WSL 是 `wsl.exe -d <distro> --exec bash -l -c <script>`），
+  远端只收到**一个** argv，引号在本地就处理干净；
+- 进程级注册表 `set_current_target` / `current_target` / `ssh_target_for_path`：`ide-git` / `ide-search`
+  只拿得到根路径，靠它决定用 `wsl.exe` 还是 `ssh`；**只有「当前目标是 SSH 且根是 POSIX 路径」才走 SSH**，
+  Windows 盘符工程维持原来的 WSL 行为。
+
+### 各层改动
+
+- `ide-remote`：`RemoteFs` / `RemoteTerminal` 改成吃 `RemoteTarget`，沿用原来的持久 agent 协议
+  （TAB 分隔 + base64 参数），握手失败带上 stderr 尾巴，「连不上」与「超时」分开报；
+- `ide-ui`：`Connect to Host… (SSH)` 从占位变成可点 → `draw_ssh_dialog`（用户 / 主机 / 端口 / 目录 + 子目录浏览 /
+  Up / Refresh / Connect）；设置新增 `remote_kind`（`"wsl"`/`"ssh"`）、`ssh_host`、`ssh_user`、`ssh_port`，
+  **旧配置没有 `remote_kind` 但有 `remote_distro` 时仍按 WSL 处理**；状态栏显示完整标签；
+  断开连接会清掉 `remote_kind`；设置热重载发现目标变了会自动换工作区；
+- `ide-ui/src/fileindex.rs`：Ctrl+P 索引在远端跑一条 `find`（照样排掉 `.git` / `build*` / `out` /
+  `CMakeFiles` / `node_modules`），后台进程带 `CREATE_NO_WINDOW`，不弹黑框；
+- `ide-lsp` / `ide-dap`：`Transport::{Wsl, Ssh}`，探测与启动按目标分派；远端工具用 shell 片段解析
+  （`command -v` → `/usr/lib/llvm-*/bin`、devtoolset 等常见目录），clangd 参数、gdb `-q -nx` 不变；
+- `ide-dap/src/path.rs`：`win_to_wsl` 对**已经是 POSIX 的路径原样透传**（SSH 工程的程序路径本来就是
+  `/home/...`，再按盘符规则重写会变成不存在的 `/mnt/...`）；
+- `ide-core/src/diagnostics.rs`：新增 `tool_missing_on(&target, ...)`，SSH 上缺 clangd/gdb 时不再提示
+  「WSL / `scripts/setup-wsl.sh`」，改成「在远端用 yum/apt 安装」。
+
+### 顺手修掉的两个真 bug
+
+1. `settings.json` 解析失败时 `load()` 返回 `mtime = None`，热重载把它当成「每帧都变」→ **每帧重新加载并刷日志**；
+   现在坏文件也记住 mtime（文件真被改了才重试）；
+2. SSH 对话框原来每敲一个字符就重连一次（主机名打到一半会连十几次，每次最长等 10s）；
+   改成只有 Enter / Refresh / Connect 才发起连接。
+
+### 验收（真机，CentOS 7 / 192.168.77.6）
+
+该机免密登录；远端 PATH 里有 devtoolset-9 的 gdb、`/home/fubin/opt/git/bin/git`、
+`~/.cache/opencode/bin/rg`（ripgrep 15.1.0，CentOS 7 可用）。
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --workspace` | ✅ 全绿（ide-ui 162 个用例；SSH 真机用例默认 `#[ignore]`） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 warning |
+| 会话往返（`ide-remote`） | ✅ `ssh_session_roundtrip`：建目录 / 写 / 读 / 列目录 |
+| 集成终端 | ✅ `ssh_terminal_runs_commands`：PTY、颜色、退出码 |
+| git + 仓库发现 | ✅ `ssh_remote_git_and_repo_discovery`（`rev-parse --show-toplevel` == 工程根） |
+| rg 文件 + 内容搜索 | ✅ `ssh_remote_search`（rg 不在 PATH 里，靠解析器找到；`--files` / `--json` 都通） |
+| Ctrl+P 文件索引 | ✅ `ssh_file_index_lists_remote_sources`（2051 个文件，build / .git 已排除） |
+| clangd 探测 | ⚠️ `ssh_probe_clangd_reports_path_or_clear_error`：远端**没装 clangd**，状态栏给出明确原因与远端安装建议（接线正确，缺的是工具） |
+| gdb 探测 | ✅ `ssh_probe_gdb_finds_binary`（`/opt/rh/devtoolset-9/root/usr/bin/gdb`） |
+| GUI 冷启动 | ✅ 带 SSH `settings.json` 启动 exe：`LSP root: /home/fubin/work/candanza -> file:///home/...`，Detecting → Unavailable，30s 无崩溃 |
+
+### 本轮已知边界
+
+- SSH 只走**免密**（BatchMode）：要输密码的场景只有集成终端 / 外部终端能弹提示，探测类调用会直接报错；
+- 首次连接的主机指纹用 `StrictHostKeyChecking=accept-new` 自动接受（与 VS Code Remote-SSH 默认一致）；
+- LSP 需要远端自己装 clangd（CentOS 7 可装 llvm-toolset / clang-tools-extra，或编译后放进 PATH）；
+- DAP 只验到「gdb 探测 + 路径映射」，**没有**在远端完整跑一场调试会话；
+- 远端会话是持久 agent（一个 ssh 进程 + 一个 bash），掉线后下一次操作自动重连；没有端口转发 / 隧道功能。
 
 ---
 

@@ -1,12 +1,14 @@
-//! WSL 内 PTY 终端：一个 `wsl.exe -d <distro> --cd <posix>` 进程 + ConPTY。
+//! 远端 PTY 终端：一个 `wsl.exe -d <distro> --cd <posix>`（WSL）或
+//! `ssh -t ... user@host 'cd <posix> && exec bash -l'`（SSH）进程 + ConPTY。
 //!
 //! 集成终端（编辑区下方 Split 出来的面板）用的就是这里：`portable-pty` 在 Windows 上
-//! 走 ConPTY，WSL 里拿到的是真正的 Linux tty（有提示符、行编辑、颜色、Ctrl+C、vim/top
+//! 走 ConPTY，远端拿到的是真正的 Linux tty（有提示符、行编辑、颜色、Ctrl+C、vim/top
 //! 这类全屏程序也能跑），而不是拿管道接一个非交互 bash。
 //!
 //! 读写都在后台线程里：PTY 输出可能很快（`cmake` 一屏一屏刷），UI 线程只做
 //! `try_recv` 非阻塞排空，绝不在这里等 IO。
 
+use ide_core::remote::{shell_quote, wsl_exe, RemoteTarget};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -19,53 +21,87 @@ pub struct TermOutput {
     pub exited: bool,
 }
 
-/// 在 WSL 里跑一个交互式 shell 的常驻 PTY 会话。
+/// 在远端跑一个交互式 shell 的常驻 PTY 会话。
 ///
 /// 生命周期：
-/// - [`WslTerminal::spawn`] 建 PTY 并拉起 `wsl.exe`；
-/// - 后台线程持续把 PTY 输出送进 channel，UI 线程用 [`WslTerminal::drain`] 非阻塞取；
-/// - [`WslTerminal::write`] 送键盘输入；
-/// - [`WslTerminal::resize`] 跟随面板尺寸（WSL 里的程序会收到 SIGWINCH）；
-/// - drop / [`WslTerminal::kill`] 结束进程。
-pub struct WslTerminal {
+/// - [`RemoteTerminal::spawn`] 建 PTY 并拉起 `wsl.exe` / `ssh`；
+/// - 后台线程持续把 PTY 输出送进 channel，UI 线程用 [`RemoteTerminal::drain`] 非阻塞取；
+/// - [`RemoteTerminal::write`] 送键盘输入；
+/// - [`RemoteTerminal::resize`] 跟随面板尺寸（远端程序会收到 SIGWINCH）；
+/// - drop / [`RemoteTerminal::kill`] 结束进程。
+pub struct RemoteTerminal {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     rx: Receiver<TermOutput>,
-    distro: String,
+    target: RemoteTarget,
     cwd: String,
     cols: u16,
     rows: u16,
     exited: bool,
 }
 
-impl WslTerminal {
-    /// 在 `distro` 的 `posix_cwd` 目录下启动登录 shell。
+impl RemoteTerminal {
+    /// 在远端 `posix_cwd` 目录下启动登录 shell。
     ///
-    /// `TERM=xterm-256color` / `COLORTERM=truecolor` 让 WSL 里的程序输出 256 色 / 真彩色；
-    /// 其余环境变量来自 WSL 用户自己的登录环境（`wsl.exe` 负责）。
-    pub fn spawn(distro: &str, posix_cwd: &str, cols: u16, rows: u16) -> Result<Self, String> {
-        Self::spawn_with_args(distro, posix_cwd, cols, rows, &[])
+    /// `TERM=xterm-256color` / `COLORTERM=truecolor` 让远端程序输出 256 色 / 真彩色；
+    /// 其余环境变量来自远端用户自己的登录环境（`wsl.exe` / `ssh` + `bash -l` 负责）。
+    pub fn spawn(
+        target: &RemoteTarget,
+        posix_cwd: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self, String> {
+        Self::spawn_with_args(target, posix_cwd, cols, rows, &[])
     }
 
-    /// 同 [`spawn`](Self::spawn)，但给 `wsl.exe` 追加参数。
+    /// 同 [`spawn`](Self::spawn)，但给最终 shell 追加参数。
     ///
-    /// 默认启动发行版的登录 shell（会加载 `.bashrc` 等）；测试或未来的自定义终端配置
-    /// 可以用它换成 `--exec bash --noprofile --norc -i` 这类干净 shell。
+    /// 默认启动登录 shell（会加载 `.bashrc` 等）；测试或未来的自定义终端配置
+    /// 可以用它换成 `--noprofile --norc -i` 这类干净 shell。
     pub fn spawn_with_args(
-        distro: &str,
+        target: &RemoteTarget,
         posix_cwd: &str,
         cols: u16,
         rows: u16,
         extra_args: &[&str],
     ) -> Result<Self, String> {
-        let distro = distro.trim();
-        if distro.is_empty() {
-            return Err("未指定 WSL 发行版".to_string());
+        if let RemoteTarget::Wsl { distro } = target {
+            if distro.trim().is_empty() {
+                return Err("未指定 WSL 发行版".to_string());
+            }
         }
         let cwd = crate::normalize_posix(posix_cwd);
         let cols = cols.max(2);
         let rows = rows.max(2);
+
+        let (program, args) = match target {
+            RemoteTarget::Wsl { distro } => {
+                // `--cd` 由 wsl.exe 自己切目录，不经过 shell。
+                let mut a: Vec<String> = vec![
+                    "-d".into(),
+                    distro.clone(),
+                    "--cd".into(),
+                    cwd.clone(),
+                ];
+                a.extend(extra_args.iter().map(|s| s.to_string()));
+                (wsl_exe(), a)
+            }
+            RemoteTarget::Ssh { .. } => {
+                let mut script = format!("cd {} && exec bash -l", shell_quote(&cwd));
+                if !extra_args.is_empty() {
+                    script.push(' ');
+                    script.push_str(
+                        &extra_args
+                            .iter()
+                            .map(|a| shell_quote(a))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+                target.interactive_argv(&script)
+            }
+        };
 
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -74,33 +110,32 @@ impl WslTerminal {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| format!("创建 WSL 终端失败: {e}"))?;
+            .map_err(|e| format!("创建远程终端失败: {e}"))?;
 
-        let mut cmd = CommandBuilder::new("wsl.exe");
-        cmd.args(["-d", distro, "--cd", cwd.as_str()]);
-        cmd.args(extra_args);
+        let mut cmd = CommandBuilder::new(&program);
+        cmd.args(&args);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
 
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| format!("启动 WSL 终端失败（{distro}）: {e}"))?;
+            .map_err(|e| format!("启动远程终端失败（{}）: {e}", target.label()))?;
         // slave 必须尽早释放：它一直开着的话 PTY 永远不会 EOF。
         drop(pair.slave);
 
         let mut reader = pair
             .master
             .try_clone_reader()
-            .map_err(|e| format!("读取 WSL 终端输出失败: {e}"))?;
+            .map_err(|e| format!("读取远程终端输出失败: {e}"))?;
         let writer = pair
             .master
             .take_writer()
-            .map_err(|e| format!("写入 WSL 终端失败: {e}"))?;
+            .map_err(|e| format!("写入远程终端失败: {e}"))?;
 
         let (tx, rx) = mpsc::channel::<TermOutput>();
         std::thread::Builder::new()
-            .name("wsl-pty-read".to_string())
+            .name("remote-pty-read".to_string())
             .spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -126,15 +161,18 @@ impl WslTerminal {
                     exited: true,
                 });
             })
-            .map_err(|e| format!("启动 WSL 终端读取线程失败: {e}"))?;
+            .map_err(|e| format!("启动远程终端读取线程失败: {e}"))?;
 
-        tracing::info!("[terminal] 启动 WSL PTY: {distro}:{cwd} ({cols}x{rows})");
+        tracing::info!(
+            "[terminal] 启动远程 PTY: {}:{cwd} ({cols}x{rows})",
+            target.label()
+        );
         Ok(Self {
             master: pair.master,
             child,
             writer,
             rx,
-            distro: distro.to_string(),
+            target: target.clone(),
             cwd,
             cols,
             rows,
@@ -178,11 +216,11 @@ impl WslTerminal {
             .and_then(|_| self.writer.flush())
             .map_err(|e| {
                 self.exited = true;
-                format!("写入 WSL 终端失败: {e}")
+                format!("写入远程终端失败: {e}")
             })
     }
 
-    /// 面板尺寸变化时同步给 PTY（WSL 里的程序收到 SIGWINCH 后会重排）。
+    /// 面板尺寸变化时同步给 PTY（远端程序收到 SIGWINCH 后会重排）。
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let cols = cols.max(2);
         let rows = rows.max(2);
@@ -207,8 +245,8 @@ impl WslTerminal {
         self.exited
     }
 
-    pub fn distro(&self) -> &str {
-        &self.distro
+    pub fn target(&self) -> &RemoteTarget {
+        &self.target
     }
 
     pub fn cwd(&self) -> &str {
@@ -226,7 +264,7 @@ impl WslTerminal {
     }
 }
 
-impl Drop for WslTerminal {
+impl Drop for RemoteTerminal {
     fn drop(&mut self) {
         if !self.exited {
             let _ = self.child.kill();
@@ -248,14 +286,15 @@ mod tests {
     #[test]
     #[ignore = "需要本机 WSL 发行版 Ubuntu2404"]
     fn wsl_terminal_runs_commands_and_reports_exit() {
+        let target = RemoteTarget::wsl(distro());
         // 用 `--norc` 的干净 shell：默认登录 shell 会加载用户的 `.bashrc`，
         // 里面可能有联网/隧道脚本，测试不能依赖那套环境。
-        let mut term = WslTerminal::spawn_with_args(
-            &distro(),
+        let mut term = RemoteTerminal::spawn_with_args(
+            &target,
             "/tmp",
             100,
             30,
-            &["--exec", "bash", "--noprofile", "--norc", "-i"],
+            &["--noprofile", "--norc", "-i"],
         )
         .expect("spawn");
         assert_eq!(term.dimensions(), (100, 30));
@@ -303,7 +342,7 @@ mod tests {
             "没收到命令输出，实际输出: {text:?}"
         );
 
-        // resize 不应报错，且终端宽度变化后 WSL 里的 `tput cols` 能读到新值。
+        // resize 不应报错，且终端宽度变化后远端 `tput cols` 能读到新值。
         term.resize(137, 40);
         std::thread::sleep(Duration::from_millis(200));
         term.write(b"printf 'COLS=%s\\n' \"$(tput cols)\"\r")
@@ -342,5 +381,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(exited, "`exit` 之后应报告进程退出");
+    }
+
+    /// 真实 SSH 终端验收（免密已配好才跑）：
+    /// `cargo test -p ide-remote ssh_terminal -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要一台可免密登录的 SSH 主机（LITEIDE_SSH_TEST_HOST/USER）"]
+    fn ssh_terminal_runs_commands() {
+        let user = std::env::var("LITEIDE_SSH_TEST_USER").unwrap_or_else(|_| "fubin".to_string());
+        let host = std::env::var("LITEIDE_SSH_TEST_HOST")
+            .unwrap_or_else(|_| "192.168.77.6".to_string());
+        let target = RemoteTarget::ssh(user, host, 22);
+        let mut term = RemoteTerminal::spawn(&target, "/tmp", 100, 30).expect("spawn ssh");
+
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(25);
+        term.write(b"echo SSH_PTY_$((40+2))\r").expect("write");
+        while Instant::now() < deadline {
+            let chunk = term.drain();
+            if chunk.bytes.windows(4).any(|w| w == b"\x1b[6n") {
+                term.write(b"\x1b[1;1R").expect("reply DSR");
+            }
+            out.extend_from_slice(&chunk.bytes);
+            if String::from_utf8_lossy(&out).contains("SSH_PTY_42") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            String::from_utf8_lossy(&out).contains("SSH_PTY_42"),
+            "SSH 终端没收到命令输出: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        term.kill();
     }
 }
