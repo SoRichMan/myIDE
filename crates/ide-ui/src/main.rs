@@ -440,6 +440,21 @@ struct CachedSymbols {
     at: Instant,
 }
 
+/// 标签标题的排版缓存（避免每帧重排 + 重截断）。
+#[derive(Default, Clone)]
+struct TabLabelCache {
+    /// 缓存对应的标题。
+    title: String,
+    /// 是不是预览标签（斜体）。
+    italic: bool,
+    /// 截断时用的可用宽度。
+    text_w: f32,
+    /// 标题的自然宽度（未截断）。
+    natural_w: f32,
+    /// 截断后的标题（带 `…`）；空 = 还没算过。
+    label: String,
+}
+
 /// 本地文件的修改时间（秒）+ 大小（字节）。拿不到就是 None。
 fn local_file_stamp(path: &std::path::Path) -> Option<(u64, u64)> {
     let md = std::fs::metadata(path).ok()?;
@@ -574,6 +589,8 @@ struct LiteIdeApp {
     applied_font: f32,
     applied_theme: ThemeKind,
     tabs: TabList,
+    /// 标签标题的排版缓存（按标签序号）。
+    tab_labels: Vec<TabLabelCache>,
     closed_tabs: Vec<Tab>,
     editor_clean_seq: u64,
     indent_hint: String,
@@ -831,6 +848,7 @@ impl LiteIdeApp {
             applied_font: 14.0,
             applied_theme,
             tabs,
+            tab_labels: Vec::new(),
             closed_tabs: Vec::new(),
             editor_clean_seq: 0,
             indent_hint,
@@ -5419,14 +5437,49 @@ impl LiteIdeApp {
             );
             ui.painter().layout_job(job)
         };
+        // 截断标题到指定宽度（放不下就加省略号）。
+        let truncate = |ui: &egui::Ui,
+                       title: &str,
+                       max_w: f32,
+                       color: egui::Color32,
+                       italic: bool|
+         -> String {
+            if layout_label(ui, title, color, italic).size().x <= max_w {
+                return title.to_string();
+            }
+            let mut n = title.chars().count();
+            while n > 1 {
+                n -= 1;
+                let mut s: String = title.chars().take(n).collect();
+                s.push('…');
+                if layout_label(ui, &s, color, italic).size().x <= max_w {
+                    return s;
+                }
+            }
+            "…".to_string()
+        };
+        // 排版结果缓存：标题宽度 + 截断后的文本。
+        // （原来每个标签每帧要排 3 次版，截断时还是 O(标题长度) 次。）
+        if self.tab_labels.len() != n {
+            self.tab_labels.resize_with(n, TabLabelCache::default);
+        }
+        for i in 0..n {
+            let preview = self.tabs.is_preview(i);
+            let changed = match (self.tabs.get(i), self.tab_labels.get(i)) {
+                (Some(t), Some(c)) => c.title != t.title || c.italic != preview,
+                _ => true,
+            };
+            if changed {
+                let title = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
+                let c = &mut self.tab_labels[i];
+                c.title = title;
+                c.italic = preview;
+                c.natural_w = layout_label(ui, &c.title, hex("#ffffff"), preview).size().x;
+                c.label.clear();
+            }
+        }
         // 每个标签按自己标题的自然宽度排（VS Code 语义）。
-        let label_ws: Vec<f32> = (0..n)
-            .map(|i| {
-                let text = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
-                let preview = self.tabs.is_preview(i);
-                layout_label(ui, &text, hex("#ffffff"), preview).size().x
-            })
-            .collect();
+        let label_ws: Vec<f32> = (0..n).map(|i| self.tab_labels[i].natural_w).collect();
         ui.horizontal(|ui| {
             ui.set_min_height(34.0);
             // 右侧要给 "N tabs" 留位置；总宽不够时标签等比压缩（不低于 TAB_MIN_W）。
@@ -5442,22 +5495,16 @@ impl LiteIdeApp {
                 };
                 let text_color = if active { hex("#ffffff") } else { hex("#999999") };
                 let bg = if active { hex(p.bg_editor) } else { egui::Color32::TRANSPARENT };
-                let title = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
                 // 「未保存」不再往标题里拼字符（那会挤占标题宽度），改成叉叉位上的圆点。
-                let mut label = title.clone();
-                // 太长就截断（标题不能被叉叉压住）
-                if layout_label(ui, &label, text_color, preview).size().x > text_w {
-                    let mut n = label.chars().count();
-                    while n > 1 {
-                        n -= 1;
-                        let mut s: String = label.chars().take(n).collect();
-                        s.push('…');
-                        if layout_label(ui, &s, text_color, preview).size().x <= text_w {
-                            label = s;
-                            break;
-                        }
+                // 截断结果走缓存：只有标题或可用宽度变了才重新排版。
+                let label: String = {
+                    let c = &mut self.tab_labels[i];
+                    if c.label.is_empty() || c.text_w != text_w {
+                        c.text_w = text_w;
+                        c.label = truncate(ui, &c.title, text_w, text_color, preview);
                     }
-                }
+                    c.label.clone()
+                };
                 // 自己画标签（不用 Button）：文字左对齐 + 右侧留出叉叉的位置。
                 // 注意：`allocate_exact_size` 只负责占位，**不做交互**，
                 // 所以还要 `ui.interact` 一次才有 hover / click。

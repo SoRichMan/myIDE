@@ -107,16 +107,31 @@ pub fn registry() -> &'static [CommandSpec] {
 
 /// 命令面板模糊过滤：按 `ide_search::fuzzy` 分数降序，取前 `limit` 条。
 pub fn filter_commands(query: &str, limit: usize) -> Vec<&'static CommandSpec> {
-    let mut scored: Vec<(u32, &'static CommandSpec)> = registry()
+    // 预拼好的检索串（分类 + 英文标题 + 中文标题）：命令面板每帧都要过滤，
+    // 每次现拼 = 79 个 String 分配/帧。
+    let haystacks = haystacks();
+    let mut scored: Vec<(u32, &'static CommandSpec)> = haystacks
         .iter()
-        .filter_map(|c| {
-            // 分类 + 英文标题 + 中文标题一起参与匹配，支持中英文查询。
-            let hay = format!("{} {} {}", c.category, c.title, c.zh);
-            ide_search::fuzzy::fuzzy_score(query, &hay).map(|s| (s, c))
-        })
+        .filter_map(|(c, hay)| ide_search::fuzzy::fuzzy_score(query, hay).map(|s| (s, *c)))
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(b.1.title)));
     scored.into_iter().take(limit).map(|(_, c)| c).collect()
+}
+
+/// 每条命令的检索串（进程内算一次）。
+fn haystacks() -> &'static [(&'static CommandSpec, String)] {
+    use std::sync::OnceLock;
+    static HAY: OnceLock<Vec<(&'static CommandSpec, String)>> = OnceLock::new();
+    HAY.get_or_init(|| {
+        registry()
+            .iter()
+            .map(|c| {
+                // 分类 + 英文标题 + 中文标题一起参与匹配，支持中英文查询。
+                let hay = format!("{} {} {}", c.category, c.title, c.zh);
+                (c, hay)
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]

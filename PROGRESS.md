@@ -2126,6 +2126,9 @@ egui 命中测试是「同一层里最后注册的控件赢」，如果遮罩单
 - `codicon_font()`：每画一个图标都 `String::new()` 一个字体族名 → 按字号缓存 `FontId`。
 - `cell_metrics()`：每帧排一遍 64 个字符的版 → 按字体缓存。
 - `filter_dir_entries`：改成不分配的大小写不敏感匹配（ASCII 快路径 + CJK 慢路径）。
+- **标签栏**：每个标签每帧要排 3 次版（截断时还是 O(标题长度) 次）→ 加
+  `TabLabelCache`（标题宽度 + 截断后的文本），只有标题/可用宽度变了才重排。
+- **命令面板**：每帧给 79 条命令各拼一个检索串 → 进程内预拼一次（`haystacks()`）。
 
 新增用例：`line_chars_and_chars_from_match_snapshot`、
 `contains_ignore_case_handles_ascii_and_cjk`、
@@ -2133,6 +2136,14 @@ egui 命中测试是「同一层里最后注册的控件赢」，如果遮罩单
 `perf_word_lookup_scales_with_line_not_file`（性能回归护栏）。
 
 `cargo test --workspace` 全绿（28 个 suite），clippy 0 warning。
+
+### 还没做的（留作后续）
+
+- 搜索结果树的**行模型**每帧重建（`build_search_rows`）：要改成「按索引引用结果集」
+  才能缓存，自引用借用不好处理，先留着（只在搜索面板打开时有开销）。
+- `text_advance()` 每次都要做一次真实 galley 排版（鼠标移动时最多 24 次/帧）：
+  可以给纯 ASCII 行走「等宽格数 × 格宽」的快路径。
+- `i.events.clone()`（每帧 5 次事件列表克隆）：量很小，先不动。
 
 ---
 
