@@ -5300,14 +5300,25 @@ impl LiteIdeApp {
                 if resp.middle_clicked() {
                     close = Some(i); // 中键 → 关闭（VS Code 习惯）
                 }
-                if resp.hovered() {
-                    let x = egui::Rect::from_center_size(
-                        egui::pos2(rect.right() - TAB_X_SLOT * 0.5, rect.center().y),
-                        egui::vec2(16.0, 16.0),
-                    );
-                    let hit = ui.interact(x, egui::Id::new(("tab_close", i)), egui::Sense::click());
+                // 关闭按钮：**必须无条件创建**，不能放在「标签 hover 时才画」的分支里。
+                // egui 的命中测试用的是**上一帧**的控件表：叉叉只在标签 hover 的帧存在时，
+                // 指针停在叉叉上会两帧一循环（标签 hover → 画叉叉；叉叉抢走 hover → 不画），
+                // 点击就有一半落在没有叉叉的帧上 —— 表现正是「点叉叉没反应」（SSH 下帧更慢更明显）。
+                // 可见性只影响绘制，不影响交互。
+                let x = egui::Rect::from_center_size(
+                    egui::pos2(rect.right() - TAB_X_SLOT * 0.5, rect.center().y),
+                    egui::vec2(16.0, 16.0),
+                );
+                let hit = ui
+                    .interact(x, egui::Id::new(("tab_close", i)), egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                // 可见性保持原样（只有悬停标签时才画），但交互永远在：
+                // 指针移到叉叉上时 `resp.hovered()` 会变成 false，靠 `hit.hovered()` 兜住，
+                // 否则叉叉会自己「闪没」，点击就丢了。
+                if resp.hovered() || hit.hovered() {
                     if hit.hovered() {
-                        ui.painter().rect_filled(x, 3.0, hex("#ffffff").gamma_multiply(0.1));
+                        ui.painter()
+                            .rect_filled(x, 3.0, hex("#ffffff").gamma_multiply(0.1));
                     }
                     draw_codicon(
                         ui.painter(),
@@ -5316,11 +5327,11 @@ impl LiteIdeApp {
                         Codicon::Close,
                         if hit.hovered() { hex("#ffffff") } else { hex("#999999") },
                     );
-                    if hit.clicked() {
-                        close = Some(i);
-                    }
-                    hit.on_hover_text("关闭标签");
                 }
+                if hit.clicked() {
+                    close = Some(i);
+                }
+                hit.on_hover_text("关闭标签");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let dirty = self.tabs.dirty_count();
@@ -10395,6 +10406,69 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_bar(ui));
         });
         assert!(has_close(&out), "悬停时应显示关闭按钮");
+    }
+
+    /// 点叉叉必须真的能关掉标签。
+    ///
+    /// 回归：叉叉曾经只在「标签 hover」的帧里创建，而 egui 的命中测试用的是**上一帧**
+    /// 控件表 —— 指针移到叉叉上后 `resp.hovered()` 变 false（叉叉抢走 hover），下一帧
+    /// 叉叉就不存在了，点击被丢到标签上，表现是「点叉叉没反应」。
+    #[test]
+    fn tab_close_button_click_closes_tab() {
+        let ctx = drawing_ctx();
+        let _ = ctx.run(probe_raw_input(), |_| {});
+        let mut app = test_app();
+        // 复现用户现场：SSH 工作区 + 远程文件按「预览标签」打开（标题斜体）。
+        app.settings.remote_kind = Some("ssh".to_string());
+        app.settings.ssh_user = Some("fubin".to_string());
+        app.settings.ssh_host = Some("192.168.77.6".to_string());
+        app.settings.remote_path = Some("/home/fubin/work/candanza".to_string());
+        assert!(app.is_remote());
+        while !app.tabs.is_empty() {
+            app.tabs.close(0);
+        }
+        app.open_file(
+            std::path::PathBuf::from("/home/fubin/work/candanza/src/FragmentSub.cpp"),
+            "int x;\n".to_string(),
+            true,
+        );
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.tabs.is_preview(0), "应是预览标签（和用户截图一致）");
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut input = probe_raw_input();
+            input.events = events;
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_bar(ui));
+            })
+        };
+        // 两帧 hover（第一帧只是把标签登记进控件表）。
+        for _ in 0..2 {
+            let _ = frame(vec![egui::Event::PointerMoved(egui::pos2(40.0, 17.0))]);
+        }
+        let out = frame(vec![egui::Event::PointerMoved(egui::pos2(40.0, 17.0))]);
+        let center = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text() == "\u{ea76}" => {
+                    Some(t.pos + t.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .expect("悬停标签时应画出关闭按钮");
+        // 指针移到叉叉上，按下 / 抬起。
+        for pressed in [true, false] {
+            let _ = frame(vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ]);
+        }
+        assert_eq!(app.tabs.len(), 0, "点击叉叉应关闭标签");
     }
 
     /// 悬停同一条提交时，详情请求只发一次（否则每帧都发 git 请求会拖垮整个队列）。
