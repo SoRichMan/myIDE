@@ -65,19 +65,25 @@ const TAB_ACTIVE_INDICATOR_H: f32 = 2.0;
 /// 标签页尺寸（egui points）。宽度按各自标题的**自然宽度**算（VS Code 就是这样），
 /// 只有整行放不下时才等比压缩 —— 之前是「所有标签等宽 = 最长标题」，
 /// 短标题（large.cpp）会白占一大片。
-const TAB_X_SLOT: f32 = 24.0; // 右侧给叉叉预留
-const TAB_PAD_X: f32 = 9.0; // 标题左右内边距
+/// 叉叉命中框（16×16）以及它到标签右边缘的余量。
+const TAB_CLOSE_W: f32 = 16.0;
+const TAB_CLOSE_MARGIN: f32 = 2.0;
+/// 标题右边缘到叉叉命中框左边缘的空隙。
+const TAB_GAP_X: f32 = 7.0;
+/// 标题右侧整块预留：空隙 + 叉叉 + 右边缘余量。
+const TAB_X_SLOT: f32 = TAB_GAP_X + TAB_CLOSE_W + TAB_CLOSE_MARGIN;
+const TAB_PAD_X: f32 = 9.0; // 标题左内边距
 const TAB_MIN_W: f32 = 80.0;
 const TAB_MAX_W: f32 = 340.0;
 /// 右侧 "N tabs" 计数的大致占位（先给标签算宽度时扣掉）。
 const TAB_BADGE_W: f32 = 110.0;
 
-/// 每个标签的宽度：自然宽度（标题 + 叉叉位 + 内边距）夹在 `[TAB_MIN_W, TAB_MAX_W]`；
+/// 每个标签的宽度：自然宽度（标题 + 左内边距 + 叉叉位）夹在 `[TAB_MIN_W, TAB_MAX_W]`；
 /// 整行放不下时等比压缩，但不低于 `TAB_MIN_W`（再不够就溢出，由裁剪处理）。
 fn tab_widths(label_widths: &[f32], avail: f32) -> Vec<f32> {
     let natural: Vec<f32> = label_widths
         .iter()
-        .map(|w| (w + TAB_X_SLOT + TAB_PAD_X * 2.0).clamp(TAB_MIN_W, TAB_MAX_W))
+        .map(|w| (w + TAB_PAD_X + TAB_X_SLOT).clamp(TAB_MIN_W, TAB_MAX_W))
         .collect();
     let total: f32 = natural.iter().sum();
     if total <= avail || total <= 0.0 {
@@ -5245,7 +5251,7 @@ impl LiteIdeApp {
             let widths = tab_widths(&label_ws, avail);
             for i in 0..n {
                 let tab_w = widths.get(i).copied().unwrap_or(TAB_MIN_W);
-                let text_w = (tab_w - TAB_X_SLOT - TAB_PAD_X * 2.0).max(20.0);
+                let text_w = (tab_w - TAB_PAD_X - TAB_X_SLOT).max(20.0);
                 let (dirty, active, preview) = {
                     let Some(t) = self.tabs.get(i) else { continue };
                     let preview = self.tabs.is_preview(i);
@@ -5330,8 +5336,11 @@ impl LiteIdeApp {
                 // 点击就有一半落在没有叉叉的帧上 —— 表现正是「点叉叉没反应」（SSH 下帧更慢更明显）。
                 // 可见性只影响绘制，不影响交互。
                 let x = egui::Rect::from_center_size(
-                    egui::pos2(rect.right() - TAB_X_SLOT * 0.5, rect.center().y),
-                    egui::vec2(16.0, 16.0),
+                    egui::pos2(
+                        rect.right() - TAB_CLOSE_MARGIN - TAB_CLOSE_W * 0.5,
+                        rect.center().y,
+                    ),
+                    egui::vec2(TAB_CLOSE_W, TAB_CLOSE_W),
                 );
                 let hit = ui
                     .interact(x, egui::Id::new(("tab_close", i)), egui::Sense::click())
@@ -10498,10 +10507,10 @@ mod tests {
     /// 标签宽度：短标题自己窄、长标题更宽；放不下时等比压缩，但不低于下限。
     #[test]
     fn tab_widths_follow_each_title() {
-        // 自然宽度 = 标题 + 叉叉位 + 左右内边距
+        // 自然宽度 = 标题 + 左内边距 + 右侧叉叉位
         let w = tab_widths(&[60.0, 140.0], 2000.0);
-        assert!((w[0] - (60.0 + TAB_X_SLOT + TAB_PAD_X * 2.0)).abs() < 0.01);
-        assert!((w[1] - (140.0 + TAB_X_SLOT + TAB_PAD_X * 2.0)).abs() < 0.01);
+        assert!((w[0] - (60.0 + TAB_PAD_X + TAB_X_SLOT)).abs() < 0.01);
+        assert!((w[1] - (140.0 + TAB_PAD_X + TAB_X_SLOT)).abs() < 0.01);
         assert!(
             w[0] < w[1],
             "短标题不应跟着最长标题一起变宽：{w:?}"
@@ -10509,7 +10518,7 @@ mod tests {
         // 极短标题有下限、超长标题有上限
         assert!((tab_widths(&[1.0], 2000.0)[0] - TAB_MIN_W).abs() < 0.01);
         assert!((tab_widths(&[5000.0], 2000.0)[0] - TAB_MAX_W).abs() < 0.01);
-        // 放不下：等比压缩（3 × 242 = 726 → 450，每格 150）
+        // 放不下：等比压缩（3 × 234 = 702 → 450，每格 150）
         let shrunk = tab_widths(&[200.0, 200.0, 200.0], 450.0);
         assert!(
             shrunk.iter().all(|w| (w - 150.0).abs() < 0.01),
