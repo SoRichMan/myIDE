@@ -566,6 +566,8 @@ struct LiteIdeApp {
     remote_dialog_path: String,
     /// 对话框当前目录下的子目录列表。
     remote_dialog_dirs: Vec<String>,
+    /// WSL 对话框最近一次连接/列目录的错误（连不上时直接显示在对话框里）。
+    remote_dialog_error: Option<String>,
     /// 「连接到 SSH 主机」对话框是否展开。
     ssh_dialog_open: bool,
     ssh_dialog_host: String,
@@ -767,6 +769,7 @@ impl LiteIdeApp {
             remote_dialog_distro: String::new(),
             remote_dialog_path: String::new(),
             remote_dialog_dirs: Vec::new(),
+            remote_dialog_error: None,
             ssh_dialog_open: false,
             ssh_dialog_host: String::new(),
             ssh_dialog_user: String::new(),
@@ -995,20 +998,24 @@ impl LiteIdeApp {
     /// 重置资源管理器并让 LSP 以新根重起、Git 换根。
     ///
     /// 返回是否连接成功（对话框据此决定关不关）。
-    fn connect_remote(&mut self, target: RemoteTarget, path: &str) -> bool {
+    /// 返回失败原因（对话框直接显示，不要只 flash 到状态栏——模态窗口挡着，
+    /// 用户看不到「为什么连不上」）。
+    fn connect_remote(&mut self, target: RemoteTarget, path: &str) -> Result<(), String> {
         let posix = normalize_posix(path);
         match self.remote.path_kind(&target, &posix) {
             Ok(PathKind::Dir) => {}
-            Ok(_) => {
-                self.flash(format!(
-                    "无法打开远程目录 {}:{posix}（不是目录或不存在）",
+            Ok(kind) => {
+                let msg = format!(
+                    "无法打开远程目录 {}:{posix}（不是目录或不存在，检测结果 {kind:?}）",
                     target.label()
-                ));
-                return false;
+                );
+                tracing::warn!("{msg}");
+                return Err(msg);
             }
             Err(e) => {
-                self.flash(format!("无法连接 {}：{e}", target.label()));
-                return false;
+                let msg = format!("无法连接 {}：{e}", target.label());
+                tracing::warn!("{msg}");
+                return Err(msg);
             }
         }
         match &target {
@@ -1032,7 +1039,7 @@ impl LiteIdeApp {
             "remote workspace: {}:{posix}（远端内部 POSIX 根）",
             target.label()
         );
-        true
+        Ok(())
     }
 
     /// 把当前设置里的远程目标同步给所有只拿根路径的模块。
@@ -6157,6 +6164,7 @@ impl LiteIdeApp {
         self.remote_dialog_path = normalize_posix(
             &self.settings.remote_path.clone().unwrap_or_else(|| "/home".to_string()),
         );
+        self.remote_dialog_error = None;
         self.refresh_remote_dialog_dirs();
         self.remote_dialog_open = true;
     }
@@ -6164,20 +6172,28 @@ impl LiteIdeApp {
     /// 重新枚举对话框里当前目录的子目录（在远端内部 `find`，不走 9P 视图）。
     fn refresh_remote_dialog_dirs(&mut self) {
         let posix = normalize_posix(&self.remote_dialog_path);
+        if self.remote_dialog_distro.trim().is_empty() {
+            self.remote_dialog_dirs.clear();
+            self.remote_dialog_error = Some("请先选择一个 WSL 发行版".to_string());
+            return;
+        }
         let target = RemoteTarget::wsl(self.remote_dialog_distro.clone());
-        let mut dirs: Vec<String> = self
-            .remote
-            .list_dir(&target, &posix)
-            .map(|entries| {
-                entries
+        match self.remote.list_dir(&target, &posix) {
+            Ok(entries) => {
+                let mut dirs: Vec<String> = entries
                     .into_iter()
                     .filter(|e| e.is_dir)
                     .map(|e| e.name)
-                    .collect()
-            })
-            .unwrap_or_default();
-        dirs.sort_by_key(|d| d.to_lowercase());
-        self.remote_dialog_dirs = dirs;
+                    .collect();
+                dirs.sort_by_key(|d| d.to_lowercase());
+                self.remote_dialog_dirs = dirs;
+                self.remote_dialog_error = None;
+            }
+            Err(e) => {
+                self.remote_dialog_dirs.clear();
+                self.remote_dialog_error = Some(e);
+            }
+        }
     }
 
     fn draw_remote_dialog(&mut self, ctx: &egui::Context) {
@@ -6193,6 +6209,7 @@ impl LiteIdeApp {
         let mut distro = self.remote_dialog_distro.clone();
         let mut path = self.remote_dialog_path.clone();
         let dirs = self.remote_dialog_dirs.clone();
+        let error = self.remote_dialog_error.clone();
         egui::Window::new("Connect to WSL")
             .open(&mut open)
             .collapsible(false)
@@ -6250,6 +6267,14 @@ impl LiteIdeApp {
                             }
                         }
                     });
+                if let Some(err) = &error {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(err)
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(0xf4, 0x87, 0x71)),
+                    );
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Connect").clicked() {
@@ -6285,8 +6310,9 @@ impl LiteIdeApp {
         if go {
             let distro = self.remote_dialog_distro.clone();
             let path = normalize_posix(&self.remote_dialog_path);
-            if self.connect_remote(RemoteTarget::wsl(distro), &path) {
-                self.remote_dialog_open = false;
+            match self.connect_remote(RemoteTarget::wsl(distro), &path) {
+                Ok(()) => self.remote_dialog_open = false,
+                Err(e) => self.remote_dialog_error = Some(e),
             }
         } else if cancel {
             self.remote_dialog_open = false;
@@ -6296,6 +6322,16 @@ impl LiteIdeApp {
     }
 
     // ================= 连接到 SSH 主机 =================
+
+    /// 用户名/主机没填全时的占位提示；填全后自动消失。
+    const SSH_DIALOG_NEED_USER_HOST: &'static str = "请先填写用户名和主机";
+
+    /// 填全用户名/主机后清掉占位提示（真正的连接错误要留到下一次操作）。
+    fn clear_ssh_placeholder_error(&mut self) {
+        if self.ssh_dialog_error.as_deref() == Some(Self::SSH_DIALOG_NEED_USER_HOST) {
+            self.ssh_dialog_error = None;
+        }
+    }
 
     /// 打开「Connect to SSH Host」对话框：主机 / 用户 / 端口 / 目录 + 子目录浏览。
     fn open_ssh_dialog(&mut self) {
@@ -6322,7 +6358,13 @@ impl LiteIdeApp {
             normalize_posix(&prefill.unwrap_or_else(|| "/home".to_string()));
         self.ssh_dialog_error = None;
         self.ssh_dialog_open = true;
-        self.refresh_ssh_dialog_dirs();
+        // 只有用户名/主机都已就绪才去连：否则一打开就报「请先填写…」，
+        // 用户填完以后这条旧错误还挂在那里，看起来像 Connect 没生效。
+        if self.ssh_dialog_target().is_some() {
+            self.refresh_ssh_dialog_dirs();
+        } else {
+            self.ssh_dialog_dirs.clear();
+        }
     }
 
     /// 对话框里填的 SSH 目标（用户名/主机没填全时返回 None）。
@@ -6338,7 +6380,7 @@ impl LiteIdeApp {
     /// 重新枚举 SSH 对话框里当前目录的子目录（一次 `find`，顺带验证连通性）。
     fn refresh_ssh_dialog_dirs(&mut self) {
         let Some(target) = self.ssh_dialog_target() else {
-            self.ssh_dialog_error = Some("请先填写用户名和主机".to_string());
+            self.ssh_dialog_error = Some(Self::SSH_DIALOG_NEED_USER_HOST.to_string());
             self.ssh_dialog_dirs.clear();
             return;
         };
@@ -6357,6 +6399,7 @@ impl LiteIdeApp {
             }
             Err(e) => {
                 self.ssh_dialog_dirs.clear();
+                tracing::warn!("列出远程目录失败（{}:{}）: {e}", target.label(), posix);
                 self.ssh_dialog_error = Some(e);
             }
         }
@@ -6387,17 +6430,23 @@ impl LiteIdeApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("User:").size(13.0));
-                    ui.add(
+                    let e = ui.add(
                         egui::TextEdit::singleline(&mut user)
                             .hint_text("fubin")
                             .desired_width(130.0),
                     );
+                    if e.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        refresh = true;
+                    }
                     ui.label(RichText::new("Host:").size(13.0));
-                    ui.add(
+                    let e = ui.add(
                         egui::TextEdit::singleline(&mut host)
                             .hint_text("192.168.77.6")
                             .desired_width(150.0),
                     );
+                    if e.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        refresh = true;
+                    }
                     ui.label(RichText::new("Port:").size(13.0));
                     ui.add(
                         egui::DragValue::new(&mut port)
@@ -6424,12 +6473,18 @@ impl LiteIdeApp {
                     }
                 });
                 ui.add_space(4.0);
+                let ready = !user.trim().is_empty() && !host.trim().is_empty();
                 egui::ScrollArea::vertical()
                     .max_height(230.0)
                     .show(ui, |ui| {
                         if dirs.is_empty() {
+                            let hint = if ready {
+                                "（无子目录 / 连接失败）"
+                            } else {
+                                "（填好用户名和主机后点 Refresh 或 Browse）"
+                            };
                             ui.label(
-                                RichText::new("（无子目录 / 连接失败）")
+                                RichText::new(hint)
                                     .size(12.0)
                                     .color(hex("#8c8c8c")),
                             );
@@ -6475,6 +6530,9 @@ impl LiteIdeApp {
         self.ssh_dialog_user = user;
         self.ssh_dialog_port = port;
         self.ssh_dialog_path = path;
+        if self.ssh_dialog_target().is_some() {
+            self.clear_ssh_placeholder_error();
+        }
 
         if up {
             let cur = normalize_posix(&self.ssh_dialog_path);
@@ -6502,12 +6560,13 @@ impl LiteIdeApp {
             let target = self.ssh_dialog_target();
             let path = normalize_posix(&self.ssh_dialog_path);
             match target {
-                Some(t) => {
-                    if self.connect_remote(t, &path) {
-                        self.ssh_dialog_open = false;
-                    }
+                Some(t) => match self.connect_remote(t, &path) {
+                    Ok(()) => self.ssh_dialog_open = false,
+                    Err(e) => self.ssh_dialog_error = Some(e),
+                },
+                None => {
+                    self.ssh_dialog_error = Some(Self::SSH_DIALOG_NEED_USER_HOST.to_string());
                 }
-                None => self.ssh_dialog_error = Some("请先填写用户名和主机".to_string()),
             }
         } else if cancel {
             self.ssh_dialog_open = false;
@@ -8691,6 +8750,65 @@ mod tests {
         )));
         // 本机盘符路径仍然按本地处理（SSH 不影响本地文件）。
         assert!(!app.is_remote_path(std::path::Path::new(r"E:\proj\a.cpp")));
+    }
+
+    /// 真实 SSH 验收：对话框里填完用户名/主机后，目录列表能读出来（这是 Connect 的前置条件）。
+    ///
+    /// `cargo test -p ide-ui ssh_dialog_lists_remote_directories -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要一台可免密登录的 SSH 主机（LITEIDE_SSH_TEST_HOST/USER）"]
+    fn ssh_dialog_lists_remote_directories() {
+        let host = std::env::var("LITEIDE_SSH_TEST_HOST")
+            .unwrap_or_else(|_| "192.168.77.6".to_string());
+        let user = std::env::var("LITEIDE_SSH_TEST_USER").unwrap_or_else(|_| "fubin".to_string());
+        let mut app = test_app();
+        app.ssh_dialog_user = user;
+        app.ssh_dialog_host = host;
+        app.ssh_dialog_port = 22;
+        app.ssh_dialog_path = "/home/fubin/work".to_string();
+        assert!(app.ssh_dialog_target().is_some());
+        app.refresh_ssh_dialog_dirs();
+        assert_eq!(app.ssh_dialog_error, None);
+        assert!(
+            app.ssh_dialog_dirs.iter().any(|d| d == "candanza"),
+            "应能列出 candanza: {:?}",
+            app.ssh_dialog_dirs
+        );
+    }
+
+    /// 真实 SSH 验收：连不上时 `connect_remote` 要把原因带回来（对话框直接显示）。
+    #[test]
+    #[ignore = "需要一台可免密登录的 SSH 主机（LITEIDE_SSH_TEST_HOST/USER）"]
+    fn ssh_connect_remote_returns_error_for_refused_host() {
+        let mut app = test_app();
+        // 本机没有 2222 端口：ssh 会立刻 Connection refused。
+        let target = RemoteTarget::ssh("fubin", "127.0.0.1", 2222);
+        let err = app
+            .connect_remote(target, "/home")
+            .expect_err("连不上应该返回错误");
+        assert!(err.contains("无法连接"), "错误应说明连不上: {err}");
+    }
+
+    /// 真实 SSH 验收：对话框填的东西一路通到工作区（路径校验 + 设置落盘 + 换根）。
+    #[test]
+    #[ignore = "需要一台可免密登录的 SSH 主机（LITEIDE_SSH_TEST_HOST/USER）"]
+    fn ssh_connect_remote_switches_workspace() {
+        let host = std::env::var("LITEIDE_SSH_TEST_HOST")
+            .unwrap_or_else(|_| "192.168.77.6".to_string());
+        let user = std::env::var("LITEIDE_SSH_TEST_USER").unwrap_or_else(|_| "fubin".to_string());
+        let root = std::env::var("LITEIDE_SSH_TEST_ROOT")
+            .unwrap_or_else(|_| "/home/fubin/work/candanza".to_string());
+        let mut app = test_app();
+        app.connect_remote(RemoteTarget::ssh(user, host, 22), &root)
+            .expect("应能连上测试主机");
+        assert!(app.is_remote());
+        assert_eq!(app.workspace_root(), root);
+        assert_eq!(
+            app.remote_target().map(|t| t.label()).as_deref(),
+            Some("SSH: fubin@192.168.77.6")
+        );
+        app.disconnect_remote();
+        assert!(!app.is_remote());
     }
 
     /// 远程根切换会让 LSP 换根（clangd 重启到新根），而不是继续用旧根。

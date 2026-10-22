@@ -1843,6 +1843,27 @@ clangd、gdb、Ctrl+P 索引全部共用同一套上层逻辑（**没有**给 SS
 | gdb 探测 | ✅ `ssh_probe_gdb_finds_binary`（`/opt/rh/devtoolset-9/root/usr/bin/gdb`） |
 | GUI 冷启动 | ✅ 带 SSH `settings.json` 启动 exe：`LSP root: /home/fubin/work/candanza -> file:///home/...`，Detecting → Unavailable，30s 无崩溃 |
 
+### 补丁（同日）：Connect 失败必须能看见原因
+
+用户反馈：对话框里 User/Host/Folder 都填好了，点 Connect 没反应，红色错误还挂着「请先填写用户名和主机」。
+
+根因两条：
+
+1. `connect_remote` 失败时只 `flash` 到状态栏 —— 模态窗口挡着、几秒又消失，等于什么都没说；
+2. 对话框里的错误是**打开那一刻**（字段还空着）留下的占位文案，从来没被清掉，看起来像「按键没生效」。
+
+改法：
+
+- `connect_remote` 返回 `Result<(), String>`，WSL / SSH 两个对话框各自把失败原因**就地显示**（WSL 对话框也补了错误行）；
+- 打开对话框时字段没填全就**不预连**、也不写占位错误；填全后占位错误自动消失；
+- User / Host 输入框里按回车 = Refresh（不必先摸到 Browse）；
+- 空列表提示分两种：没填全 → 「填好用户名和主机后点 Refresh 或 Browse」，填全但读不到 → 「无子目录 / 连接失败」；
+- 失败同时 `tracing::warn!`，`RUST_LOG=info` 能看到完整原因（含 ssh 的 stderr 尾巴）。
+
+新增 3 个真机守护用例：`ssh_dialog_lists_remote_directories`（列目录）、
+`ssh_connect_remote_returns_error_for_refused_host`（连不上要把原因带回来）、
+`ssh_connect_remote_switches_workspace`（连接成功 → 换根 → 断开回本地），全部通过。
+
 ### 本轮已知边界
 
 - SSH 只走**免密**（BatchMode）：要输密码的场景只有集成终端 / 外部终端能弹提示，探测类调用会直接报错；
