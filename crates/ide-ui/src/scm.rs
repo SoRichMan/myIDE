@@ -117,25 +117,23 @@ impl RepoState {
         self.status.branch.as_deref()
     }
 
-    /// 已暂存文件。
-    pub fn staged_files(&self) -> Vec<GitEntry> {
+    /// 已暂存文件（**借用**，不克隆：未跟踪文件多的仓库能有几千条）。
+    pub fn staged_files(&self) -> Vec<&GitEntry> {
         self.status
             .entries
             .iter()
             .filter(|e| !matches!(e.staged, '.' | ' ' | '?' | 'N'))
-            .cloned()
             .collect()
     }
 
-    /// 未暂存 + 未跟踪文件。
-    pub fn unstaged_files(&self) -> Vec<GitEntry> {
+    /// 未暂存 + 未跟踪文件（借用，不克隆）。
+    pub fn unstaged_files(&self) -> Vec<&GitEntry> {
         self.status
             .entries
             .iter()
             .filter(|e| {
                 !matches!(e.worktree, '.' | ' ' | 'N') || e.staged == '?' || e.worktree == '?'
             })
-            .cloned()
             .collect()
     }
 }
@@ -689,26 +687,29 @@ impl ScmPanel {
 
         // ---- 文件分组 ----
         ui.add_space(4.0);
-        let staged = repos[idx].staged_files();
-        let unstaged = repos[idx].unstaged_files();
+        // 先算条数（借用，不克隆几千条 GitEntry），再改展开状态，最后取列表来画。
+        let staged_len = repos[idx].staged_files().len();
+        let unstaged_len = repos[idx].unstaged_files().len();
 
-        if !staged.is_empty() {
+        if staged_len > 0 {
             let open = repos[idx].expanded_staged;
-            let (o, changed) = group_header(ui, "暂存的更改", staged.len(), open);
+            let (o, changed) = group_header(ui, "暂存的更改", staged_len, open);
             repos[idx].expanded_staged = if changed { !open } else { o };
             if repos[idx].expanded_staged {
+                let staged = repos[idx].staged_files();
                 self.draw_file_list(ui, idx, &staged, true, actions);
             }
         }
-        if !unstaged.is_empty() {
+        if unstaged_len > 0 {
             let open = repos[idx].expanded_unstaged;
-            let (o, changed) = group_header(ui, "更改", unstaged.len(), open);
+            let (o, changed) = group_header(ui, "更改", unstaged_len, open);
             repos[idx].expanded_unstaged = if changed { !open } else { o };
             if repos[idx].expanded_unstaged {
+                let unstaged = repos[idx].unstaged_files();
                 self.draw_file_list(ui, idx, &unstaged, false, actions);
             }
         }
-        if staged.is_empty() && unstaged.is_empty() {
+        if staged_len == 0 && unstaged_len == 0 {
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
                 ui.label(RichText::new("工作区干净").size(12.0).color(hex(FG_DIM)));
@@ -997,7 +998,7 @@ impl ScmPanel {
         &mut self,
         ui: &mut egui::Ui,
         idx: usize,
-        files: &[GitEntry],
+        files: &[&GitEntry],
         staged: bool,
         actions: &mut Vec<Action>,
     ) {

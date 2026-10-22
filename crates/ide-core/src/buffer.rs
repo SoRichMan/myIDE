@@ -71,6 +71,21 @@ impl Buffer {
         self.rope.line(clamped).to_string()
     }
 
+    /// 第 `idx` 行的**字符迭代器**（不分配）。
+    ///
+    /// 高频路径（悬停取词、括号配对）用它代替 `line()`：后者每次都复制一行。
+    pub fn line_chars(&self, idx: usize) -> impl Iterator<Item = char> + '_ {
+        let n = self.line_count();
+        let clamped = idx.min(n.saturating_sub(1));
+        self.rope.line(clamped).chars()
+    }
+
+    /// 从 `char_idx` 开始的字符迭代器（不分配）。
+    pub fn chars_from(&self, char_idx: usize) -> impl Iterator<Item = char> + '_ {
+        let start = char_idx.min(self.len_chars());
+        self.rope.slice(start, self.len_chars()).chars()
+    }
+
     /// 字符索引 → `(行, 列)`。
     pub fn char_to_line_col(&self, char_idx: usize) -> (usize, usize) {
         let clamped = char_idx.min(self.len_chars());
@@ -185,6 +200,19 @@ impl Buffer {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// `line_chars` / `chars_from`：不分配的行/字符迭代器。
+    #[test]
+    fn line_chars_and_chars_from_match_snapshot() {
+        let b = Buffer::from_text("ab\ncdé\nf");
+        assert_eq!(b.line_chars(0).collect::<String>(), "ab\n");
+        assert_eq!(b.line_chars(1).collect::<String>(), "cdé\n");
+        assert_eq!(b.line_chars(9).collect::<String>(), "f");
+        assert_eq!(b.chars_from(0).collect::<String>(), "ab\ncdé\nf");
+        assert_eq!(b.chars_from(3).collect::<String>(), "cdé\nf");
+        // 越界要夹住，不能 panic。
+        assert_eq!(b.chars_from(9999).count(), 0);
+    }
 
     #[test]
     fn basic_insert_delete_and_undo_redo() {

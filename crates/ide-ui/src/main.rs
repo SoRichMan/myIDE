@@ -46,6 +46,12 @@ const JUMP_STACK_CAP: usize = 100;
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// 文件内容缓存条目上限（超出后按插入顺序淘汰最旧的）。
 const FILE_CACHE_CAP: usize = 64;
+/// 文件内容缓存的**字节**预算（超过就淘汰最旧的）。
+///
+/// 按条数算的话，64 个 2MB 的文件就是 128MB 常驻内存；轻量优先，按字节封顶。
+const FILE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// 文档符号缓存的条目上限（每个条目是一棵符号树，内存占用不小）。
+const FILE_SYMBOLS_CAP: usize = 32;
 /// 关闭标签的恢复栈上限。
 const CLOSED_TAB_CAP: usize = 10;
 /// Ctrl+P 结果默认显示多少条（再多就点「显示更多」）。
@@ -448,6 +454,8 @@ fn local_file_stamp(path: &std::path::Path) -> Option<(u64, u64)> {
 struct LiteIdeApp {
     editor: Option<editor::Editor>,
     status_line: Arc<str>,
+    /// 状态栏文本的「键」（光标位置 / 行数 / 加载耗时）：变了才重算状态栏文本。
+    status_key: (usize, usize, usize, u128),
     // ---- LSP ----
     lsp: LspManager,
     lsp_started: bool,
@@ -499,6 +507,11 @@ struct LiteIdeApp {
     dap: DapManager,
     dap_status: DapStatus,
     ui_breakpoints: Vec<BreakpointSpec>,
+    /// 断点列表的版本号（每次改动 +1）：给「每帧同步到编辑器」做快路径判断。
+    ui_bp_rev: u64,
+    /// 上次同步给编辑器的断点所属文件 / 版本号。
+    bp_synced_path: Option<PathBuf>,
+    bp_synced_rev: u64,
     dap_breakpoints: Vec<ide_dap::manager::BreakpointInfo>,
     dap_variables: Vec<VarNode>,
     dap_watches: Vec<(String, String)>,
@@ -538,6 +551,8 @@ struct LiteIdeApp {
     file_picker_focus: bool,
     content_query: String,
     content_results: Vec<SearchMatch>,
+    /// 搜索结果里命中的文件数（结果到达时算好，别每帧建 HashSet）。
+    content_file_count: usize,
     pending_search_seq: Option<u64>,
     /// 下一帧把焦点交给侧栏搜索输入框（Ctrl+Shift+F 时）。
     content_search_focus: bool,
@@ -546,6 +561,10 @@ struct LiteIdeApp {
     scm: scm::ScmPanel,
     /// 启动时是否已按 `LITEIDE_OPEN_SCM` 打开过 SCM 视图。
     scm_opened_at_start: bool,
+    /// `LITEIDE_OPEN_SCM` 环境变量（启动时读一次，别每帧查环境变量）。
+    open_scm_at_start: bool,
+    /// 上次检查设置热重载的时间（节流：每帧一次 stat 太浪费）。
+    settings_checked_at: Instant,
     // ---- 阶段 5：设置 / 多标签 / 命令面板 / 视图 ----
     /// 扩展宿主：启动时激活内置扩展，注册表供界面查询语言/配色。
     host: ExtensionHost,
@@ -717,6 +736,7 @@ impl LiteIdeApp {
             editor.set_highlighter(host.registry().create_highlighter(&p.to_string_lossy()));
         }
         let status_line: Arc<str> = editor.status_text().into();
+        let status_key = editor.status_key();
         let current_file = path.clone();
         let current_uri = current_file
             .as_ref()
@@ -732,6 +752,7 @@ impl LiteIdeApp {
         let mut app = Self {
             editor: Some(editor),
             status_line,
+            status_key,
             lsp: LspManager::new(),
             lsp_started: false,
             lsp_status: LspStatus::Off,
@@ -765,6 +786,9 @@ impl LiteIdeApp {
             dap: DapManager::new(),
             dap_status: DapStatus::Off,
             ui_breakpoints: Vec::new(),
+            ui_bp_rev: 0,
+            bp_synced_path: None,
+            bp_synced_rev: 0,
             dap_breakpoints: Vec::new(),
             dap_variables: Vec::new(),
             dap_watches: Vec::new(),
@@ -792,11 +816,14 @@ impl LiteIdeApp {
             file_picker_focus: false,
             content_query: String::new(),
             content_results: Vec::new(),
+            content_file_count: 0,
             pending_search_seq: None,
             content_search_focus: false,
             debug_open: false,
             scm: scm::ScmPanel::default(),
             scm_opened_at_start: false,
+            open_scm_at_start: std::env::var("LITEIDE_OPEN_SCM").is_ok(),
+            settings_checked_at: Instant::now(),
             host,
             settings,
             config_mtime,
@@ -997,21 +1024,30 @@ impl LiteIdeApp {
         }
     }
 
-    /// 存一份文件内容进缓存（超出上限就淘汰最旧的）。
+    /// 存一份文件内容进缓存（超出预算就淘汰最旧的）。
     fn store_file_cache(&mut self, path: &std::path::Path, text: &str) {
         let Some((mtime, size)) = local_file_stamp(path) else {
             return;
         };
-        if self.file_cache.len() >= FILE_CACHE_CAP {
-            // HashMap 无序：随便丢一个最旧的（用写入时间最小的那条）。
-            if let Some(oldest) = self
+        // 预算按**字节**算：按条数算的话，64 个 2MB 的文件就是 128MB 常驻。
+        let mut total: usize = self.file_cache.values().map(|v| v.text.len()).sum();
+        let new_len = text.len();
+        if new_len > FILE_CACHE_BYTES {
+            // 单个文件就超预算：不缓存。
+            return;
+        }
+        while total + new_len > FILE_CACHE_BYTES || self.file_cache.len() >= FILE_CACHE_CAP {
+            // HashMap 无序：丢一个最旧的（写入时间最小的那条）。
+            let Some(oldest) = self
                 .file_cache
                 .iter()
                 .min_by_key(|(_, v)| v.at)
-                .map(|(k, _)| k.clone())
-            {
-                self.file_cache.remove(&oldest);
-            }
+                .map(|(k, v)| (k.clone(), v.text.len()))
+            else {
+                break;
+            };
+            total = total.saturating_sub(oldest.1);
+            self.file_cache.remove(&oldest.0);
         }
         self.file_cache.insert(
             path.to_path_buf(),
@@ -1204,6 +1240,7 @@ impl LiteIdeApp {
         self.explorer_rows.clear();
         self.explorer_expanded.clear();
         self.content_results.clear();
+        self.content_file_count = 0;
         let root = self.workspace_root();
         self.search.load_files(&root);
         self.ensure_file_index();
@@ -1383,6 +1420,21 @@ impl LiteIdeApp {
         Ok(())
     }
 
+    /// 记下一个刚关掉的标签（供「重新打开已关闭的标签」）。
+    ///
+    /// 内存友好：**只保留脏标签的正文**（未保存的内容必须留着）；
+    /// 干净的标签正文可以从磁盘重读，没必要在内存里留着整份文件。
+    fn remember_closed_tab(&mut self, mut tab: Tab) {
+        if !tab.dirty {
+            tab.text.clear();
+            tab.text.shrink_to_fit();
+        }
+        self.closed_tabs.push(tab);
+        if self.closed_tabs.len() > CLOSED_TAB_CAP {
+            self.closed_tabs.remove(0);
+        }
+    }
+
     /// 关闭指定标签（脏标签弹确认，返回是否真正关闭）。
     fn close_tab_at(&mut self, idx: usize) -> bool {
         if idx >= self.tabs.len() {
@@ -1397,10 +1449,7 @@ impl LiteIdeApp {
             }
             CloseResult::Closed => {
                 if let Some(t) = tab {
-                    self.closed_tabs.push(t);
-                    if self.closed_tabs.len() > CLOSED_TAB_CAP {
-                        self.closed_tabs.remove(0);
-                    }
+                    self.remember_closed_tab(t);
                 }
                 self.confirm_close = None;
                 self.reload_active_editor();
@@ -1421,10 +1470,7 @@ impl LiteIdeApp {
             }
             CloseResult::Closed => {
                 if let Some(t) = tab {
-                    self.closed_tabs.push(t);
-                    if self.closed_tabs.len() > CLOSED_TAB_CAP {
-                        self.closed_tabs.remove(0);
-                    }
+                    self.remember_closed_tab(t);
                 }
                 self.reload_active_editor();
             }
@@ -1683,6 +1729,7 @@ impl LiteIdeApp {
                             match result {
                                 Ok(syms) => {
                                     // 进缓存：切回这个文件时直接复用。
+                                    self.prune_file_symbols();
                                     self.file_symbols.insert(
                                         uri.clone(),
                                         CachedSymbols {
@@ -1713,8 +1760,31 @@ impl LiteIdeApp {
         }
     }
 
-    /// 同步当前文件的文档符号（大纲 / 符号搜索）。
+    /// 清理过期的文档符号缓存。
     ///
+    /// 每个条目是一整棵符号树（一个 C++ 头文件能到几百 KB），
+    /// 开着几十个文件就是几十 MB 常驻 —— 超过上限就丢最旧的。
+    fn prune_file_symbols(&mut self) {
+        if self.file_symbols.len() < FILE_SYMBOLS_CAP {
+            return;
+        }
+        // 先按 TTL 清一遍，再按条数上限丢最旧的。
+        let ttl = CACHE_TTL;
+        self.file_symbols.retain(|_, v| v.at.elapsed() < ttl);
+        while self.file_symbols.len() >= FILE_SYMBOLS_CAP {
+            let Some(oldest) = self
+                .file_symbols
+                .iter()
+                .min_by_key(|(_, v)| v.at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.file_symbols.remove(&oldest);
+        }
+    }
+
+    /// 同步当前文件的文档符号（大纲 / 符号搜索）。
     /// 优先用缓存：文件没被改过（编辑序列号一致）且缓存没过 TTL，就直接复用，
     /// 省掉一次 clangd 的 documentSymbol 解析。
     fn request_symbols_for(&mut self, uri: &str) {
@@ -1734,28 +1804,36 @@ impl LiteIdeApp {
     }
 
     fn sync_document(&mut self) {
-        if self.lsp_status.is_ready() {
-            let Some(uri) = self.current_uri.clone() else {
-                return;
-            };
-            if !self.lsp_ready_synced {
-                if let Some(ed) = &self.editor {
-                    self.lsp
-                        .open_document(uri.clone(), ed.text(), self.doc_version);
-                    self.request_symbols_for(&uri);
-                }
-                self.lsp_ready_synced = true;
-                self.last_sync_seq = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
-            } else if let Some(ed) = &self.editor {
-                let seq_now = ed.edit_seq();
-                if seq_now != self.last_sync_seq {
-                    self.doc_version = self.doc_version.saturating_add(1);
-                    self.lsp.change_document(uri, ed.text(), self.doc_version);
-                    self.last_sync_seq = seq_now;
-                }
+        if !self.lsp_status.is_ready() {
+            if self.lsp_ready_synced {
+                self.lsp_ready_synced = false;
             }
-        } else if self.lsp_ready_synced {
-            self.lsp_ready_synced = false;
+            return;
+        }
+        let need_open = !self.lsp_ready_synced;
+        let seq_now = self.editor.as_ref().map(|e| e.edit_seq()).unwrap_or(0);
+        let changed = seq_now != self.last_sync_seq;
+        if !need_open && !changed {
+            return; // 稳态：什么都不用发，也不必克隆 uri
+        }
+        // 只在真的要发消息时才取 uri（每帧克隆一次 String 没意义）。
+        let Some(uri) = self.current_uri.clone() else {
+            return;
+        };
+        let Some(ed) = &self.editor else {
+            return;
+        };
+        if need_open {
+            self.lsp
+                .open_document(uri.clone(), ed.text(), self.doc_version);
+            self.request_symbols_for(&uri);
+            self.lsp_ready_synced = true;
+            self.last_sync_seq = seq_now;
+        } else {
+            self.doc_version = self.doc_version.saturating_add(1);
+            self.lsp
+                .change_document(uri, ed.text(), self.doc_version);
+            self.last_sync_seq = seq_now;
         }
     }
 
@@ -1956,10 +2034,16 @@ impl LiteIdeApp {
             .find(|b| b.file_win == spec.file_win && b.line == spec.line)
             .cloned();
         match same {
-            Some(_) => self.ui_breakpoints.retain(|b| {
-                !(b.file_win == spec.file_win && b.line == spec.line)
-            }),
-            None => self.ui_breakpoints.push(spec.clone()),
+            Some(_) => {
+                self.ui_breakpoints.retain(|b| {
+                    !(b.file_win == spec.file_win && b.line == spec.line)
+                });
+                self.ui_bp_rev = self.ui_bp_rev.wrapping_add(1);
+            }
+            None => {
+                self.ui_breakpoints.push(spec.clone());
+                self.ui_bp_rev = self.ui_bp_rev.wrapping_add(1);
+            }
         }
         if self.dap_interactive() {
             self.dap.toggle_breakpoint(spec);
@@ -1968,10 +2052,17 @@ impl LiteIdeApp {
 
     /// 当前文件断点行号（1-based），同步给编辑器行号栏画红点。
     fn sync_editor_breakpoints(&mut self) {
+        // 每帧都跑，但绝大多数帧「文件没变 + 断点没变」→ 直接返回，
+        // 省掉每帧一次路径克隆 + 断点行号收集。
+        if self.current_file == self.bp_synced_path && self.ui_bp_rev == self.bp_synced_rev {
+            return;
+        }
         let Some(cur) = self.current_file.clone() else {
             if let Some(ed) = &mut self.editor {
                 ed.set_breakpoints(Vec::new());
             }
+            self.bp_synced_path = None;
+            self.bp_synced_rev = self.ui_bp_rev;
             return;
         };
         let cur = cur.to_string_lossy().into_owned();
@@ -1984,6 +2075,8 @@ impl LiteIdeApp {
         if let Some(ed) = &mut self.editor {
             ed.set_breakpoints(lines);
         }
+        self.bp_synced_path = self.current_file.clone();
+        self.bp_synced_rev = self.ui_bp_rev;
     }
 
     fn on_debug_next(&mut self) {
@@ -2050,6 +2143,7 @@ impl LiteIdeApp {
                 }
                 DebugPanelAction::RemoveUiBreakpoint(idx) => {
                     self.ui_breakpoints.remove(idx);
+                    self.ui_bp_rev = self.ui_bp_rev.wrapping_add(1);
                 }
             }
         }
@@ -2059,19 +2153,21 @@ impl LiteIdeApp {
         let mut actions: Vec<DebugPanelAction> = Vec::new();
         let status = self.dap_status.clone();
         let session_active = !matches!(status, DapStatus::Off | DapStatus::Unavailable(_));
-        let dap_bps = self.dap_breakpoints.clone();
-        let ui_bps = self.ui_breakpoints.clone();
+        // 借用而不是克隆：原来每帧把整个调试状态（栈、变量、监视、控制台 400 行）
+        // 深拷贝一遍。这里先「借走」，画完还回去。
+        let dap_bps = std::mem::take(&mut self.dap_breakpoints);
+        let ui_bps = std::mem::take(&mut self.ui_breakpoints);
         let bps_len = if session_active {
             dap_bps.len()
         } else {
             ui_bps.len()
         };
-        let stack = self.dap_stack.clone();
-        let locals = self.dap_variables.clone();
-        let watches = self.dap_watches.clone();
-        let children_map = self.dap_children.clone();
-        let expanded = self.dap_expanded.clone();
-        let console = self.dap_console.clone();
+        let stack = std::mem::take(&mut self.dap_stack);
+        let locals = std::mem::take(&mut self.dap_variables);
+        let watches = std::mem::take(&mut self.dap_watches);
+        let children_map = std::mem::take(&mut self.dap_children);
+        let expanded = std::mem::take(&mut self.dap_expanded);
+        let console = std::mem::take(&mut self.dap_console);
         let watch_input = &mut self.dap_watch_input;
         let ptype_input = &mut self.dap_ptype_input;
 
@@ -2318,6 +2414,15 @@ impl LiteIdeApp {
                             });
                     });
             });
+        // 借走的调试状态还回去（动作在之后应用，顺序不能反）。
+        self.dap_breakpoints = dap_bps;
+        self.ui_breakpoints = ui_bps;
+        self.dap_stack = stack;
+        self.dap_variables = locals;
+        self.dap_watches = watches;
+        self.dap_children = children_map;
+        self.dap_expanded = expanded;
+        self.dap_console = console;
         self.apply_debug_actions(actions);
     }
 
@@ -2755,7 +2860,9 @@ impl LiteIdeApp {
         // 列表的滚动偏移（自己维护，见下面「结果列表」的说明）。
         let mut picker_scroll = self.file_picker_scroll;
         let dir = self.file_picker_dir.clone();
-        let entries = self.file_picker_entries.clone();
+        // 目录条目不克隆（原来每帧克隆整个目录列表：几千个 String）。
+        // 借用一下，窗口画完放回去。
+        let entries = std::mem::take(&mut self.file_picker_entries);
         // 工作区模糊搜索结果（文件名 + 相对路径 + 命中位置）。
         // 一次最多算 20 条（`PICKER_PAGE`），要更多再点「显示更多」。
         let limit = if self.file_picker_expanded {
@@ -2968,6 +3075,8 @@ impl LiteIdeApp {
                         });
                 }
             });
+        // 借用的目录条目放回去（不克隆）。
+        self.file_picker_entries = entries;
         self.file_picker_open = open && !esc;
         self.file_picker_focus = want_focus;
         // 查询词变了就重新收起（「显示更多」只对当前查询有效）。
@@ -3304,11 +3413,7 @@ impl LiteIdeApp {
         let searching = self.pending_search_seq.is_some();
         {
             let results = &self.content_results;
-            let file_count = results
-                .iter()
-                .map(|m| m.file.as_str())
-                .collect::<HashSet<_>>()
-                .len();
+            let file_count = self.content_file_count;
 
             // VS Code：一条消息行「N 个结果 - 在编辑器中打开」，紧贴上面的「⋯」行
             // （`.messages { margin-top: -5px }` 会压掉消息行自身的高度，这里退 3px 对齐）。
@@ -3511,6 +3616,7 @@ impl LiteIdeApp {
             // （搜索 / 替换 / 包含的文件 / 排除的文件）一起清空，点它就是回到干净面板。
             // 注意：此时本帧的输入框内容已经写回 `content_query`，直接清字段即可。
             self.content_results.clear();
+            self.content_file_count = 0;
             self.pending_search_seq = None;
             self.search_debounce_at = None;
             self.content_query.clear();
@@ -3528,6 +3634,7 @@ impl LiteIdeApp {
         if want_search {
             if self.content_query.trim().is_empty() {
                 self.content_results.clear();
+                self.content_file_count = 0;
                 self.pending_search_seq = None;
             } else {
                 self.start_content_search();
@@ -3610,6 +3717,12 @@ impl LiteIdeApp {
                 SearchEvent::SearchResults { seq, matches, error } => {
                     if self.pending_search_seq == Some(seq) {
                         self.pending_search_seq = None;
+                        // 命中文件数在这里算好（原来每帧建一个 HashSet 统计）。
+                        self.content_file_count = matches
+                            .iter()
+                            .map(|m| m.file.as_str())
+                            .collect::<HashSet<_>>()
+                            .len();
                         self.content_results = matches;
                         if let Some(e) = error {
                             self.flash(format!("搜索失败: {e}"));
@@ -5472,13 +5585,19 @@ impl LiteIdeApp {
     }
 
     fn draw_breadcrumb(&mut self, ui: &mut egui::Ui) {
-        let Some(tab) = self.tabs.active_tab().cloned() else { return };
-        let path = tab
-            .path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| tab.title.clone());
-        let dirty = tab.dirty;
+        // 注意：这里**不能** `active_tab().cloned()` —— Tab 里存着整份文件内容，
+        // 克隆一次就是整文件拷贝（每帧都做 → 大文件时每秒几十 MB 的分配）。
+        // 只取需要的字段（path / title / dirty）后立刻结束借用。
+        let (path, dirty) = {
+            let Some(tab) = self.tabs.active_tab() else { return };
+            (
+                tab.path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| tab.title.clone()),
+                tab.dirty,
+            )
+        };
         ui.horizontal(|ui| {
             ui.set_min_height(20.0);
             let sep = if path.contains('\\') { '\\' } else { '/' };
@@ -6106,12 +6225,15 @@ impl LiteIdeApp {
                             .color(hex("#6a6a6a")),
                     );
                 }
-                let syms = self.symbols.clone();
+                // 借用符号树（`mem::take` 借用，闭包结束后放回）：
+                // 原来每帧 `self.symbols.clone()` —— 一个头文件的符号树几百 KB。
+                let syms = std::mem::take(&mut self.symbols);
                 for sym in &syms {
                     if let Some(p) = draw_symbol(ui, sym, 0) {
                         jump = Some(p);
                     }
                 }
+                self.symbols = syms;
             });
         if let Some((line, col)) = jump {
             if let Some(f) = self.current_file.clone() {
@@ -7165,6 +7287,8 @@ impl LiteIdeApp {
         }
         let mut open = true;
         let mut jump: Option<(usize, usize)> = None;
+        // 借用符号树：原来每帧把整棵树克隆一遍（几百 KB）。
+        let syms = std::mem::take(&mut self.symbols);
         egui::Window::new("Symbol Search  (Ctrl+T)")
             .open(&mut open)
             .collapsible(false)
@@ -7179,7 +7303,8 @@ impl LiteIdeApp {
                 );
                 ui.separator();
                 let filter = self.symbol_filter.to_lowercase();
-                let all = flatten_symbols(&self.symbols);
+                let mut all: Vec<&SymbolInfo> = Vec::new();
+                flatten_symbols_ref(&syms, &mut all);
                 let mut shown = 0usize;
                 egui::ScrollArea::vertical()
                     .max_height(320.0)
@@ -7216,6 +7341,7 @@ impl LiteIdeApp {
                         }
                     });
             });
+        self.symbols = syms;
         self.symbol_search_open = open;
         if let Some((line, col)) = jump {
             if let Some(f) = self.current_file.clone() {
@@ -7593,20 +7719,25 @@ impl eframe::App for LiteIdeApp {
         }
 
         // 调试用：`LITEIDE_OPEN_SCM=1` 启动即打开源代码管理视图（截图 / 自检）。
-        if !self.scm_opened_at_start && std::env::var("LITEIDE_OPEN_SCM").is_ok() {
+        // 环境变量启动时读一次即可（原来每帧查一次环境变量）。
+        if !self.scm_opened_at_start && self.open_scm_at_start {
             self.scm_opened_at_start = true;
             self.open_scm_view();
         }
 
-        // 设置热重载：外部修改 JSON 自动生效
-        if self.settings.hot_reload(&mut self.config_mtime) {
-            tracing::info!("settings hot-reloaded");
-            // 远程连接被外部改掉（WSL ↔ SSH / 换了主机或目录）：重连并切换到新工作区。
-            let wanted = self.remote_target();
-            if wanted != self.applied_remote {
-                self.sync_remote_targets();
-                self.applied_remote = wanted;
-                self.apply_workspace_switch();
+        // 设置热重载：外部修改 JSON 自动生效。
+        // 节流到每 500ms 一次：原来每帧一次同步 stat（配置文件在网络盘上时更慢）。
+        if self.settings_checked_at.elapsed().as_secs_f64() >= settings::HOT_RELOAD_INTERVAL {
+            self.settings_checked_at = Instant::now();
+            if self.settings.hot_reload(&mut self.config_mtime) {
+                tracing::info!("settings hot-reloaded");
+                // 远程连接被外部改掉（WSL ↔ SSH / 换了主机或目录）：重连并切换到新工作区。
+                let wanted = self.remote_target();
+                if wanted != self.applied_remote {
+                    self.sync_remote_targets();
+                    self.applied_remote = wanted;
+                    self.apply_workspace_switch();
+                }
             }
         }
 
@@ -7719,7 +7850,13 @@ impl eframe::App for LiteIdeApp {
                 }
                 if let Some(ed) = self.editor.as_mut() {
                     let act = ed.show(ui);
-                    self.status_line = ed.status_text().into();
+                    // 状态栏文本只在「光标/行数/加载耗时」变了才重算
+                    // （原来每帧 format! + 复制一遍 Arc<str>）。
+                    let key = ed.status_key();
+                    if key != self.status_key {
+                        self.status_key = key;
+                        self.status_line = ed.status_text().into();
+                    }
                     act
                 } else {
                     None
@@ -7851,14 +7988,18 @@ impl eframe::App for LiteIdeApp {
     }
 }
 
-fn lsp_status_label(s: &LspStatus) -> String {
+/// LSP 状态栏文字。
+///
+/// 常见状态返回 `&'static str`（不分配）；只有带错误详情的两种才格式化。
+fn lsp_status_label(s: &LspStatus) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
     match s {
-        LspStatus::Off => "LSP: off".to_string(),
-        LspStatus::Detecting => "LSP: detecting remote...".to_string(),
-        LspStatus::Connecting => "LSP: starting clangd...".to_string(),
-        LspStatus::Ready => "LSP: Ready (clangd)".to_string(),
-        LspStatus::Crashed(d) => format!("LSP: CRASHED ({d})"),
-        LspStatus::Unavailable(d) => format!("LSP: unavailable ({d})"),
+        LspStatus::Off => Cow::Borrowed("LSP: off"),
+        LspStatus::Detecting => Cow::Borrowed("LSP: detecting remote..."),
+        LspStatus::Connecting => Cow::Borrowed("LSP: starting clangd..."),
+        LspStatus::Ready => Cow::Borrowed("LSP: Ready (clangd)"),
+        LspStatus::Crashed(d) => Cow::Owned(format!("LSP: CRASHED ({d})")),
+        LspStatus::Unavailable(d) => Cow::Owned(format!("LSP: unavailable ({d})")),
     }
 }
 
@@ -8028,7 +8169,23 @@ impl Codicon {
 }
 
 /// codicon 字体 id（内置 codicon.ttf 的专用族）。
+///
+/// `egui::FontFamily::Name` 持有 `String`，直接构造会**每画一个图标分配一次**。
+/// 这里按字号缓存（图标尺寸只有 10/12/14/16 几种），命中即零分配。
 fn codicon_font(size: f32) -> egui::FontId {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<Vec<(f32, egui::FontId)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let key = (size * 4.0).round() / 4.0; // 0.25 精度归一，避免浮点抖动导致缓存失效
+    if let Ok(mut guard) = cache.lock() {
+        if let Some((_, id)) = guard.iter().find(|(k, _)| *k == key) {
+            return id.clone();
+        }
+        let id = egui::FontId::new(key, egui::FontFamily::Name(CODICON_FAMILY.into()));
+        guard.push((key, id.clone()));
+        return id;
+    }
     egui::FontId::new(size, egui::FontFamily::Name(CODICON_FAMILY.into()))
 }
 
@@ -9067,13 +9224,34 @@ fn sort_dir_entries(entries: &mut [(String, bool)]) {
 ///
 /// 含路径分隔符（`/` `\`）或盘符冒号的输入被当作「要跳转的路径」而非过滤词，
 /// 此时不做过滤——否则列表会被清空、用户反而看不到当前目录内容。
+/// 大小写不敏感的子串包含（**不分配**）。
+///
+/// 旧实现用 `name.to_lowercase().contains(&q)`：每个条目都要分配一个小写副本
+/// （文件选择器每帧过滤几千个条目 = 每帧几千次分配）。
+fn contains_ignore_case(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.len() > h.len() {
+        return false;
+    }
+    if n.is_ascii() {
+        h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+    } else {
+        // 非 ASCII 查询词（中文）走慢路径。
+        hay.to_lowercase().contains(&needle.to_lowercase())
+    }
+}
+
+/// 在目录条目里按名字过滤（返回命中的下标）。
 fn filter_dir_entries(entries: &[(String, bool)], query: &str) -> Vec<usize> {
     let q = query.trim().to_lowercase();
     let path_like = q.contains('/') || q.contains('\\') || q.contains(':');
     entries
         .iter()
         .enumerate()
-        .filter(|(_, (name, _))| q.is_empty() || path_like || name.to_lowercase().contains(&q))
+        .filter(|(_, (name, _))| path_like || contains_ignore_case(name, &q))
         .map(|(i, _)| i)
         .collect()
 }
@@ -9286,15 +9464,17 @@ fn picker_hit_row(
     resp.clicked()
 }
 
-fn dap_status_label(s: &DapStatus) -> String {
+/// 调试状态栏文字（常见状态不分配）。
+fn dap_status_label(s: &DapStatus) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
     match s {
-        DapStatus::Off => "DBG: off".to_string(),
-        DapStatus::Starting => "DBG: starting gdb...".to_string(),
-        DapStatus::Ready => "DBG: ready".to_string(),
-        DapStatus::Running => "DBG: running".to_string(),
-        DapStatus::Stopped => "DBG: stopped".to_string(),
-        DapStatus::Crashed(d) => format!("DBG: CRASHED ({d})"),
-        DapStatus::Unavailable(d) => format!("DBG: unavailable ({d})"),
+        DapStatus::Off => Cow::Borrowed("DBG: off"),
+        DapStatus::Starting => Cow::Borrowed("DBG: starting gdb..."),
+        DapStatus::Ready => Cow::Borrowed("DBG: ready"),
+        DapStatus::Running => Cow::Borrowed("DBG: running"),
+        DapStatus::Stopped => Cow::Borrowed("DBG: stopped"),
+        DapStatus::Crashed(d) => Cow::Owned(format!("DBG: CRASHED ({d})")),
+        DapStatus::Unavailable(d) => Cow::Owned(format!("DBG: unavailable ({d})")),
     }
 }
 
@@ -9515,6 +9695,8 @@ fn draw_symbol(ui: &mut egui::Ui, sym: &SymbolInfo, depth: usize) -> Option<(usi
     hit
 }
 
+/// 展平符号树（克隆版；仅测试用，UI 走借用版 `flatten_symbols_ref`）。
+#[cfg(test)]
 fn flatten_symbols(syms: &[SymbolInfo]) -> Vec<SymbolInfo> {
     let mut out = Vec::new();
     for s in syms {
@@ -9522,6 +9704,16 @@ fn flatten_symbols(syms: &[SymbolInfo]) -> Vec<SymbolInfo> {
         out.extend(flatten_symbols(&s.children));
     }
     out
+}
+
+/// 展平符号树，但**只借用**（不克隆）。
+///
+/// 符号搜索每帧都要展平一次：克隆整棵树（几百 KB）太浪费，借用只多一个 Vec<&>。
+fn flatten_symbols_ref<'a>(syms: &'a [SymbolInfo], out: &mut Vec<&'a SymbolInfo>) {
+    for s in syms {
+        out.push(s);
+        flatten_symbols_ref(&s.children, out);
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -9922,6 +10114,17 @@ mod tests {
         // 路径样式的输入不过滤（它是要跳转的目标）。
         assert_eq!(super::filter_dir_entries(&entries, r"E:\TestDeepSeek"), vec![0, 1, 2]);
         assert_eq!(super::filter_dir_entries(&entries, "src/"), vec![0, 1, 2]);
+    }
+
+    /// 大小写不敏感的包含（ASCII 快路径 + 非 ASCII 慢路径）。
+    #[test]
+    fn contains_ignore_case_handles_ascii_and_cjk() {
+        assert!(super::contains_ignore_case("README.md", "readme"));
+        assert!(super::contains_ignore_case("README.md", "ME.MD"));
+        assert!(!super::contains_ignore_case("README.md", "readme2"));
+        assert!(super::contains_ignore_case("anything", ""));
+        // 非 ASCII 查询词也要能匹配。
+        assert!(super::contains_ignore_case("源文件.cpp", "文件"));
     }
 
     /// 输入解析：绝对路径原样，相对路径拼到当前目录。

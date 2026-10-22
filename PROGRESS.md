@@ -2075,6 +2075,67 @@ egui 命中测试是「同一层里最后注册的控件赢」，如果遮罩单
 
 ---
 
+## 性能与内存优化（轻量化专项）
+
+目标：IDE 要轻量 —— 空闲时不吃 CPU、内存不随使用时长膨胀、每帧不做无谓的分配。
+
+### A. 每帧的「整文件级」分配（最要命的一类）
+
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| `draw_breadcrumb` | `active_tab().cloned()` → **每帧复制整份文件正文** | 只取 path/title/dirty 三个字段 |
+| `Editor::word_range_at` | `buffer.text()` + `Vec<char>` → **每帧复制整篇文档** | 只扫光标所在行，零分配 |
+| `Editor::bracket_pair` | 整篇 `Vec<char>` + 逐行 `String` 累加定位 | rope 字符迭代器 + 逐行倒扫 |
+| `Editor` minimap | 每帧扫全文算每行列宽 | 文本变更时算好 `minimap_cols`，渲染查表 |
+| `draw_status_bar` | `format!` 状态栏文本 + `Arc<str>` 复制，每帧 | 只在「光标/行数/加载耗时」变了才重算 |
+| `sync_editor_breakpoints` | 每帧克隆路径 + 收集断点行 | 文件 + 断点版本号比对，没变就跳过 |
+| `sync_document` | 每帧克隆 uri | 只在真的要发 LSP 消息时取 |
+| `lsp_status_label` / `dap_status_label` | 每帧 `String` | `Cow<'static, str>`（常见状态不分配） |
+| 调试面板 | 每帧深拷贝栈/变量/监视/400 行控制台 | `mem::take` 借用，画完还回去 |
+| 大纲 / 符号搜索 | 每帧克隆整棵符号树 | 借用（`flatten_symbols_ref` 只借用） |
+| 文件选择器 | 每帧克隆整个目录列表 + 每条目 `to_lowercase()` | 借用 + 不分配的大小写不敏感包含 |
+| SCM 改动列表 | 每帧克隆全部 `GitEntry`（未跟踪文件多时几千条） | 借用（`staged_files()` 返回 `Vec<&GitEntry>`） |
+| 搜索结果 | 每帧建 `HashSet` 统计文件数 | 结果到达时算好 |
+
+新增 `Buffer::line_chars` / `Buffer::chars_from`：rope 上不分配的字符迭代器。
+
+实测（`perf_word_lookup_scales_with_line_not_file`，66 万字节文件、悬停取词 20 次）：
+
+- 旧写法（整篇复制）：**78 ms**
+- 新写法（只看一行）：**0.53 ms** → 约 **150 倍**；折算到每帧，鼠标停在编辑器上时
+  光这一项就从 ~3.9ms/帧 降到 ~26µs/帧。
+
+### B. 空闲时的后台开销
+
+- **设置热重载**：原来每帧一次 `fs::metadata`（同步文件系统调用）+ 2 次环境变量查找；
+  改成**每 500ms 一次**（`settings::HOT_RELOAD_INTERVAL`），`LITEIDE_OPEN_SCM` 启动时读一次。
+- **终端重绘**：终端面板原来每 60ms 强制重画 → **整个 IDE** 每秒重画 16 次；
+  改成 250ms（只为了光标闪烁），PTY 有输出时仍然立刻重画。
+
+### C. 内存（缓存不再无限增长）
+
+- **文件内容缓存**：原来只按条数封顶（64 条 × 文件大小，2MB 的文件就是 128MB 常驻）；
+  改成 **16MB 字节预算** + 条数上限，单个文件超预算直接不缓存。
+- **文档符号缓存**：原来**只读不淘汰**，开过的每个文件都留一整棵符号树；
+  改成上限 32 条 + TTL 清理（`prune_file_symbols`）。
+- **已关闭标签**：原来保留 10 份**完整文件正文**；改成只保留**脏标签**的正文
+  （未保存内容必须留着，干净的可以从磁盘重读）。
+
+### D. 其它
+
+- `codicon_font()`：每画一个图标都 `String::new()` 一个字体族名 → 按字号缓存 `FontId`。
+- `cell_metrics()`：每帧排一遍 64 个字符的版 → 按字体缓存。
+- `filter_dir_entries`：改成不分配的大小写不敏感匹配（ASCII 快路径 + CJK 慢路径）。
+
+新增用例：`line_chars_and_chars_from_match_snapshot`、
+`contains_ignore_case_handles_ascii_and_cjk`、
+`editor_matching_bracket_matches_reference`（rope 版括号配对与旧实现逐字符一致）、
+`perf_word_lookup_scales_with_line_not_file`（性能回归护栏）。
+
+`cargo test --workspace` 全绿（28 个 suite），clippy 0 warning。
+
+---
+
 ## 下一步任务：项目主体已完成
 
 myIDE.md 阶段 0-6 全部交付。后续仅按需处理技术债清单，不主动开工。

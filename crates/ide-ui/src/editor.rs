@@ -177,6 +177,10 @@ pub struct Editor {
     raw_text: String,
     /// 每行在 raw_text 里的字节起点。
     line_byte_starts: Vec<usize>,
+    /// 每行的 minimap 指标：(缩进列数, 总列数)。
+    ///
+    /// 文本变更时算一次；minimap 渲染直接查表（原来每帧扫全文算列宽）。
+    minimap_cols: Vec<(u16, u16)>,
     /// 最长行的字符数（水平滚动上限用）。
     max_cols: usize,
     /// 上一次渲染的视口高度（滚动到光标用）。
@@ -239,6 +243,7 @@ impl Editor {
             highlights: Vec::new(),
             raw_text: String::new(),
             line_byte_starts: Vec::new(),
+            minimap_cols: Vec::new(),
             max_cols: 0,
             viewport_h: 0.0,
             breakpoints: Vec::new(),
@@ -631,22 +636,40 @@ impl Editor {
     }
 
     /// 指定字符位置所在的标识符范围（**字符**下标，含端点）。
+    ///
+    /// 只扫光标所在的那一行：标识符不会跨行，逐行扫描足够。
+    /// （旧实现会把整篇文档复制成 `String` + `Vec<char>`，大文件时每帧 ~1MB 分配。）
     pub fn word_range_at(&self, char_idx: usize) -> Option<(usize, usize)> {
-        let text = self.buffer.text();
+        let (line, col) = self.buffer.char_to_line_col(char_idx);
         let is_ident = |c: char| c.is_alphanumeric() || c == '_';
-        let chars: Vec<char> = text.chars().collect();
-        if char_idx >= chars.len() || !is_ident(chars[char_idx]) {
-            return None;
+        // 找光标所在的那一段连续标识符：[run_start, run_end)
+        let mut run_start: Option<usize> = None;
+        let mut run_end = 0usize;
+        let mut word: Option<(usize, usize)> = None;
+        for (i, ch) in self.buffer.line_chars(line).enumerate() {
+            if is_ident(ch) {
+                if run_start.is_none() {
+                    run_start = Some(i);
+                }
+                run_end = i + 1;
+            } else if let Some(s) = run_start.take() {
+                if s <= col && col < run_end {
+                    word = Some((s, run_end));
+                }
+            }
+            if let Some((s, e)) = word {
+                // 命中就收工：后面的行内容不用再看
+                let line_start = self.buffer.line_col_to_char(line, 0);
+                return Some((line_start + s, line_start + e));
+            }
         }
-        let mut start = char_idx;
-        while start > 0 && is_ident(chars[start - 1]) {
-            start -= 1;
+        if let Some(s) = run_start {
+            if s <= col && col < run_end {
+                let line_start = self.buffer.line_col_to_char(line, 0);
+                return Some((line_start + s, line_start + run_end));
+            }
         }
-        let mut end = char_idx;
-        while end < chars.len() && is_ident(chars[end]) {
-            end += 1;
-        }
-        Some((start, end))
+        None
     }
 
     /// 悬停词在第 `line` 行上的**字符列**范围；该行没有悬停词时 `None`。
@@ -719,6 +742,31 @@ impl Editor {
             .map(|l| l.chars().map(char_cells).sum::<usize>())
             .max()
             .unwrap_or(0);
+        // minimap 的每行指标（缩进列 / 总列）：文本变了才重算，
+        // 渲染时直接查表 —— 原来每帧都要扫一遍全文算列宽。
+        self.minimap_cols.clear();
+        for line in self.raw_text.split('\n') {
+            let mut lead_cols = 0usize;
+            let mut lead_chars = 0usize;
+            for ch in line.chars() {
+                match ch {
+                    ' ' => {
+                        lead_cols += 1;
+                        lead_chars += 1;
+                    }
+                    '\t' => {
+                        lead_cols += INDENT_STEP;
+                        lead_chars += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let len = lead_cols + line.chars().skip(lead_chars).map(char_cells).sum::<usize>();
+            self.minimap_cols.push((
+                lead_cols.min(u16::MAX as usize) as u16,
+                len.min(u16::MAX as usize) as u16,
+            ));
+        }
         self.highlights = self.highlighter.highlight(&self.raw_text, edit);
         // 按起点排序：渲染与 minimap 都用"推进游标"扫描高亮，依赖此有序性。
         self.highlights.sort_by_key(|h| h.start);
@@ -957,25 +1005,64 @@ impl Editor {
     /// 光标附近若为括号，返回配对括号的 (行,列)（0-based）。
     fn bracket_pair(&self) -> Option<((usize, usize), (usize, usize))> {
         let (line, col) = self.buffer.char_to_line_col(self.cursor);
-        let line_text = self.buffer.line(line).to_string();
-        let chars: Vec<char> = line_text.chars().collect();
         // 优先取光标右侧字符，其次取左侧字符。
         let cand = [col, col.wrapping_sub(1)];
         for &c in &cand {
-            let Some(&ch) = chars.get(c) else { continue };
+            let Some(ch) = self.buffer.line_chars(line).nth(c) else {
+                continue;
+            };
             if !"()[]{}".contains(ch) {
                 continue;
             }
-            let (l, cc) = (line, c);
-            // 在整文档字符数组中定位。
-            let mut start = 0usize;
-            for l0 in 0..l {
-                start += self.buffer.line(l0).chars().count();
+            let idx = self.buffer.line_col_to_char(line, c);
+            if let Some(m) = self.matching_bracket(idx, ch) {
+                return Some((
+                    self.buffer.char_to_line_col(idx),
+                    self.buffer.char_to_line_col(m),
+                ));
             }
-            let idx = start + cc;
-            let all: Vec<char> = self.buffer.text().chars().collect();
-            if let Some(m) = find_matching_bracket(&all, idx) {
-                return Some((self.buffer.char_to_line_col(idx), self.buffer.char_to_line_col(m)));
+        }
+        None
+    }
+
+    /// 找 `idx` 处括号（`ch`）的配对位置（文档字符下标）。
+    ///
+    /// 向前扫用 rope 的字符迭代器；向后扫按行倒着找（ropey 没有反向迭代器）。
+    /// 全程不复制整篇文档（旧实现每帧 `buffer.text()` 复制一次全文）。
+    fn matching_bracket(&self, idx: usize, ch: char) -> Option<usize> {
+        const OPEN: &str = "([{";
+        const CLOSE: &str = ")]}";
+        if let Some(pos) = OPEN.find(ch) {
+            let close = CLOSE.chars().nth(pos)?;
+            let mut depth = 0i32;
+            for (j, d) in (idx..).zip(self.buffer.chars_from(idx)) {
+                if d == ch {
+                    depth += 1;
+                } else if d == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+            }
+        } else if let Some(pos) = CLOSE.find(ch) {
+            let open = OPEN.chars().nth(pos)?;
+            let (line, col) = self.buffer.char_to_line_col(idx);
+            let mut depth = 0i32;
+            for l in (0..=line).rev() {
+                let chars: Vec<char> = self.buffer.line_chars(l).collect();
+                let end = if l == line { col } else { chars.len() };
+                for ci in (0..end).rev() {
+                    let d = chars[ci];
+                    if d == ch {
+                        depth += 1;
+                    } else if d == open {
+                        if depth == 0 {
+                            return Some(self.buffer.line_col_to_char(l, ci));
+                        }
+                        depth -= 1;
+                    }
+                }
             }
         }
         None
@@ -1392,23 +1479,11 @@ impl Editor {
                 if le <= ls {
                     continue; // 空行
                 }
-                let line = &self.raw_text[ls..le];
-                let mut lead_cols = 0usize;
-                let mut lead_chars = 0usize;
-                for ch in line.chars() {
-                    match ch {
-                        ' ' => {
-                            lead_cols += 1;
-                            lead_chars += 1;
-                        }
-                        '\t' => {
-                            lead_cols += INDENT_STEP;
-                            lead_chars += 1;
-                        }
-                        _ => break,
-                    }
-                }
-                let len = lead_cols + line.chars().skip(lead_chars).map(char_cells).sum::<usize>();
+                // 每行的缩进/长度直接查表（文本变更时算好的）。
+                let (lead_cols, len) = match self.minimap_cols.get(li) {
+                    Some(&(lead, len)) => (lead as usize, len as usize),
+                    None => continue,
+                };
                 let x0 = mm_rect.left() + pad + (lead_cols as f32 / cols) * usable_w;
                 let x1 = mm_rect.left() + pad + (len as f32 / cols) * usable_w;
                 mm_painter.rect_filled(
@@ -1633,6 +1708,14 @@ impl Editor {
             self.buffer.line_count(),
             self.load_ms
         )
+    }
+
+    /// 状态栏文本的「键」：(行, 列, 总行数, 加载耗时)。
+    ///
+    /// 变了才需要重算状态栏文本（否则每帧都要 format! + 复制一遍）。
+    pub fn status_key(&self) -> (usize, usize, usize, u128) {
+        let (line, col) = self.buffer.char_to_line_col(self.cursor);
+        (line, col, self.buffer.line_count(), self.load_ms)
     }
 }
 
@@ -1880,6 +1963,9 @@ fn breaks_ime_composition(ev: &egui::Event) -> bool {
 }
 
 /// 在字符数组中查找 `idx` 处括号的配对（`()[]{}`）；无匹配返回 None。
+///
+/// 仅测试用：生产路径走 `Editor::matching_bracket`（直接扫 rope，不复制文档）。
+#[cfg(test)]
 fn find_matching_bracket(chars: &[char], idx: usize) -> Option<usize> {
     const OPEN: &str = "([{";
     const CLOSE: &str = ")]}";
@@ -1918,6 +2004,51 @@ fn find_matching_bracket(chars: &[char], idx: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 性能对照：悬停取词 / 括号配对在**大文件**上的每帧成本。
+    ///
+    /// 旧实现每帧把整篇文档复制成 `String` + `Vec<char>`（大文件 ~1MB/帧），
+    /// 新实现只看光标所在的一行、零分配。
+    #[test]
+    fn perf_word_lookup_scales_with_line_not_file() {
+        // 20 万字符、1 万行的大文件。
+        let mut big = String::with_capacity(200_000);
+        for i in 0..10_000 {
+            big.push_str("    some_ident_name_");
+            big.push_str(&i.to_string());
+            big.push_str(" = 42; // filler text to make the line long\n");
+        }
+        let ed = Editor::new(&big);
+        let mid = big.len() / 2;
+
+        // 旧写法：整篇复制。
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            let text = ed.buffer.text();
+            let chars: Vec<char> = text.chars().collect();
+            std::hint::black_box(&chars);
+        }
+        let old = t0.elapsed();
+
+        // 新写法：只看一行。
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            let r = ed.word_range_at(mid);
+            std::hint::black_box(r);
+        }
+        let new = t0.elapsed();
+
+        println!(
+            "PERF word_range_at: 旧写法(整篇复制) {:?} / 20 次，新写法 {:?} / 20 次，文件 {} 字节",
+            old,
+            new,
+            big.len()
+        );
+        assert!(
+            new < old,
+            "新写法应更快：old={old:?} new={new:?}"
+        );
+    }
 
     /// 高亮区间重叠（tree-sitter 注入层）时不能崩。
     ///
@@ -2587,6 +2718,21 @@ mod tests {
         let bclose = find_matching_bracket(&chars, br).unwrap();
         assert_eq!(chars[bclose], ']');
         assert!(find_matching_bracket(&chars, 0).is_none()); // 'i' 非括号
+    }
+
+    /// 生产路径的括号配对（rope 版，不复制文档）要和旧实现一致。
+    #[test]
+    fn editor_matching_bracket_matches_reference() {
+        let src = "int f(int a[3]) {\n  return g(a[0]);\n}\n";
+        let ed = Editor::new(src);
+        let chars: Vec<char> = src.chars().collect();
+        for (i, &c) in chars.iter().enumerate() {
+            if !"()[]{}".contains(c) {
+                continue;
+            }
+            let want = find_matching_bracket(&chars, i);
+            assert_eq!(ed.matching_bracket(i, c), want, "位置 {i} 字符 {c}");
+        }
     }
 
     #[test]

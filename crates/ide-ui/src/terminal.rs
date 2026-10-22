@@ -954,7 +954,9 @@ pub fn draw_body(
         session.parser.screen_mut().set_scrollback(0);
         ui.ctx().request_repaint();
     }
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+    // 定期重绘：只为了光标闪烁。原来的 60ms 相当于让**整个 IDE** 每秒重画 16 次
+    // （终端开着时永远停不下来）。改成 250ms（4Hz，肉眼看不出差别）。
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
 
     session.focused
 }
@@ -966,6 +968,29 @@ pub fn draw_body(
 /// 8.0，而 `glyph_width` 报 7.758）。两者相差 0.24px/字符，一行 60 个字符就漂移
 /// ~15px——光标会落在文字中间。这里直接量一段真实排版结果的平均步进。
 pub(crate) fn cell_metrics(fonts: &egui::epaint::Fonts, font: &FontId) -> (f32, f32) {
+    // 缓存：原来每帧都排一遍 64 个字符的版（编辑器 + 终端各一次）。
+    // 只在字号/字体族变化时重算即可。
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<Vec<(FontId, f32, f32)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut guard) = cache.lock() {
+        if let Some((_, w, h)) = guard.iter().find(|(f, _, _)| f == font) {
+            return (*w, *h);
+        }
+        let (w, h) = measure_cell_metrics(fonts, font);
+        // 只保留最近的几项，避免字体族切来切去把缓存撑大。
+        if guard.len() >= 8 {
+            guard.remove(0);
+        }
+        guard.push((font.clone(), w, h));
+        return (w, h);
+    }
+    measure_cell_metrics(fonts, font)
+}
+
+/// 实测单元格尺寸（见 `cell_metrics` 的说明）。
+fn measure_cell_metrics(fonts: &egui::epaint::Fonts, font: &FontId) -> (f32, f32) {
     const SAMPLE: usize = 64;
     let galley = fonts.layout_no_wrap("M".repeat(SAMPLE), font.clone(), Color32::WHITE);
     (

@@ -1,11 +1,15 @@
 //! 应用设置：JSON 配置文件 + 热重载（阶段 5）。
 //!
 //! 配置文件位置：`%APPDATA%\LiteIDE\settings.json`（`LITEIDE_CONFIG_DIR` 可覆盖目录，测试用）。
-//! 热重载：每帧 stat 一次 mtime，变化才重新读取（本地小文件，微秒级开销）。
+//! 热重载：**每 500ms** stat 一次 mtime，变化才重新读取
+//! （原来每帧一次：一次同步文件系统调用 + 两次环境变量查找，纯属浪费）。
 //! 遵循红线：非测试代码不使用 unwrap/expect。
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
+
+/// 热重载的最小检查间隔（秒）。
+pub const HOT_RELOAD_INTERVAL: f64 = 0.5;
 
 /// 设置项（可序列化，未知字段忽略，缺失字段回退默认）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -111,6 +115,9 @@ impl AppSettings {
     }
 
     /// 配置文件绝对路径。
+    ///
+    /// 会被热重载每 500ms 调一次（原来每帧一次）——所以这里不再做进程级缓存：
+    /// 缓存会和测试里切换 `LITEIDE_CONFIG_DIR` 冲突，而收益已经不大了。
     pub fn config_path() -> PathBuf {
         if let Ok(dir) = std::env::var("LITEIDE_CONFIG_DIR") {
             let mut p = PathBuf::from(dir);
